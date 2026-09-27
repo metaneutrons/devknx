@@ -67,6 +67,8 @@ mod macos {
 }
 
 /// Initialize the native app menu and About panel, if this is macOS.
+// The non-macOS body is inert; marking this wrapper const would break AppKit.
+#[allow(clippy::missing_const_for_fn)]
 pub fn init_app() {
     #[cfg(target_os = "macos")]
     macos::init_app();
@@ -74,6 +76,7 @@ pub fn init_app() {
 
 /// Consume a pending menu action once, if this is macOS.
 #[must_use]
+#[allow(clippy::missing_const_for_fn)]
 pub fn take(action: MenuAction) -> bool {
     #[cfg(target_os = "macos")]
     return macos::take(action);

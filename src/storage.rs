@@ -3,6 +3,7 @@
 
 //! Versioned SQLite history for raw KNX telegrams.
 
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
@@ -63,6 +64,12 @@ pub enum StorageError {
     /// A read-only store cannot accept frames.
     #[error("capture store is read-only")]
     ReadOnly,
+    /// Another process already owns the writable capture store.
+    #[error("capture writer is already active for {0}")]
+    WriterBusy(PathBuf),
+    /// A writable capture directory must not be writable by other users.
+    #[error("capture directory is writable by another user: {0}")]
+    InsecureDirectory(PathBuf),
     /// Cursor IDs are nonnegative, with zero meaning the beginning.
     #[error("capture cursor must be nonnegative: {0}")]
     InvalidCursor(i64),
@@ -91,10 +98,11 @@ pub struct StoredCapture {
     pub event: CaptureEvent,
 }
 
-/// Single-owner SQLite capture store. A later daemon will own this writer.
+/// Single-owner SQLite capture store.
 pub struct CaptureStore {
     connection: Connection,
     max_events: Option<NonZeroU32>,
+    _writer_lease: Option<File>,
 }
 
 impl CaptureStore {
@@ -111,6 +119,7 @@ impl CaptureStore {
             std::fs::create_dir_all(parent)?;
         }
         let database_path = normalized_sqlite_path(path)?;
+        let writer_lease = acquire_writer_lease(&database_path)?;
         #[cfg(unix)]
         prepare_private_file(&database_path)?;
         let mut connection = Connection::open_with_flags(
@@ -128,6 +137,7 @@ impl CaptureStore {
         Ok(Self {
             connection,
             max_events: Some(max_events),
+            _writer_lease: writer_lease,
         })
     }
 
@@ -147,6 +157,7 @@ impl CaptureStore {
         Ok(Self {
             connection,
             max_events: None,
+            _writer_lease: None,
         })
     }
 
@@ -287,6 +298,61 @@ impl CaptureStore {
             }
         }
         Ok(count)
+    }
+}
+
+fn acquire_writer_lease(database_path: &Path) -> Result<Option<File>, StorageError> {
+    if database_path == Path::new(":memory:") {
+        return Ok(None);
+    }
+    let mut lease_name = database_path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing database filename"))?
+        .to_os_string();
+    lease_name.push(".writer.lock");
+    let lease_path = database_path.with_file_name(lease_name);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+        let parent = database_path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "missing parent directory")
+        })?;
+        if std::fs::metadata(parent)?.permissions().mode() & 0o022 != 0 {
+            return Err(StorageError::InsecureDirectory(parent.to_path_buf()));
+        }
+        match std::fs::symlink_metadata(&lease_path) {
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "capture writer lock is not a regular file",
+                )
+                .into());
+            }
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
+        }
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(false).mode(0o600);
+        let file = options.open(&lease_path)?;
+        lock_writer_file(file, lease_path)
+    }
+    #[cfg(not(unix))]
+    {
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lease_path)?;
+        lock_writer_file(file, lease_path)
+    }
+}
+
+fn lock_writer_file(file: File, path: PathBuf) -> Result<Option<File>, StorageError> {
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(TryLockError::WouldBlock) => Err(StorageError::WriterBusy(path)),
+        Err(TryLockError::Error(error)) => Err(error.into()),
     }
 }
 
@@ -551,6 +617,49 @@ mod tests {
         let mut writer = CaptureStore::open(&path, nz(10)).unwrap();
         assert_eq!(writer.insert(&event(tunnel(), 8)).unwrap(), 2);
         assert_eq!(writer.read_after(1, nz(10)).unwrap()[0].id, 2);
+    }
+
+    #[test]
+    fn writable_store_has_one_owner_and_releases_its_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("captures.sqlite");
+        let first = CaptureStore::open(&path, nz(10)).unwrap();
+        assert!(matches!(
+            CaptureStore::open(&path, nz(10)),
+            Err(StorageError::WriterBusy(_))
+        ));
+        assert!(CaptureStore::open_existing(&path).is_ok());
+        drop(first);
+        assert!(CaptureStore::open(&path, nz(10)).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_lease_rejects_symlink_and_shared_directory() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let directory = tempfile::tempdir().unwrap();
+        let victim = directory.path().join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        let path = directory.path().join("captures.sqlite");
+        symlink(
+            &victim,
+            directory.path().join("captures.sqlite.writer.lock"),
+        )
+        .unwrap();
+        assert!(matches!(
+            CaptureStore::open(&path, nz(10)),
+            Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::InvalidInput
+        ));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+
+        let shared = directory.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(matches!(
+            CaptureStore::open(&shared.join("captures.sqlite"), nz(10)),
+            Err(StorageError::InsecureDirectory(_))
+        ));
     }
 
     #[test]

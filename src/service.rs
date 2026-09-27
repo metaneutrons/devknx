@@ -3,7 +3,8 @@
 
 //! Long-lived owner for one KNXnet/IP connection and its capture store.
 //!
-//! This is an in-process service core, not yet the standalone local daemon.
+//! This core can run in an independent foreground process. Local IPC and
+//! supervised automatic startup are not implemented yet.
 //! Connection state is a watch value so late subscribers see the current state.
 //! Live frames are broadcast; a slow subscriber receives Tokio's structured
 //! `Lagged(count)` error. That count describes dropped *application events*,
@@ -309,63 +310,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_loopback_tunnel_commits_before_live_delivery() {
-        let server = DeviceServer::start_at("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
-        let address = server.local_addr();
+    async fn real_loopback_tunnel_commits_and_replays_across_owner_restart() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("loopback.sqlite");
-        let store = CaptureStore::open(&path, NonZeroU32::new(10).unwrap()).unwrap();
-        let mut service = CaptureService::new(
-            ConnectionSpec::Tunnel(address),
-            Some(store),
-            ReconnectPolicy::default(),
-            capacity(8),
-        );
-        let mut states = service.subscribe_state();
-        let mut frames = service.subscribe_frames();
-        let sent = frame(42);
-        let original = sent.as_bytes().to_vec();
-        let (stop_tx, stop_rx) = oneshot::channel();
-        let observer = async {
-            loop {
-                states.changed().await.unwrap();
-                if matches!(
-                    &*states.borrow_and_update(),
-                    ConnectionState::Connected { .. }
-                ) {
-                    break;
+        let mut originals = Vec::new();
+        for (id, value) in [(1, 42), (2, 43)] {
+            // A fresh gateway stub avoids platform-specific UDP reset behavior
+            // after the previous tunnel closes; the persistent database is shared.
+            let server = DeviceServer::start_at("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+            let address = server.local_addr();
+            let store = CaptureStore::open(&path, NonZeroU32::new(10).unwrap()).unwrap();
+            let mut service = CaptureService::new(
+                ConnectionSpec::Tunnel(address),
+                Some(store),
+                ReconnectPolicy::default(),
+                capacity(8),
+            );
+            let mut states = service.subscribe_state();
+            let mut frames = service.subscribe_frames();
+            let sent = frame(value);
+            let original = sent.as_bytes().to_vec();
+            let (stop_tx, stop_rx) = oneshot::channel();
+            let observer = async {
+                loop {
+                    states.changed().await.unwrap();
+                    if matches!(
+                        &*states.borrow_and_update(),
+                        ConnectionState::Connected { .. }
+                    ) {
+                        break;
+                    }
                 }
-            }
-            server.send_frame(sent).await.unwrap();
-            let live = frames.recv().await.unwrap();
-            assert_eq!(live.id, Some(1));
-            assert_eq!(live.event.frame().as_bytes(), original);
-            stop_tx.send(()).unwrap();
-        };
-        let (result, ()) = timeout(Duration::from_secs(5), async {
-            tokio::join!(
-                service.run_until(async {
-                    let _ = stop_rx.await;
-                }),
-                observer
-            )
-        })
-        .await
-        .expect("loopback frame arrives");
-        result.unwrap();
-        assert_eq!(*states.borrow(), ConnectionState::Stopped);
-        drop(service);
+                server.send_frame(sent).await.unwrap();
+                let live = frames.recv().await.unwrap();
+                assert_eq!(live.id, Some(id));
+                assert_eq!(live.event.frame().as_bytes(), original);
+                stop_tx.send(()).unwrap();
+            };
+            let (result, ()) = timeout(Duration::from_secs(5), async {
+                tokio::join!(
+                    service.run_until(async {
+                        let _ = stop_rx.await;
+                    }),
+                    observer
+                )
+            })
+            .await
+            .expect("loopback frame arrives");
+            result.unwrap();
+            assert_eq!(*states.borrow(), ConnectionState::Stopped);
+            originals.push(original);
+            server.stop().await;
+        }
         let history = CaptureStore::open_existing(&path).unwrap();
         assert_eq!(
-            history.read_after(0, NonZeroU32::new(1).unwrap()).unwrap()[0]
-                .event
-                .frame()
-                .as_bytes(),
-            original
+            history
+                .read_after(0, NonZeroU32::new(10).unwrap())
+                .unwrap()
+                .into_iter()
+                .map(|capture| capture.event.frame().as_bytes().to_vec())
+                .collect::<Vec<_>>(),
+            originals
         );
-        server.stop().await;
     }
 
     #[tokio::test]

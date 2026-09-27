@@ -39,6 +39,17 @@ enum Command {
         #[arg(long, default_value_t = NonZeroU32::new(100_000).expect("nonzero"))]
         max_events: NonZeroU32,
     },
+    /// Run persistent capture in the foreground, independently of a monitor client.
+    Serve {
+        /// KNXnet/IP tunnel or router endpoint URL.
+        endpoint: String,
+        /// SQLite database owned by this capture process.
+        #[arg(long)]
+        database: PathBuf,
+        /// Maximum rows retained in the database.
+        #[arg(long, default_value_t = NonZeroU32::new(100_000).expect("nonzero"))]
+        max_events: NonZeroU32,
+    },
     /// Read captured telegrams after a monotonic event ID.
     History {
         /// Existing SQLite capture database.
@@ -82,6 +93,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let spec = parse_url(&endpoint)?;
             run_monitor(spec, database, max_events).await?;
         }
+        Some(Command::Serve {
+            endpoint,
+            database,
+            max_events,
+        }) => {
+            let spec = parse_url(&endpoint)?;
+            run_service(spec, database, max_events).await?;
+        }
         Some(Command::History {
             database,
             after,
@@ -107,6 +126,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("No command specified. Use --help for available commands.");
             std::process::exit(2);
         }
+    }
+    Ok(())
+}
+
+async fn run_service(
+    spec: ConnectionSpec,
+    database: PathBuf,
+    max_events: NonZeroU32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let store = CaptureStore::open(&database, max_events)?;
+    let queue_capacity = NonZeroUsize::new(1_024).expect("nonzero live queue capacity");
+    let service = CaptureService::new(
+        spec,
+        Some(store),
+        ReconnectPolicy::default(),
+        queue_capacity,
+    );
+    let mut states = service.subscribe_state();
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let mut task = tokio::spawn(async move {
+        let mut service = service;
+        service
+            .run_until(async {
+                let _ = stop_rx.await;
+            })
+            .await
+    });
+    let signal = tokio::signal::ctrl_c();
+    tokio::pin!(signal);
+    let signal_error = loop {
+        tokio::select! {
+            biased;
+            result = &mut signal => break result.err(),
+            result = &mut task => return Ok(result??),
+            changed = states.changed() => {
+                if changed.is_ok() {
+                    eprintln!("connection_state={:?}", *states.borrow_and_update());
+                }
+            }
+        }
+    };
+    let _ = stop_tx.send(());
+    task.await??;
+    if let Some(error) = signal_error {
+        return Err(Box::new(error));
     }
     Ok(())
 }

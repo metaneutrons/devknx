@@ -3,5 +3,6 @@
 
 //! Shared KNX capture model used by the application interfaces.
 
+pub mod capabilities;
 pub mod capture;
 pub mod storage;

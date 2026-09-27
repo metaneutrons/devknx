@@ -122,6 +122,8 @@ The [versioned initiative plan](docs/plans/devknx.md) defines the architecture,
 milestones, acceptance evidence, and the later KnxMonitor handoff. The project
 will also appear on [metaneutrons.cc](https://metaneutrons.cc), the overview of
 Fabian's repositories; it does not require a separate project website.
+The [capability registry](src/capabilities.rs) records which current operations
+exist in the CLI and GUI and why their coverage differs during development.
 
 ## Development and security
 

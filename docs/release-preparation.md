@@ -5,6 +5,13 @@ on packaging pull requests and can also be dispatched manually. Its token has
 read-only repository access. It creates no tag, GitHub Release, package-channel
 update, signature, or notarization submission.
 
+Release Please uses the single-crate Rust strategy and the checked-in 0.1.0
+manifest to propose a version/changelog pull request. It synchronizes
+`Cargo.toml`, `Cargo.lock`, the manifest, and `CHANGELOG.md`. The proposal
+must remain unmerged until the release is separately authorized. Only its
+merge creates the immutable tag and draft GitHub release, then dispatches
+the hardened pipeline against that exact tag.
+
 Its short-lived CI artifacts contain seven target-specific CLI archives, a
 tagged source archive, an unsigned macOS ARM64 app ZIP, and two Debian packages:
 

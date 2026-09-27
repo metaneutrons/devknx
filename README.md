@@ -63,6 +63,7 @@ cargo run --locked -- monitor tunnel://192.0.2.1:3671 --database captures.sqlite
 cargo run --locked -- serve tunnel://192.0.2.1:3671 --database captures.sqlite
 cargo run --locked -- history --database captures.sqlite --after 0 --limit 100
 cargo run --locked -- export --database captures.sqlite > captures.csv
+cargo run --locked -- backup --database captures.sqlite --output captures-backup.sqlite
 cargo run --locked -- gui
 ```
 
@@ -85,8 +86,11 @@ The optional `--database` creates a versioned SQLite capture store. Each
 committed telegram receives a monotonic ID; the default retention limit is
 100,000 frames and can be changed with `--max-events`. `history` reads an
 existing store using an exclusive `--after` ID and a bounded page size.
-`export` streams CSV up to the highest ID present when export begins. Both
-commands fail rather than create an empty database if the path is wrong.
+`export` streams CSV up to the highest ID present when export begins. `backup`
+creates a consistent SQLite snapshot, including committed WAL transactions
+while `serve` is running; it never overwrites an existing destination. All
+three commands fail rather than create an empty database if the source path is
+wrong.
 Existing databases with an unsupported schema are not rewritten. The CLI now
 runs an in-process connection owner and live event bus; capture continues if
 its terminal subscriber falls behind. The connection and database are still

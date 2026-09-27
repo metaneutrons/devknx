@@ -115,7 +115,7 @@ static NSMenu *add_menu(NSMenu *main, NSString *title) {
 
 void devknx_init_macos_app(const char *version, const uint8_t *icon, size_t icon_len) {
     @autoreleasepool {
-        if (version) app_version = [NSString stringWithUTF8String:version];
+        if (version) app_version = [[NSString alloc] initWithUTF8String:version];
         [[NSProcessInfo processInfo] setProcessName:@"devknx"];
         NSApplication *app = [NSApplication sharedApplication];
         [app setActivationPolicy:NSApplicationActivationPolicyRegular];

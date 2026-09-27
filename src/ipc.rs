@@ -566,6 +566,9 @@ async fn await_group_response(
     timeout_ms: u32,
 ) -> Result<ReadOutcome, String> {
     let mut response_state = state.clone();
+    if !matches!(&*response_state.borrow(), ConnectionState::Connected { .. }) {
+        return Err("KNXnet/IP connection interrupted while awaiting response".to_owned());
+    }
     let response = tokio::time::timeout(std::time::Duration::from_millis(u64::from(timeout_ms)), async {
         loop {
             let event = tokio::select! {

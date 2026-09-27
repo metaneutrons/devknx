@@ -212,6 +212,7 @@ mod tests {
     use std::time::Duration;
 
     use knx_rs_core::address::{DestinationAddress, GroupAddress, IndividualAddress};
+    use knx_rs_core::knxip::KnxIpFrame;
     use knx_rs_core::message::MessageCode;
     use knx_rs_core::types::Priority;
     use knx_rs_ip::{KnxFuture, Result as KnxResult, connect, tunnel_server::DeviceServer};
@@ -380,5 +381,81 @@ mod tests {
         assert_eq!(events[0].frame().as_bytes(), original);
         assert_eq!(events[0].group_service(), GroupService::Response);
         server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn router_ignores_malformed_datagrams_and_preserves_group_services() {
+        use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+
+        // The router joins a multicast group, but the fixture injects into its
+        // bound UDP port over loopback so it also works on CI hosts with no
+        // multicast route. A physical multicast route remains a hardware gate.
+        let port_probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = port_probe.local_addr().unwrap().port();
+        drop(port_probe);
+        let multicast = SocketAddrV4::new(Ipv4Addr::new(239, 255, 23, 12), port);
+        let endpoint = CaptureEndpoint::Router(multicast.into());
+        let mut connection = connect(ConnectionSpec::Router(multicast.into()))
+            .await
+            .unwrap();
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+        let malformed_cemi = KnxIpFrame::routing_indication(&[0]);
+        sender.send_to(&[0x06, 0x10, 0x05], target).unwrap();
+        sender
+            .send_to(&malformed_cemi.try_to_bytes().unwrap(), target)
+            .unwrap();
+
+        let mut originals = Vec::new();
+        for payload in [[0x00, 0x00], [0x00, 0x40], [0x00, 0x80]] {
+            let cemi = frame(&payload);
+            originals.push(cemi.as_bytes().to_vec());
+            let routing = KnxIpFrame::routing_indication(cemi.as_bytes());
+            sender
+                .send_to(&routing.try_to_bytes().unwrap(), target)
+                .unwrap();
+        }
+
+        let mut events = Vec::new();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let mut stop_tx = Some(stop_tx);
+        let exit = timeout(
+            Duration::from_secs(5),
+            capture_until(
+                &mut connection,
+                endpoint,
+                |event| {
+                    events.push(event);
+                    if events.len() == 3
+                        && let Some(sender) = stop_tx.take()
+                    {
+                        let _ = sender.send(());
+                    }
+                    Ok(())
+                },
+                async {
+                    stop_rx
+                        .await
+                        .map_err(|_| io::Error::other("stop signal dropped"))
+                },
+            ),
+        )
+        .await
+        .expect("router frames arrive")
+        .expect("router capture succeeds");
+        assert_eq!(exit, CaptureExit::Stopped);
+        assert_eq!(events.len(), 3);
+        for (index, (event, original)) in events.iter().zip(originals).enumerate() {
+            assert_eq!(event.frame().as_bytes(), original);
+            assert_eq!(event.endpoint(), endpoint);
+            assert_eq!(
+                event.group_service(),
+                [
+                    GroupService::Read,
+                    GroupService::Response,
+                    GroupService::Write
+                ][index]
+            );
+        }
     }
 }

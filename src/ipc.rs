@@ -30,9 +30,11 @@ use interprocess::local_socket::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{Semaphore, broadcast, watch};
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 
-use crate::service::{ConnectionState, LiveCapture, LiveRoutingLoss};
+use crate::capture::GroupService;
+use crate::operations::OperationRequest;
+use crate::service::{ConnectionState, LiveCapture, LiveRoutingLoss, OperationEnvelope};
 
 const MAX_MESSAGE_SIZE: usize = 16 * 1024;
 const MAX_CLIENTS: usize = 32;
@@ -99,6 +101,32 @@ pub enum IpcMessage {
         /// Number of local events missed, not a bus-loss count.
         count: u64,
     },
+    /// Transport acknowledged a send; a read may still have no response.
+    OperationResult {
+        /// Durable operation-attempt ID.
+        audit_id: i64,
+        /// Durable sent-capture ID.
+        capture_id: i64,
+        /// Exact transmitted cEMI bytes.
+        raw_cemi: String,
+        /// Only present for reads.
+        read: Option<ReadOutcome>,
+    },
+    /// Validation, connection, transport, or observation failed.
+    OperationError {
+        /// Human-readable failure without claiming a device state change.
+        reason: String,
+    },
+}
+
+/// The observation phase of a successfully transmitted group read.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ReadOutcome {
+    /// A received group-value response matched the requested address.
+    Response { raw_cemi: String },
+    /// No matching response arrived before the requested deadline.
+    NoResponse,
 }
 
 /// Local IPC stream whose subscriber fell behind.
@@ -355,6 +383,7 @@ impl IpcServer {
         state: watch::Receiver<ConnectionState>,
         frames: broadcast::Receiver<LiveCapture>,
         routing_losses: broadcast::Receiver<LiveRoutingLoss>,
+        operations: mpsc::Sender<OperationEnvelope>,
     ) -> Result<(), IpcError> {
         let slots = Arc::new(Semaphore::new(MAX_CLIENTS));
         loop {
@@ -366,9 +395,10 @@ impl IpcServer {
             let state = state.clone();
             let frames = frames.resubscribe();
             let routing_losses = routing_losses.resubscribe();
+            let operations = operations.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                let _ = handle_client(stream, state, frames, routing_losses).await;
+                let _ = handle_client(stream, state, frames, routing_losses, operations).await;
             });
         }
     }
@@ -379,22 +409,23 @@ async fn handle_client(
     mut state: watch::Receiver<ConnectionState>,
     mut frames: broadcast::Receiver<LiveCapture>,
     mut routing_losses: broadcast::Receiver<LiveRoutingLoss>,
+    operations: mpsc::Sender<OperationEnvelope>,
 ) -> Result<(), IpcError> {
-    let mut command = [0_u8; 7];
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        stream.read_exact(&mut command),
-    )
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "IPC command timed out"))??;
-    if &command != b"STATUS\n" && &command != b"FOLLOW\n" {
+    let command = read_line(&mut stream, 16).await?;
+    if command == b"OPERATE" {
+        let request = read_line(&mut stream, MAX_MESSAGE_SIZE).await?;
+        let request: OperationRequest = serde_json::from_slice(&request)?;
+        handle_operation(&mut stream, &state, &mut frames, &operations, request).await?;
+        return Ok(());
+    }
+    if command != b"STATUS" && command != b"FOLLOW" {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "unknown IPC command").into());
     }
     let initial = IpcMessage::State {
         value: WireState::from(&*state.borrow_and_update()),
     };
     write_message(&mut stream, &initial).await?;
-    if &command == b"STATUS\n" {
+    if command == b"STATUS" {
         return Ok(());
     }
     loop {
@@ -432,6 +463,143 @@ async fn handle_client(
             }
         }
     }
+}
+
+async fn read_line(stream: &mut Stream, maximum: usize) -> Result<Vec<u8>, IpcError> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut line = Vec::new();
+        loop {
+            match stream.read_u8().await? {
+                b'\n' => return Ok(line),
+                byte if line.len() < maximum => line.push(byte),
+                _ => return Err(IpcError::MessageTooLarge),
+            }
+        }
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "IPC request timed out"))?
+}
+
+async fn handle_operation(
+    stream: &mut Stream,
+    state: &watch::Receiver<ConnectionState>,
+    frames: &mut broadcast::Receiver<LiveCapture>,
+    operations: &mpsc::Sender<OperationEnvelope>,
+    request: OperationRequest,
+) -> Result<(), IpcError> {
+    if !matches!(&*state.borrow(), ConnectionState::Connected { .. }) {
+        return write_message(
+            stream,
+            &IpcMessage::OperationError {
+                reason: "KNXnet/IP connection is not connected".to_owned(),
+            },
+        )
+        .await;
+    }
+    // Drop observations made before this request was queued. The sent-capture
+    // ID below provides a second ordering check for persistent service use.
+    while frames.try_recv().is_ok() {}
+    let read_address = match &request {
+        OperationRequest::Read {
+            address_raw,
+            timeout_ms,
+        } => Some((*address_raw, *timeout_ms)),
+        _ => None,
+    };
+    let (response, receiver) = oneshot::channel();
+    if operations
+        .send(OperationEnvelope { request, response })
+        .await
+        .is_err()
+    {
+        return write_message(
+            stream,
+            &IpcMessage::OperationError {
+                reason: "connection owner stopped".to_owned(),
+            },
+        )
+        .await;
+    }
+    let receipt = match receiver.await {
+        Ok(Ok(receipt)) => receipt,
+        Ok(Err(reason)) => {
+            return write_message(stream, &IpcMessage::OperationError { reason }).await;
+        }
+        Err(_) => {
+            return write_message(
+                stream,
+                &IpcMessage::OperationError {
+                    reason: "connection owner did not confirm transmission".to_owned(),
+                },
+            )
+            .await;
+        }
+    };
+    let read = if let Some((address_raw, timeout_ms)) = read_address {
+        match await_group_response(state, frames, address_raw, receipt.capture_id, timeout_ms).await
+        {
+            Ok(outcome) => Some(outcome),
+            Err(reason) => {
+                return write_message(stream, &IpcMessage::OperationError { reason }).await;
+            }
+        }
+    } else {
+        None
+    };
+    write_message(
+        stream,
+        &IpcMessage::OperationResult {
+            audit_id: receipt.audit_id,
+            capture_id: receipt.capture_id,
+            raw_cemi: hex(&receipt.raw_cemi),
+            read,
+        },
+    )
+    .await
+}
+
+async fn await_group_response(
+    state: &watch::Receiver<ConnectionState>,
+    frames: &mut broadcast::Receiver<LiveCapture>,
+    address_raw: u16,
+    sent_capture_id: i64,
+    timeout_ms: u32,
+) -> Result<ReadOutcome, String> {
+    let mut response_state = state.clone();
+    let response = tokio::time::timeout(std::time::Duration::from_millis(u64::from(timeout_ms)), async {
+        loop {
+            let event = tokio::select! {
+                changed = response_state.changed() => {
+                    if changed.is_err() || !matches!(&*response_state.borrow_and_update(), ConnectionState::Connected { .. }) {
+                        return Err("KNXnet/IP connection interrupted while awaiting response".to_owned());
+                    }
+                    continue;
+                }
+                event = frames.recv() => event,
+            };
+            match event {
+                Ok(capture)
+                    if capture.id.is_some_and(|id| id > sent_capture_id)
+                        && capture.event.group_service() == GroupService::Response
+                        && capture.event.frame().destination_address()
+                            == knx_rs_core::address::DestinationAddress::Group(
+                                knx_rs_core::address::GroupAddress::from_raw(address_raw),
+                            ) => {
+                    return Ok(ReadOutcome::Response {
+                        raw_cemi: hex(capture.event.frame().as_bytes()),
+                    });
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    return Err("response observation stream lagged".to_owned());
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    return Err("response observation stream closed".to_owned());
+                }
+            }
+        }
+    }).await;
+    response.unwrap_or(Ok(ReadOutcome::NoResponse))
 }
 
 async fn write_message(stream: &mut Stream, message: &IpcMessage) -> Result<(), IpcError> {
@@ -476,6 +644,45 @@ impl IpcClient {
             .await?;
         Ok(Self {
             reader: BufReader::new(stream),
+        })
+    }
+
+    /// Send one validated operation intent to the active connection owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns local transport or protocol failures; an operation rejection is
+    /// represented by [`IpcMessage::OperationError`].
+    pub async fn operate(
+        database: &Path,
+        request: &OperationRequest,
+    ) -> Result<IpcMessage, IpcError> {
+        #[cfg(unix)]
+        let mut stream = {
+            let path = socket_path(database, false)?;
+            Stream::connect(path.as_os_str().to_fs_name::<GenericFilePath>()?).await?
+        };
+        #[cfg(windows)]
+        let mut stream = {
+            let name = pipe_name(database)?;
+            Stream::connect(name.to_ns_name::<GenericNamespaced>()?).await?
+        };
+        let mut body = serde_json::to_vec(request)?;
+        if body.len() >= MAX_MESSAGE_SIZE {
+            return Err(IpcError::MessageTooLarge);
+        }
+        body.push(b'\n');
+        stream.write_all(b"OPERATE\n").await?;
+        stream.write_all(&body).await?;
+        let mut client = Self {
+            reader: BufReader::new(stream),
+        };
+        client.next().await?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection owner closed without result",
+            )
+            .into()
         })
     }
 

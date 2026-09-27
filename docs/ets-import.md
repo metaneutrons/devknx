@@ -31,5 +31,11 @@ Multiple declared DPTs are not silently reduced to the first one. A typed
 write must use an unambiguous, supported DPT or an explicitly chosen DPT
 compatible with the imported declarations. A standard four-column CSV gives
 no DPT to validate against; an explicit supported DPT will be required.
-Unknown DPTs never authorize a typed write. The M3 operation layer enforces
-these rules; import alone does not send telegrams.
+Unknown DPTs never authorize a typed write. The first operation layer supports
+a conservative set of typed identifiers: 1.001, 1.002, 1.006, 4.001,
+5.001, 5.003, 5.010, 7.001, 8.001, 9.001, 9.004, 12.001, 13.001,
+14.056, 16.000, 16.001, 17.001, 18.001, and 29.010. Other imported DPT
+declarations remain visible but cannot be transmitted as typed values yet.
+The operation layer enforces
+these rules again inside the running connection owner; import alone does not
+send telegrams.

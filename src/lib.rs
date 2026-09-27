@@ -7,5 +7,6 @@ pub mod capabilities;
 pub mod capture;
 pub mod ets;
 pub mod ipc;
+pub mod operations;
 pub mod service;
 pub mod storage;

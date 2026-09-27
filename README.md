@@ -17,7 +17,7 @@
 </p>
 
 > [!IMPORTANT]
-> **Early development.** There is no stable release yet. The CLI can discover gateways, capture raw telegrams from a KNXnet/IP tunnel or router, retain them in SQLite, and import ETS group-address metadata. The native GUI is still a discovery shell. There is no automatic daemon startup or group-value sending. Do not use it to operate a live installation.
+> **Early development.** There is no stable release yet. The CLI can discover gateways, capture raw telegrams, import ETS group-address metadata, and issue explicitly requested group operations through a running `serve` process. The native GUI is still a discovery shell. There is no automatic daemon startup. Group writes can affect a live installation; qualify them on an isolated test network first.
 
 ## What devknx is building
 
@@ -34,14 +34,15 @@ desktop button and an API call.
 | Independent capture process | Experimental foreground `serve` command with current-user `status` and `follow` IPC; no automatic startup yet |
 | Durable, searchable telegram history | Experimental SQLite history with ID cursor, retention cap, and CSV export; filters/search and the background daemon are pending |
 | ETS group-address CSV and XML import | Experimental CLI import and lookup; GUI integration pending |
-| DPT-validated read, write preview, and write | Planned |
+| DPT-validated read, write preview, and write | Experimental CLI operations through the single capture owner; loopback-qualified, not yet hardware-qualified |
 | Terminal UI and full native desktop UI | Planned |
 | Local REST and MCP interfaces | Planned |
 
-Group-address names and DPT declarations from ETS will enrich captured
-telegrams without changing their raw frames. A typed write will require an
-unambiguous DPT (from ETS or explicitly supplied), show the exact encoded frame
-before transmission, and report transmission separately from a device response.
+ETS group-address metadata is stored in separate revisions without changing
+raw captured telegrams. A typed write requires an unambiguous DPT (from ETS or
+explicitly supplied), and its preview is the exact frame sent by the capture
+owner. A read reports transmission separately from a matching response or
+timeout; transmission alone does not establish an actuator state change.
 
 The first stable version targets KNXnet/IP. The older
 [`KnxMonitor`](https://github.com/metaneutrons/KnxMonitor) also supports KNX-USB;
@@ -69,6 +70,11 @@ cargo run --locked -- export --database captures.sqlite > captures.csv
 cargo run --locked -- backup --database captures.sqlite --output captures-backup.sqlite
 cargo run --locked -- ets-import group-addresses.xml --database captures.sqlite --format xml
 cargo run --locked -- ets-lookup --database captures.sqlite 1/2/3
+cargo run --locked -- write-preview --database captures.sqlite 1/2/3 true
+cargo run --locked -- read --database captures.sqlite 1/2/3
+cargo run --locked -- write --database captures.sqlite 1/2/3 true
+cargo run --locked -- write-raw --database captures.sqlite --inline 1 1/2/3
+cargo run --locked -- audit --database captures.sqlite
 cargo run --locked -- gui
 ```
 
@@ -81,8 +87,8 @@ shell and discovery view.
 timestamp, endpoint, source and destination addresses, group-value service,
 and the exact raw frame in hexadecimal. Connection changes are printed to
 standard error. Failed connection attempts and unexpected closes are retried
-with a bounded 1–30 second delay; press Ctrl-C to stop. Only receive-side
-frames are captured in this development build. A router's KNXnet/IP
+with a bounded 1–30 second delay; press Ctrl-C to stop. `monitor` captures
+receive-side frames; `serve` also captures its own sent operation frames. A router's KNXnet/IP
 `RoutingLostMessage` diagnostic is stored and streamed separately from cEMI
 frames. It includes the reporting router, device state, and count of routing
 frames the router says it lost. A slow local subscriber is reported separately
@@ -108,15 +114,15 @@ wrong.
 `router-losses` reads a separate, bounded diagnostic history with its own
 monotonic ID cursor; it does not mix router reports with cEMI history or CSV.
 Opening a version-one or version-two database for writing migrates it transactionally to
-schema version three; read-only history remains available during migration.
+schema version four; read-only history remains available during migration.
 Existing databases with an unsupported schema are not rewritten. The CLI now
 runs an in-process connection owner and live event bus; capture continues if
 its terminal subscriber falls behind. The connection and database are still
 owned only while `monitor` is running. `serve` runs the same capture owner in a
 separate foreground process; it can be kept alive by a service manager while
 `history`, `export`, and `backup` read the database from other processes.
-`status` and `follow` connect to the running owner over current-user local IPC;
-`follow` emits development-version-two JSON lines with connection states, committed captures,
+`status`, `follow`, `read`, and `write` connect to the running owner over current-user local IPC;
+`follow` emits development-version-three JSON lines with connection states, committed captures,
 router reports, and explicit per-stream application-subscriber lag counts. The process does not detach or
 auto-start. One writable owner
 per database is enforced by a sidecar `.writer.lock` file, which is retained
@@ -135,6 +141,19 @@ CSV 3/1 has no DPT declaration or description. GA Export 01 XML can include
 both, and all declared DPTs are retained rather than selecting the first.
 See [ETS import and safety rules](docs/ets-import.md). Stop `serve` before an
 import: its single-writer lease also protects metadata updates.
+
+`write-preview` performs no network action. `write` resolves ETS declarations
+again inside the capture owner before sending; an absent or ambiguous DPT needs
+`--dpt`, and an explicit DPT cannot contradict the imported declaration.
+Unsupported DPT identifiers and unparseable values fail before sending; the
+currently supported typed identifiers are listed in [ETS import and safety
+rules](docs/ets-import.md). `write-raw` is a
+separate expert command with an explicit `--inline` or `--bytes` payload. Every
+accepted attempt receives a durable `audit` record before transmission,
+identifying `typed_write`, `raw_write`, or `read`; an interrupted attempt remains
+`started` rather than appearing successful. `read` reports a matching
+group-value response or `no_response` after a bounded timeout. These paths
+have loopback tests only; no production write qualification has been performed.
 
 Run `serve` under a service manager if capture must survive terminal closure;
 use another terminal for `status`, `follow`, `history`, `export`, or `backup`

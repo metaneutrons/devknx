@@ -150,6 +150,17 @@ impl CaptureEvent {
         }
     }
 
+    /// Construct a local transmission event; this does not imply a bus response.
+    #[must_use]
+    pub fn sent(endpoint: CaptureEndpoint, frame: CemiFrame) -> Self {
+        Self {
+            observed_at: SystemTime::now(),
+            endpoint,
+            direction: CaptureDirection::Sent,
+            frame,
+        }
+    }
+
     /// Restore a validated event from durable storage.
     pub(crate) const fn from_stored(
         observed_at: SystemTime,

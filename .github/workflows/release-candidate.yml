@@ -3,6 +3,12 @@ name: Release candidate packaging
 # This workflow produces short-lived CI artifacts only. It cannot create a
 # GitHub Release, push a package, sign with publication credentials, or tag.
 on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Full tag for a release dispatch; empty in PR qualification
+        required: false
+        type: string
   pull_request:
     paths:
       - .github/workflows/release-candidate.yml
@@ -16,6 +22,9 @@ on:
 
 permissions:
   contents: read
+
+env:
+  RELEASE_TAG: ${{ inputs.tag }}
 
 concurrency:
   group: candidate-${{ github.ref }}
@@ -32,6 +41,36 @@ jobs:
           python-version: '3.13'
       - run: python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
       - run: bash -n scripts/release/build-deb.sh scripts/build-macos-app.sh
+
+  package-source:
+    name: Package tagged source
+    needs: package-tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Archive the exact commit with a full-tag directory
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --offline --no-deps --locked --format-version 1 |
+            jq -r '.packages[] | select(.name == "devknx") | .version')
+          tag="${RELEASE_TAG:-v$version}"
+          mkdir -p packages extracted
+          git archive --format=tar --prefix="devknx-$tag/" HEAD |
+            gzip -n -9 > "packages/devknx-$tag-source.tar.gz"
+          tar -xzf "packages/devknx-$tag-source.tar.gz" -C extracted
+          test -s "extracted/devknx-$tag/Cargo.lock"
+          test -s "extracted/devknx-$tag/THIRD-PARTY-NOTICES.md"
+          test -s "extracted/devknx-$tag/licenses/OFL-1.1.txt"
+          test "$(find extracted -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')" -eq 1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: candidate-source
+          path: packages/*
+          if-no-files-found: error
+          retention-days: 7
 
   build-linux:
     name: Build Linux ${{ matrix.target }}
@@ -109,7 +148,7 @@ jobs:
           chmod +x native/devknx
           version=$(cargo metadata --offline --no-deps --locked --format-version 1 |
             jq -r '.packages[] | select(.name == "devknx") | .version')
-          tag="v$version"
+          tag="${RELEASE_TAG:-v$version}"
           epoch=$(git show -s --format=%ct HEAD)
           python3 scripts/release/package_cli.py --tag "$tag" \
             --target '${{ matrix.target }}' --binary native/devknx \
@@ -159,7 +198,7 @@ jobs:
           set -euo pipefail
           version=$(cargo metadata --offline --no-deps --locked --format-version 1 |
             jq -r '.packages[] | select(.name == "devknx") | .version')
-          tag="v$version"
+          tag="${RELEASE_TAG:-v$version}"
           epoch=$(git show -s --format=%ct HEAD)
           python3 scripts/release/package_cli.py --tag "$tag" \
             --target aarch64-apple-darwin --binary target/release/devknx \
@@ -211,16 +250,17 @@ jobs:
             ConvertFrom-Json).packages | Where-Object name -eq 'devknx' |
             Select-Object -ExpandProperty version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tag = if ($env:RELEASE_TAG) { $env:RELEASE_TAG } else { "v$version" }
           $epoch = [int64](git show -s --format=%ct HEAD)
-          python scripts/release/package_cli.py --tag "v$version" `
+          python scripts/release/package_cli.py --tag $tag `
             --target '${{ matrix.target }}' --binary target/release/devknx.exe `
             --output-dir packages --source-date-epoch $epoch
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $archive = "packages/devknx-v$version-${{ matrix.target }}.zip"
+          $archive = "packages/devknx-$tag-${{ matrix.target }}.zip"
           Expand-Archive -Path $archive -DestinationPath unpacked
-          & "unpacked/devknx-v$version-${{ matrix.target }}/devknx.exe" --version
+          & "unpacked/devknx-$tag-${{ matrix.target }}/devknx.exe" --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if ((& "unpacked/devknx-v$version-${{ matrix.target }}/devknx.exe" --version) -ne "devknx $version") {
+          if ((& "unpacked/devknx-$tag-${{ matrix.target }}/devknx.exe" --version) -ne "devknx $version") {
             throw 'The extracted executable has the wrong version.'
           }
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -233,7 +273,7 @@ jobs:
   candidate-success:
     name: Candidate packaging success
     if: always()
-    needs: [package-tests, build-linux, package-linux, package-macos, package-windows]
+    needs: [package-tests, package-source, build-linux, package-linux, package-macos, package-windows]
     runs-on: ubuntu-24.04
     steps:
       - name: Require every package job

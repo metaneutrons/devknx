@@ -1,4 +1,4 @@
-# Initiative plan: devknx (v3)
+# Initiative plan: devknx (v4)
 
 Epic: [devknx initiative](https://github.com/metaneutrons/devknx/issues/3)
 Decision state: product scope agreed with Fabian in September 2026
@@ -163,7 +163,8 @@ Tracking: [M6 issue](https://github.com/metaneutrons/devknx/issues/9)
 Dependencies: M1 through M5
 
 - M6-A1: A hardened release candidate builds seven GitHub CLI archives, one
-  notarized macOS `.app.zip`, and two Debian packages. Every payload has
+  notarized macOS `.app.zip`, one deterministic source archive for the AUR
+  source package, and two Debian packages. Every payload has
   checksums, SBOM, signature, attestation and a clean-room smoke test. Every
   GUI payload also includes the embedded-font licence notices.
 - M6-A2: Homebrew CLI formula and macOS app cask, AUR source/binary packages, and the shared
@@ -208,3 +209,6 @@ use. No time or runner-cost estimate has been measured.
   following devserial's system-menu integration without importing its serial
   device controls. He reaffirmed that M6 distributes the macOS ARM64 CLI as
   a Homebrew formula and the app bundle as a separate co-installable cask.
+- 2026-09-27 (v4): Release preparation adds one deterministic, attested source
+  archive for the AUR source package. It supplements the agreed binary matrix;
+  it does not add a platform or authorize publication.

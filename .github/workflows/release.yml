@@ -471,7 +471,8 @@ jobs:
           grep -Fq "source_${{ matrix.arch }}=('$archive')" "$work/PKGBUILD"
           chown -R builder:builder "$work"
           su builder -c "cd '$work' && makepkg --cleanbuild --noconfirm"
-          mapfile -t packages < <(find "$work" -maxdepth 1 -name '*.pkg.tar.zst' \
+          # Arch Linux ARM currently defaults to .xz; x86_64 uses .zst.
+          mapfile -t packages < <(find "$work" -maxdepth 1 -name '*.pkg.tar.*' \
             ! -name '*-debug-*' | sort)
           test "${#packages[@]}" -eq 1
           pacman -U --noconfirm "${packages[0]}"
@@ -521,7 +522,7 @@ jobs:
           grep -Fq "source=(\"$archive\")" "$work/PKGBUILD"
           chown -R builder:builder "$work"
           su builder -c "cd '$work' && makepkg --cleanbuild --noconfirm"
-          mapfile -t packages < <(find "$work" -maxdepth 1 -name '*.pkg.tar.zst' \
+          mapfile -t packages < <(find "$work" -maxdepth 1 -name '*.pkg.tar.*' \
             ! -name '*-debug-*' | sort)
           test "${#packages[@]}" -eq 1
           namcap "$work/PKGBUILD" "${packages[0]}" | tee "$work/namcap.txt"

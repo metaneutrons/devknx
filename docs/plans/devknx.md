@@ -1,7 +1,8 @@
 # Initiative plan: devknx (v1)
 
-Epic: pending GitHub publication
-Decision state: proposed; product scope discussed with Fabian in September 2026
+Epic: pending GitHub issue
+Decision state: product scope agreed with Fabian in September 2026;
+repository public, implementation in progress
 
 ## Outcome and boundaries
 
@@ -23,9 +24,10 @@ USB is a documented compatibility gap against `KnxMonitor` until a KNX USB
 backend is designed and qualified. Importing complete `.knxproj` projects and
 guessing a DPT from payload bytes are outside the initial release.
 
-This plan does not authorize publication, modifying `KnxMonitor`, or changing
-the existing `metaneutrons.cc` project overview. Those actions occur only at
-their acceptance stages.
+The public repository is the project workspace, not a software release. This
+plan does not authorize releasing binaries or packages, modifying `KnxMonitor`,
+or changing the existing `metaneutrons.cc` project overview. Those actions
+occur only at their acceptance stages.
 
 ## Design and decisions
 
@@ -76,7 +78,7 @@ Authenticode promise in the initial release.
 
 ### M1: Local repository, application identity, and executable skeleton
 
-Execution: pending GitHub issue
+Execution: public repository bootstrapped; issue pending
 Dependencies: none
 
 - M1-A1: Repository starts cleanly with the pinned Rust toolchain, lockfile,
@@ -184,5 +186,4 @@ use. No time or runner-cost estimate has been measured.
   first stable IP release or the later `KnxMonitor` deprecation. The gap must
   be disclosed at that handoff.
 
-GitHub issue links will be added after the repository is published and
-tracking setup is authorized.
+GitHub issue links will be added when milestone tracking is set up.

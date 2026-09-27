@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Fabian Schmieder
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -89,7 +89,6 @@ struct LiveSmoke {
     reason = "independent visible GUI dialogs"
 )]
 struct MonitorApp {
-    database_input: String,
     primary_database: Option<PathBuf>,
     offline_capture: bool,
     model: Option<MonitorModel>,
@@ -101,7 +100,6 @@ struct MonitorApp {
     settings: ConnectionSettings,
     settings_draft: ConnectionSettings,
     error: Option<String>,
-    show_open: bool,
     show_settings: bool,
     show_gateways: bool,
     show_export: bool,
@@ -165,8 +163,7 @@ impl MonitorApp {
         });
         if let Some(database) = database {
             app.primary_database = Some(database.clone());
-            app.database_input = database.display().to_string();
-            app.attach(false);
+            app.attach(&database, false);
         }
         if let (Some(smoke), Some(model)) = (&mut app.live_smoke, &app.model) {
             smoke.phase = LiveSmokePhase::Stream {
@@ -176,18 +173,24 @@ impl MonitorApp {
         app
     }
 
-    fn attach(&mut self, offline: bool) {
-        let database = PathBuf::from(self.database_input.trim());
-        match MonitorModel::open(database.clone()) {
+    fn attach(&mut self, database: &Path, offline: bool) {
+        let same_primary = self.primary_database.as_ref().is_some_and(|primary| {
+            primary == database
+                || matches!(
+                    (primary.canonicalize(), database.canonicalize()),
+                    (Ok(left), Ok(right)) if left == right
+                )
+        });
+        let offline = offline && !same_primary;
+        match MonitorModel::open(database.to_path_buf()) {
             Ok(model) => {
-                self.follower = (!offline).then(|| Follower::start(database.clone()));
+                self.follower = (!offline).then(|| Follower::start(database.to_path_buf()));
                 self.model = Some(model);
                 self.offline_capture = offline;
                 self.error = None;
                 self.selected = None;
-                self.show_open = false;
                 if !offline {
-                    match interface::load_settings(&database) {
+                    match interface::load_settings(database) {
                         Ok(settings) => {
                             self.settings_draft = settings.clone();
                             self.settings = settings;
@@ -200,6 +203,22 @@ impl MonitorApp {
                 }
             }
             Err(error) => self.error = Some(error),
+        }
+    }
+
+    fn open_capture_dialog(&mut self) {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Open KNX Capture")
+            .add_filter("SQLite capture", &["sqlite", "sqlite3", "db"]);
+        if let Some(parent) = self
+            .primary_database
+            .as_ref()
+            .and_then(|path| path.parent())
+        {
+            dialog = dialog.set_directory(parent);
+        }
+        if let Some(database) = dialog.pick_file() {
+            self.attach(&database, true);
         }
     }
 
@@ -349,7 +368,7 @@ impl MonitorApp {
 
     fn process_menu(&mut self) -> bool {
         if platform::take(MenuAction::OpenDatabase) {
-            self.show_open = true;
+            self.open_capture_dialog();
         }
         if platform::take(MenuAction::ExportCsv) {
             self.show_export = true;
@@ -550,7 +569,7 @@ impl MonitorApp {
                         ui.label("Capture storage");
                         ui.small("History is stored automatically on this computer:");
                         ui.monospace(database.display().to_string());
-                        ui.small("File > Open Capture… can inspect a different existing capture.");
+                        ui.small("Open… chooses a saved capture with the system file dialog.");
                     }
                     ui.separator();
                     ui.horizontal(|ui| {
@@ -628,22 +647,6 @@ impl MonitorApp {
                 self.settings_draft.port = address.port();
                 self.show_gateways = false;
                 self.show_settings = true;
-            }
-        }
-        if self.show_open {
-            let mut open = self.show_open;
-            let mut attach = false;
-            egui::Window::new("Open Capture")
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    ui.label("Open a previously recorded capture file for offline inspection.");
-                    ui.small("The active capture remains in the default application storage.");
-                    ui.text_edit_singleline(&mut self.database_input);
-                    attach = ui.button("Attach").clicked();
-                });
-            self.show_open = open;
-            if attach {
-                self.attach(true);
             }
         }
         if self.show_export {
@@ -781,7 +784,7 @@ impl MonitorApp {
             return (
                 egui::Color32::RED,
                 "Storage unavailable",
-                "Choose a valid capture file in File > Open Capture…".into(),
+                "Use Open… to choose an existing capture file".into(),
             );
         };
         if self.offline_capture {
@@ -839,8 +842,7 @@ impl MonitorApp {
                 if ui.button("Live capture").clicked()
                     && let Some(database) = &self.primary_database
                 {
-                    self.database_input = database.display().to_string();
-                    self.attach(false);
+                    self.attach(&database.clone(), false);
                 }
             } else if ui
                 .add_enabled(
@@ -890,6 +892,13 @@ impl MonitorApp {
                 .clicked()
             {
                 self.show_write = true;
+            }
+            if ui
+                .button("Open…")
+                .on_hover_text("Open a saved capture file")
+                .clicked()
+            {
+                self.open_capture_dialog();
             }
             if ui
                 .add_enabled(self.model.is_some(), egui::Button::new("Export…"))
@@ -1121,12 +1130,19 @@ impl eframe::App for MonitorApp {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
                 ui.separator();
             }
-            if !self.offline_capture && self.model.as_ref().is_some_and(|model| model.rows.is_empty() && !model.owner_available) {
+            if !self.offline_capture
+                && self
+                    .model
+                    .as_ref()
+                    .is_some_and(|model| model.rows.is_empty() && !model.owner_available)
+            {
                 self.render_empty(ui);
             } else if self.model.is_some() {
                 scroll_offset = self.render_captures(ui);
             } else {
-                ui.label("Capture storage could not be opened. Use File > Open Capture… to inspect an existing file.");
+                ui.label(
+                    "Capture storage could not be opened. Use Open… to choose an existing file.",
+                );
             }
             if let Some(notice) = self.model.as_ref().and_then(|model| model.notices.last()) {
                 ui.separator();
@@ -1169,8 +1185,9 @@ mod tests {
         let mut app = MonitorApp::new(Some(database.clone()), None, false);
         assert!(app.follower.is_some());
         assert!(!app.offline_capture);
-        app.database_input = database.display().to_string();
-        app.attach(true);
+        let archive = directory.path().join("archive.sqlite");
+        drop(CaptureStore::open(&archive, NonZeroU32::new(10).unwrap()).unwrap());
+        app.attach(&archive, true);
         assert!(app.follower.is_none());
         assert_eq!(app.connection_status().1, "Offline capture");
         app.connect();
@@ -1180,8 +1197,10 @@ mod tests {
                 .unwrap()
                 .contains("Return to Live Capture")
         );
-        app.attach(false);
+        app.attach(&database, false);
         assert!(app.follower.is_some());
+        assert!(!app.offline_capture);
+        app.attach(&database, true);
         assert!(!app.offline_capture);
     }
 

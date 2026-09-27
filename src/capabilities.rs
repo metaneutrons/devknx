@@ -216,7 +216,7 @@ pub const GUI: &[Declaration] = &[
     },
     Declaration {
         capability: Capability::ServiceFollow,
-        source_anchor: "Follower::start(database.clone())",
+        source_anchor: "Follower::start(database.to_path_buf())",
     },
     Declaration {
         capability: Capability::EtsLookup,
@@ -417,7 +417,7 @@ mod tests {
             }
         }
         for needle in [
-            "Open Capture",
+            "Open…",
             "Discover gateways",
             "Settings…",
             "Connect",

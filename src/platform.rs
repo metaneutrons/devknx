@@ -7,7 +7,7 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum MenuAction {
-    /// Show the capture database picker.
+    /// Open the native capture-file picker.
     OpenDatabase = 1,
     /// Show export controls.
     ExportCsv = 2,

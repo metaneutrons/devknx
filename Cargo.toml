@@ -49,6 +49,7 @@ knx-rs-core = "0.10.1"
 knx-rs-ip = "0.10.1"
 quick-xml = "0.42"
 ratatui = { version = "0.30", optional = true }
+rfd = { version = "0.17.2", optional = true, default-features = false, features = ["xdg-portal"] }
 rmcp = { version = "3.4", default-features = false, features = ["server", "macros", "transport-io", "schemars"] }
 rusqlite = { version = "0.40", features = ["backup", "bundled"] }
 schemars = "1"
@@ -61,7 +62,7 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-
 
 [features]
 default = ["gui", "tui"]
-gui = ["dep:eframe", "dep:image", "dep:chrono"]
+gui = ["dep:eframe", "dep:image", "dep:chrono", "dep:rfd"]
 tui = ["dep:ratatui", "dep:crossterm", "dep:chrono"]
 full = ["gui", "tui"]
 

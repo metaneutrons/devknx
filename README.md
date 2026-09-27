@@ -92,6 +92,9 @@ press `s` to enter `tunnel://IP:3671` or `router://MULTICAST:3671`, then `c`
 to connect or disconnect. A running capture service remains active when an
 interactive window closes; use Disconnect or `c` to stop it. The optional
 `--database` selects a different existing capture for inspection or service use.
+The GUI opens its own capture history automatically. Use **Open…** (or
+**File > Open Capture…** on macOS) to choose another saved SQLite capture in
+the system file dialog; **Live capture** returns to the active history.
 
 The REST API is a separate opt-in process, bound to `127.0.0.1:8765` by
 default. It reads the same database and sends operations through the same

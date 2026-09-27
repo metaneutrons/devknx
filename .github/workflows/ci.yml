@@ -1,0 +1,195 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+
+jobs:
+  quality:
+    name: Format, clippy, licences
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # No dtolnay/rust-toolchain: the version lives in rust-toolchain.toml
+      # and rustup installs it from there. Two sources would be a source of
+      # error.
+      - run: rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo fmt --all -- --check
+      - name: Install Linux GUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
+      # The lefthook repository has no install.sh. Binary from the release
+      # asset, version pinned like any other dependency.
+      - name: Check the hook configuration
+        env:
+          LEFTHOOK_VERSION: '2.1.12'
+        run: |
+          set -euo pipefail
+          curl -sSfL \
+            "https://github.com/evilmartians/lefthook/releases/download/v${LEFTHOOK_VERSION}/lefthook_${LEFTHOOK_VERSION}_Linux_x86_64.gz" \
+            | gzip -d > "$RUNNER_TEMP/lefthook"
+          chmod +x "$RUNNER_TEMP/lefthook"
+          "$RUNNER_TEMP/lefthook" validate
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
+        with:
+          tool: cargo-deny
+      - run: cargo deny check
+
+  test:
+    name: Tests (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64,          runner: ubuntu-24.04,     features: '--all-features', coverage: true }
+          - { name: linux-x86_64-headless, runner: ubuntu-24.04,     features: '--no-default-features' }
+          - { name: linux-aarch64,         runner: ubuntu-24.04-arm, features: '--all-features' }
+          - { name: macos-aarch64,         runner: macos-15,         features: '--all-features' }
+          - { name: windows-x86_64,        runner: windows-2025,     features: '--all-features' }
+          - { name: windows-aarch64,       runner: windows-11-arm,   features: '--all-features' }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install Linux GUI build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
+      - uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
+        with:
+          tool: cargo-nextest
+      - uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
+        if: matrix.coverage == true
+        with:
+          tool: cargo-llvm-cov
+      - run: cargo clippy --workspace --all-targets --locked ${{ matrix.features }} -- -D warnings
+      - run: cargo nextest run --workspace --locked ${{ matrix.features }}
+      - run: cargo doc --workspace --no-deps --locked ${{ matrix.features }}
+        env:
+          RUSTDOCFLAGS: '-D warnings'
+      - name: Coverage with a hard floor
+        if: matrix.coverage == true
+        run: |
+          rustup component add llvm-tools-preview
+          # Local baseline was 19.30% with two CLI smoke tests; raise this as
+          # testable core logic is added.
+          cargo llvm-cov --workspace --all-features --locked --fail-under-lines 18
+      - name: Build unsigned Apple app shell
+        if: matrix.name == 'macos-aarch64'
+        run: |
+          scripts/build-macos-app.sh
+          file dist/devknx.app/Contents/MacOS/devknx | grep -F 'arm64'
+          test -s dist/devknx.app/Contents/Resources/devknx.icns
+
+  commit-hygiene:
+    name: Commit hygiene
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - name: Check title, body and every commit
+        # Title and body reach the script exclusively through env, never by
+        # interpolation into the script text: otherwise the pull request title
+        # would be a shell injection vector.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          status=0
+          cc='^((feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?!?: .+|Revert ".+")'
+          # grep works line by line, hence .* rather than [^\n]*: in ERE
+          # [^\n] would be the class "neither a backslash nor an n" and would
+          # exclude names containing an 'n'. In the RE2 rule of the ruleset
+          # [^\n] is the correct one. Anchored at the start of the line: by
+          # convention a trailer stands on a line of its own. Without the anchor
+          # the rule also fires when a pull request body merely mentions the
+          # forbidden trailer, for instance to describe a doctor finding, and it
+          # then rejects a valid input.
+          ban='^[[:space:]]*co-authored-by:.*(claude|anthropic)|^[[:space:]]*generated with.*claude code'
+
+          # On a squash merge the pull request title becomes the subject line
+          # on main and thereby determines the next version.
+          if ! printf '%s' "$PR_TITLE" | grep -Eq "$cc"; then
+            echo "::error::pull request title does not follow Conventional Commits: $PR_TITLE"
+            status=1
+          fi
+
+          # With squash_merge_commit_message=PR_BODY the body lands in the commit.
+          if printf '%s' "$PR_BODY" | grep -Eiq "$ban"; then
+            echo "::error::the pull request body contains an AI attribution trailer."
+            status=1
+          fi
+
+          for sha in $(git rev-list "${BASE_SHA}..${HEAD_SHA}"); do
+            if git log -1 --format=%B "$sha" | grep -Eiq "$ban"; then
+              echo "::error::commit $sha contains an AI attribution trailer."
+              status=1
+            fi
+            email=$(git log -1 --format='%ae%n%ce' "$sha")
+            if printf '%s' "$email" | grep -Fq 'noreply@anthropic.com'; then
+              echo "::error::commit $sha has an Anthropic address as author or committer."
+              status=1
+            fi
+          done
+
+          if [ "$status" -ne 0 ]; then
+            echo "::notice::switch this off for good in ~/.claude/settings.json: {\"attribution\":{\"commit\":\"\",\"pr\":\"\"}}"
+            exit 1
+          fi
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      # The pre-push hook scans only the new commits. The full scan over the
+      # history belongs here, otherwise the reasoning in commits.md is hollow.
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          # Mandatory since the action's breaking change: without a token it
+          # aborts on every pull request, and with a message about the missing
+          # token rather than about a finding. The automatically generated token
+          # suffices.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # If required for organisation use: a narrowly scoped CI tooling
+          # secret, never one from a publish environment.
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  # The only required check in the ruleset. Matrix changes therefore do not
+  # break the repository configuration.
+  ci-success:
+    name: CI Success
+    if: always()
+    needs: [quality, test, secrets, commit-hygiene]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Every preceding job must have succeeded or been skipped
+        run: |
+          set -euo pipefail
+          printf '%s\n' '${{ toJSON(needs) }}' |
+            jq -e 'all(.[]; .result == "success" or .result == "skipped")'

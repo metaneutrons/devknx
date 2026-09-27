@@ -150,7 +150,8 @@ Dependencies: M1 through M5
 
 - M6-A1: A hardened release candidate builds seven GitHub CLI archives, one
   notarized macOS `.app.zip`, and two Debian packages. Every payload has
-  checksums, SBOM, signature, attestation and a clean-room smoke test.
+  checksums, SBOM, signature, attestation and a clean-room smoke test. Every
+  GUI payload also includes the embedded-font licence notices.
 - M6-A2: Homebrew formula/cask, AUR source/binary packages, and the shared
   `deb.metaneutrons.cc` archive are published only after channel preflight
   and package installation tests. Published bytes match the qualified assets.

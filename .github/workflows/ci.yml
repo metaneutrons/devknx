@@ -82,6 +82,19 @@ jobs:
           tool: cargo-llvm-cov
       - run: cargo clippy --workspace --all-targets --locked ${{ matrix.features }} -- -D warnings
       - run: cargo nextest run --workspace --locked ${{ matrix.features }}
+      - name: Verify embedded Windows icon and counter-probe
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --locked ${{ matrix.features }}
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./scripts/check-windows-icon.ps1 -Executable target/debug/devknx.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $probe = Start-Process -FilePath (Get-Command pwsh).Source `
+            -ArgumentList @('-NoProfile', '-File', './scripts/check-windows-icon.ps1',
+              '-Executable', 'target/debug/devknx.exe', '-IconId', '32767') `
+            -Wait -PassThru -NoNewWindow
+          if ($probe.ExitCode -ne 23) { throw "The absent-icon counter-probe did not fail as expected" }
       - run: cargo doc --workspace --no-deps --locked ${{ matrix.features }}
         env:
           RUSTDOCFLAGS: '-D warnings'

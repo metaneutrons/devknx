@@ -1,8 +1,7 @@
 # Initiative plan: devknx (v1)
 
-Epic: pending GitHub issue
-Decision state: product scope agreed with Fabian in September 2026;
-repository public, implementation in progress
+Epic: [devknx initiative](https://github.com/metaneutrons/devknx/issues/3)
+Decision state: product scope agreed with Fabian in September 2026
 
 ## Outcome and boundaries
 
@@ -78,7 +77,7 @@ Authenticode promise in the initial release.
 
 ### M1: Local repository, application identity, and executable skeleton
 
-Execution: public repository bootstrapped; issue pending
+Tracking: [M1 issue](https://github.com/metaneutrons/devknx/issues/4)
 Dependencies: none
 
 - M1-A1: Repository starts cleanly with the pinned Rust toolchain, lockfile,
@@ -92,7 +91,7 @@ Dependencies: none
 
 ### M2: KNX capture and persistence
 
-Execution: pending GitHub issue
+Tracking: [M2 issue](https://github.com/metaneutrons/devknx/issues/5)
 Dependencies: M1
 
 - M2-A1: Tunnel, routing, and discovery use `knx-rs-ip`; connection failures,
@@ -106,7 +105,7 @@ Dependencies: M1
 
 ### M3: ETS metadata and DPT-safe operations
 
-Execution: pending GitHub issue
+Tracking: [M3 issue](https://github.com/metaneutrons/devknx/issues/6)
 Dependencies: M2
 
 - M3-A1: ETS CSV 3/1 and GA Export 01 XML fixtures import names, descriptions,
@@ -120,7 +119,7 @@ Dependencies: M2
 
 ### M4: Human interfaces
 
-Execution: pending GitHub issue
+Tracking: [M4 issue](https://github.com/metaneutrons/devknx/issues/7)
 Dependencies: M2, M3
 
 - M4-A1: CLI, `ratatui` TUI, and native `egui` GUI expose connection state,
@@ -133,7 +132,7 @@ Dependencies: M2, M3
 
 ### M5: Automation interfaces
 
-Execution: pending GitHub issue
+Tracking: [M5 issue](https://github.com/metaneutrons/devknx/issues/8)
 Dependencies: M2, M3
 
 - M5-A1: Versioned REST routes, OpenAPI schemas, pagination, health and SSE
@@ -147,7 +146,7 @@ Dependencies: M2, M3
 
 ### M6: Publication and migration
 
-Execution: pending GitHub issue
+Tracking: [M6 issue](https://github.com/metaneutrons/devknx/issues/9)
 Dependencies: M1 through M5
 
 - M6-A1: A hardened release candidate builds seven GitHub CLI archives, one
@@ -185,5 +184,3 @@ use. No time or runner-cost estimate has been measured.
 - 2026-09-27: Fabian confirmed that KNX-USB is not a prerequisite for the
   first stable IP release or the later `KnxMonitor` deprecation. The gap must
   be disclosed at that handoff.
-
-GitHub issue links will be added when milestone tracking is set up.

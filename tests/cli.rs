@@ -16,10 +16,19 @@ fn help_describes_available_commands() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 help");
     assert!(stdout.contains("discover"));
+    assert!(stdout.contains("monitor"));
     #[cfg(feature = "gui")]
     assert!(stdout.contains("gui"));
     #[cfg(not(feature = "gui"))]
     assert!(!stdout.contains("gui"));
+}
+
+#[test]
+fn monitor_rejects_invalid_endpoint_without_connecting() {
+    let output = devknx(&["monitor", "http://192.0.2.1:3671"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 error");
+    assert!(stderr.contains("unsupported scheme"));
 }
 
 #[test]

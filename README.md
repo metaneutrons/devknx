@@ -17,7 +17,7 @@
 </p>
 
 > [!IMPORTANT]
-> **Early development.** There is no stable release yet. The current code discovers KNXnet/IP gateways from a CLI and a native GUI shell. It does **not** yet monitor telegrams, import ETS exports, or send group values. Do not use it to operate a live installation.
+> **Early development.** There is no stable release yet. The CLI can discover gateways and print raw telegrams from a KNXnet/IP tunnel or router. The native GUI is still a discovery shell. There is no persistent history, ETS import, or group-value sending. Do not use it to operate a live installation.
 
 ## What devknx is building
 
@@ -30,7 +30,7 @@ desktop button and an API call.
 | Capability | Current state |
 | --- | --- |
 | KNXnet/IP gateway discovery | CLI and native GUI shell available |
-| KNXnet/IP tunneling and routing capture | Planned |
+| KNXnet/IP tunneling and routing capture | Experimental CLI stream; no persistence or automatic reconnect yet |
 | Durable, searchable telegram history | Planned |
 | ETS group-address CSV and XML import | Planned |
 | DPT-validated read, write preview, and write | Planned |
@@ -56,6 +56,8 @@ Install [Rust via rustup](https://rustup.rs/), then run:
 git clone https://github.com/metaneutrons/devknx.git
 cd devknx
 cargo run --locked -- discover
+cargo run --locked -- monitor tunnel://192.0.2.1:3671
+cargo run --locked -- monitor router://224.0.23.12:3671
 cargo run --locked -- gui
 ```
 
@@ -63,6 +65,14 @@ Gateway discovery sends KNXnet/IP multicast on the local network. Network
 equipment and host firewall rules can affect the result. The GUI can also be
 opened without a gateway; its current purpose is to exercise the native app
 shell and discovery view.
+
+`monitor` prints one line per received cEMI frame, including a millisecond
+timestamp, endpoint, source and destination addresses, group-value service,
+and the exact raw frame in hexadecimal. Press Ctrl-C to close the connection.
+An unexpected connection close is an error; the current stream does not
+reconnect. Only receive-side frames are captured in this development build.
+The endpoints above are examples, not verified gateways; substitute your own
+network addresses. No live-bus qualification has been performed yet.
 
 For a headless CLI build:
 

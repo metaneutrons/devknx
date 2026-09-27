@@ -27,7 +27,7 @@ eframe = { version = "0.36", optional = true, default-features = false, features
 image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 knx-rs-core = "0.10.0"
 knx-rs-ip = "0.10.0"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 
 [features]
 default = ["gui"]

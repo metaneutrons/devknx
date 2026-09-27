@@ -9,6 +9,20 @@ repository = "https://github.com/metaneutrons/devknx"
 publish = false
 build = "build.rs"
 
+[package.metadata.deb]
+maintainer = "Fabian Schmieder <metaneutrons@users.noreply.github.com>"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/devknx", "usr/bin/", "755"],
+    ["LICENSE", "usr/share/doc/devknx/LICENSE", "644"],
+    ["THIRD-PARTY-NOTICES.md", "usr/share/doc/devknx/THIRD-PARTY-NOTICES.md", "644"],
+    ["licenses/Hack.txt", "usr/share/doc/devknx/licenses/Hack.txt", "644"],
+    ["licenses/OFL-1.1.txt", "usr/share/doc/devknx/licenses/OFL-1.1.txt", "644"],
+    ["licenses/UFL-1.0.txt", "usr/share/doc/devknx/licenses/UFL-1.0.txt", "644"],
+    ["licenses/emoji-icon-font-MIT.txt", "usr/share/doc/devknx/licenses/emoji-icon-font-MIT.txt", "644"],
+]
+
 [lints.rust]
 unsafe_code = "deny"
 

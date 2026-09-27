@@ -16,6 +16,8 @@ pub enum Capability {
     GatewayDiscovery,
     /// Receive and display KNXnet/IP telegrams.
     LiveCapture,
+    /// Run independent, persistent foreground capture.
+    CaptureService,
     /// Read committed telegrams from SQLite by event ID.
     HistoryRead,
     /// Export committed telegrams as CSV.
@@ -26,6 +28,7 @@ pub enum Capability {
 pub const ALL: &[Capability] = &[
     Capability::GatewayDiscovery,
     Capability::LiveCapture,
+    Capability::CaptureService,
     Capability::HistoryRead,
     Capability::CsvExport,
 ];
@@ -57,6 +60,10 @@ pub const CLI: &[Declaration] = &[
     Declaration {
         capability: Capability::LiveCapture,
         source_anchor: "Some(Command::Monitor {",
+    },
+    Declaration {
+        capability: Capability::CaptureService,
+        source_anchor: "Some(Command::Serve {",
     },
     Declaration {
         capability: Capability::HistoryRead,
@@ -96,6 +103,13 @@ pub const GAPS: &[Gap] = &[
         present_on: Surface::Cli,
         missing_on: Surface::Gui,
         reason: "The GUI is a discovery shell; live capture is an M4 interface deliverable.",
+        target_issue: "https://github.com/metaneutrons/devknx/issues/7",
+    },
+    Gap {
+        capability: Capability::CaptureService,
+        present_on: Surface::Cli,
+        missing_on: Surface::Gui,
+        reason: "The GUI cannot yet start or attach to the independent capture process.",
         target_issue: "https://github.com/metaneutrons/devknx/issues/7",
     },
     Gap {

@@ -17,7 +17,7 @@
 </p>
 
 > [!IMPORTANT]
-> **Early development.** There is no stable release yet. The CLI can discover gateways, capture raw telegrams from a KNXnet/IP tunnel or router, and optionally retain them in SQLite. The native GUI is still a discovery shell. There is no background capture daemon, ETS import, or group-value sending. Do not use it to operate a live installation.
+> **Early development.** There is no stable release yet. The CLI can discover gateways, capture raw telegrams from a KNXnet/IP tunnel or router, and retain them in SQLite through a foreground capture process. The native GUI is still a discovery shell. There is no IPC-enabled background daemon, ETS import, or group-value sending. Do not use it to operate a live installation.
 
 ## What devknx is building
 
@@ -31,6 +31,7 @@ desktop button and an API call.
 | --- | --- |
 | KNXnet/IP gateway discovery | CLI and native GUI shell available |
 | KNXnet/IP tunneling and routing capture | Experimental CLI stream with bounded reconnect and optional SQLite persistence |
+| Independent capture process | Experimental foreground `serve` command; no IPC or automatic startup yet |
 | Durable, searchable telegram history | Experimental SQLite history with ID cursor, retention cap, and CSV export; filters/search and the background daemon are pending |
 | ETS group-address CSV and XML import | Planned |
 | DPT-validated read, write preview, and write | Planned |
@@ -59,6 +60,7 @@ cargo run --locked -- discover
 cargo run --locked -- monitor tunnel://192.0.2.1:3671
 cargo run --locked -- monitor router://224.0.23.12:3671
 cargo run --locked -- monitor tunnel://192.0.2.1:3671 --database captures.sqlite
+cargo run --locked -- serve tunnel://192.0.2.1:3671 --database captures.sqlite
 cargo run --locked -- history --database captures.sqlite --after 0 --limit 100
 cargo run --locked -- export --database captures.sqlite > captures.csv
 cargo run --locked -- gui
@@ -88,8 +90,18 @@ commands fail rather than create an empty database if the path is wrong.
 Existing databases with an unsupported schema are not rewritten. The CLI now
 runs an in-process connection owner and live event bus; capture continues if
 its terminal subscriber falls behind. The connection and database are still
-owned only while `monitor` is running. A standalone background daemon and
-cross-process subscription API remain planned.
+owned only while `monitor` is running. `serve` runs the same capture owner in a
+separate foreground process; it can be kept alive by a service manager while
+`history` and `export` read the database from other processes. It does not
+detach, auto-start, or provide live IPC to other frontends. One writable owner
+per database is enforced by a sidecar `.writer.lock` file, which is retained
+across restarts and must not be deleted while capture runs. On Unix, a writable
+capture directory must not be group- or world-writable. An IPC-enabled daemon
+and cross-process live subscription remain planned.
+
+Run `serve` under a service manager if capture must survive terminal closure;
+use another terminal for `history` or `export` while it runs.
+
 Capture files can reveal activity in a building. Newly created SQLite files
 are private to the current user on Unix; choose a protected directory and
 apply suitable access controls for existing files and on Windows.

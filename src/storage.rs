@@ -333,7 +333,7 @@ fn acquire_writer_lease(database_path: &Path) -> Result<Option<File>, StorageErr
             _ => {}
         }
         let mut options = OpenOptions::new();
-        options.write(true).create(true).mode(0o600);
+        options.write(true).create(true).truncate(false).mode(0o600);
         let file = options.open(&lease_path)?;
         lock_writer_file(file, lease_path)
     }
@@ -342,6 +342,7 @@ fn acquire_writer_lease(database_path: &Path) -> Result<Option<File>, StorageErr
         let file = OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&lease_path)?;
         lock_writer_file(file, lease_path)
     }

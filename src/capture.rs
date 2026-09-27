@@ -52,11 +52,38 @@ pub enum GroupService {
     Other,
 }
 
+/// Direction relative to this application, not a claim of bus delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureDirection {
+    /// Received from a KNXnet/IP connection.
+    Received,
+    /// Locally transmitted; no device response is implied.
+    Sent,
+}
+
+impl CaptureDirection {
+    /// Stable lowercase representation for storage and text output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Received => "received",
+            Self::Sent => "sent",
+        }
+    }
+}
+
+impl std::fmt::Display for CaptureDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One received telegram, with the exact cEMI frame retained for replay and export.
 #[derive(Clone, Debug)]
 pub struct CaptureEvent {
     observed_at: SystemTime,
     endpoint: CaptureEndpoint,
+    direction: CaptureDirection,
     frame: CemiFrame,
 }
 
@@ -67,6 +94,22 @@ impl CaptureEvent {
         Self {
             observed_at: SystemTime::now(),
             endpoint,
+            direction: CaptureDirection::Received,
+            frame,
+        }
+    }
+
+    /// Restore a validated event from durable storage.
+    pub(crate) const fn from_stored(
+        observed_at: SystemTime,
+        endpoint: CaptureEndpoint,
+        direction: CaptureDirection,
+        frame: CemiFrame,
+    ) -> Self {
+        Self {
+            observed_at,
+            endpoint,
+            direction,
             frame,
         }
     }
@@ -81,6 +124,12 @@ impl CaptureEvent {
     #[must_use]
     pub const fn endpoint(&self) -> CaptureEndpoint {
         self.endpoint
+    }
+
+    /// Direction relative to this application.
+    #[must_use]
+    pub const fn direction(&self) -> CaptureDirection {
+        self.direction
     }
 
     /// Parsed cEMI frame; [`CemiFrame::as_bytes`] returns its original wire bytes.

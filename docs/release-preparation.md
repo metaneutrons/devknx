@@ -5,8 +5,9 @@ on packaging pull requests and can also be dispatched manually. Its token has
 read-only repository access. It creates no tag, GitHub Release, package-channel
 update, signature, or notarization submission.
 
-Release Please uses the single-crate Rust strategy and the checked-in 0.1.0
-manifest to propose a version/changelog pull request. It synchronizes
+Release Please uses the single-crate Rust strategy and a 0.0.0 bootstrap
+manifest to propose 0.1.0 as the first version. The source crate remains at
+0.1.0 until that proposal is merged. Release Please synchronizes
 `Cargo.toml`, `Cargo.lock`, the manifest, and `CHANGELOG.md`. The proposal
 must remain unmerged until the release is separately authorized. Only its
 merge creates the immutable tag and draft GitHub release, then dispatches
@@ -53,8 +54,11 @@ and arm64. A failed APT read-back leaves the previous index in service; it
 cannot roll back a GitHub release already promoted.
 
 GitHub has two isolated environments. `release-please` accepts only
-`main` and holds only its dedicated App key. `release` accepts only
-`v*` tags and holds Apple signing/notary credentials, the AUR SSH key, and
+`main` and holds the shared Release Please App key; the workflow requests an
+installation token limited to `devknx` with only Contents and Pull Requests
+write access. The App key itself can mint tokens for other repositories in its
+existing installations, so its custody remains security-critical. `release`
+accepts only `v*` tags and holds Apple signing/notary credentials, the AUR SSH key, and
 the dedicated Homebrew and central-archive App keys. The first stable release
 and the subsequent KnxMonitor deprecation require Fabian's separate release
 instruction. The pipeline cannot be claimed end-to-end qualified until a tag

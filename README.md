@@ -35,7 +35,7 @@ desktop button and an API call.
 | Durable telegram history | Experimental SQLite history with ID cursor and retention cap; interactive views filter the loaded window and export the full retained history |
 | ETS group-address CSV and XML import | Experimental CLI import; TUI and GUI display active ETS labels and DPT declarations |
 | DPT-validated read, write preview, and write | Experimental CLI/TUI/GUI operations through the single capture owner; loopback-qualified, not yet hardware-qualified |
-| Terminal UI and native desktop UI | Experimental; platform and sustained-traffic qualification remains |
+| Terminal UI and native desktop UI | Experimental; automated window, menu, sustained-capture, scrolling, and owner-restart qualification passes on the supported GUI platforms; visual review is deferred |
 | Local REST and MCP interfaces | Planned |
 
 ETS group-address metadata is stored in separate revisions without changing
@@ -221,6 +221,9 @@ defines the live method; measured results and limits are recorded in the
 Fabian's repositories; it does not require a separate project website.
 The [capability registry](src/capabilities.rs) records which current operations
 exist in the CLI, TUI and GUI and why their coverage differs during development.
+The [M4 qualification record](https://github.com/metaneutrons/devknx/issues/7)
+links the native GUI live/reconnect CI run and the TUI 5,000-row test. These
+tests do not replace a visual review of the app before the first stable release.
 
 ## Development and security
 

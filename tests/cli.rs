@@ -7,6 +7,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use devknx::capture::{CaptureEndpoint, CaptureEvent};
+use devknx::ipc::{IpcClient, IpcMessage, WireState};
 use devknx::storage::CaptureStore;
 use knx_rs_core::address::{DestinationAddress, GroupAddress, IndividualAddress};
 use knx_rs_core::cemi::CemiFrame;
@@ -22,6 +23,16 @@ fn devknx(args: &[&str]) -> std::process::Output {
         .expect("run devknx")
 }
 
+fn response_frame() -> CemiFrame {
+    CemiFrame::new_l_data(
+        MessageCode::LDataInd,
+        IndividualAddress::from_raw(0x1101),
+        DestinationAddress::Group(GroupAddress::from_raw(0x0801)),
+        Priority::Low,
+        &[0x00, 0x40, 0x2a],
+    )
+}
+
 #[test]
 fn help_describes_available_commands() {
     let output = devknx(&["--help"]);
@@ -33,6 +44,8 @@ fn help_describes_available_commands() {
     assert!(stdout.contains("history"));
     assert!(stdout.contains("export"));
     assert!(stdout.contains("backup"));
+    assert!(stdout.contains("status"));
+    assert!(stdout.contains("follow"));
     #[cfg(feature = "gui")]
     assert!(stdout.contains("gui"));
     #[cfg(not(feature = "gui"))]
@@ -140,6 +153,115 @@ async fn serve_recovers_committed_history_after_process_termination() {
         .collect();
     assert!(values.contains(&41), "first process capture was lost");
     assert!(values.contains(&42), "second process capture was lost");
+}
+
+#[tokio::test]
+async fn independent_capture_process_streams_committed_frames_over_local_ipc() {
+    use std::fmt::Write as _;
+
+    struct CaptureChild(Child);
+
+    impl Drop for CaptureChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("ipc.sqlite");
+    let server = DeviceServer::start_at("127.0.0.1:0".parse().expect("loopback address"))
+        .await
+        .expect("start KNX tunnel server");
+    let endpoint = format!("tunnel://{}", server.local_addr());
+    let child = Command::new(env!("CARGO_BIN_EXE_devknx"))
+        .args([
+            "serve",
+            &endpoint,
+            "--database",
+            path.to_str().expect("UTF-8 test path"),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start capture process");
+    let mut child = CaptureChild(child);
+
+    let received = tokio::time::timeout(Duration::from_secs(15), async {
+        let mut client = loop {
+            if let Ok(client) = IpcClient::connect(&path, true).await {
+                break client;
+            }
+            assert!(
+                child
+                    .0
+                    .try_wait()
+                    .expect("capture process status")
+                    .is_none(),
+                "capture process exited before IPC became available"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let status = devknx(&[
+            "status",
+            "--database",
+            path.to_str().expect("UTF-8 test path"),
+        ]);
+        assert!(status.status.success(), "{:?}", status.stderr);
+        let status_record: IpcMessage =
+            serde_json::from_slice(&status.stdout).expect("one JSON status record");
+        assert!(matches!(status_record, IpcMessage::State { .. }));
+        loop {
+            match client.next().await.expect("read local status") {
+                Some(IpcMessage::State {
+                    value: WireState::Connected { .. },
+                }) => break,
+                Some(_) => {}
+                None => panic!("local IPC closed before connection"),
+            }
+        }
+
+        let expected = response_frame();
+        let original = expected.as_bytes().to_vec();
+        server
+            .send_frame(expected)
+            .await
+            .expect("send loopback frame");
+        loop {
+            match client.next().await.expect("read live capture") {
+                Some(IpcMessage::Capture {
+                    id: Some(id),
+                    raw_cemi,
+                    service,
+                    ..
+                }) => {
+                    assert_eq!(id, 1);
+                    assert_eq!(service, "Response");
+                    let expected_hex = original.iter().fold(String::new(), |mut text, byte| {
+                        write!(&mut text, "{byte:02x}").expect("write to String");
+                        text
+                    });
+                    assert_eq!(raw_cemi, expected_hex);
+                    break;
+                }
+                Some(_) => {}
+                None => panic!("local IPC closed before capture"),
+            }
+        }
+    })
+    .await;
+    assert!(received.is_ok(), "IPC capture timed out");
+    child.0.kill().expect("terminate capture process");
+    child.0.wait().expect("reap capture process");
+    server.stop().await;
+    assert_eq!(
+        CaptureStore::open_existing(&path)
+            .expect("replay after process death")
+            .read_after(0, NonZeroU32::new(10).expect("nonzero"))
+            .expect("read committed capture")
+            .len(),
+        1
+    );
 }
 
 #[test]

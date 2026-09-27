@@ -25,6 +25,7 @@ allow = [
     "BSD-3-Clause",
     "BSL-1.0", # Clipboard dependencies on Windows.
     "ISC",
+    "0BSD", # interprocess's permissive alternative to Apache-2.0.
     "OFL-1.1", # eframe's bundled default fonts.
     "Ubuntu-font-1.0", # eframe's bundled default fonts.
     "Unicode-3.0",

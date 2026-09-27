@@ -326,6 +326,8 @@ fn parse_csv(text: &str) -> Result<BTreeMap<u16, EtsGroup>, EtsError> {
     let mut width = None;
     let mut main_name = String::new();
     let mut middle_name = String::new();
+    let mut main_context = None;
+    let mut middle_context = None;
     for (index, record) in reader.records().enumerate() {
         let record = record?;
         if record.iter().all(|value| value.trim().is_empty()) {
@@ -368,6 +370,8 @@ fn parse_csv(text: &str) -> Result<BTreeMap<u16, EtsGroup>, EtsError> {
             }
             main_name.clone_from(&columns[0]);
             middle_name.clear();
+            main_context = Some(parsed);
+            middle_context = None;
             continue;
         }
         if let Some(prefix) = notation.strip_suffix("/-") {
@@ -384,13 +388,31 @@ fn parse_csv(text: &str) -> Result<BTreeMap<u16, EtsGroup>, EtsError> {
             if GroupAddress::new_3level(main, middle, 0).is_err() {
                 return Err(EtsError::Address(notation.clone()));
             }
+            if main_context.is_some_and(|current| current != main) {
+                return Err(EtsError::Structure(format!(
+                    "CSV row {} middle range does not match current main range",
+                    index + 1
+                )));
+            }
             middle_name.clone_from(&columns[1]);
+            middle_context = Some((main, middle));
             continue;
         }
         let address = parse_group_address(notation)?;
         if notation.split('/').count() != 3 || columns[2].is_empty() {
             return Err(EtsError::Structure(format!(
                 "CSV row {} is not a named 3-level address",
+                index + 1
+            )));
+        }
+        let main_address = u8::try_from(address.raw() >> 11).expect("five-bit main address");
+        let middle_address =
+            u8::try_from((address.raw() >> 8) & 0x07).expect("three-bit middle address");
+        if (columns[0].is_empty() && main_context != Some(main_address))
+            || (columns[1].is_empty() && middle_context != Some((main_address, middle_address)))
+        {
+            return Err(EtsError::Structure(format!(
+                "CSV row {} has no matching parent range",
                 index + 1
             )));
         }
@@ -563,6 +585,14 @@ fn parse_xml(text: &str) -> Result<BTreeMap<u16, EtsGroup>, EtsError> {
             Event::DocType(_) => {
                 return Err(EtsError::Structure("XML DTD is forbidden".to_owned()));
             }
+            Event::Text(value) if !value.as_ref().trim().is_empty() => {
+                return Err(EtsError::Structure(
+                    "unexpected XML text content".to_owned(),
+                ));
+            }
+            Event::CData(_) => {
+                return Err(EtsError::Structure("XML CDATA is unsupported".to_owned()));
+            }
             Event::Eof => break,
             _ => {}
         }
@@ -674,6 +704,17 @@ mod tests {
         let namespace = XML_STANDARD.replace(GA_EXPORT_NAMESPACE, "http://example.invalid");
         assert!(matches!(
             parse_xml_fixture(&namespace),
+            Err(EtsError::Structure(_))
+        ));
+        let stale_hierarchy = CSV_STANDARD.replace("1/2/3", "2/2/3");
+        assert!(matches!(
+            parse_csv_fixture(&stale_hierarchy),
+            Err(EtsError::Structure(_))
+        ));
+        let text =
+            XML_STANDARD.replace("</GroupAddress-Export>", "unexpected</GroupAddress-Export>");
+        assert!(matches!(
+            parse_xml_fixture(&text),
             Err(EtsError::Structure(_))
         ));
     }

@@ -11,14 +11,15 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
 use knx_rs_core::cemi::CemiFrame;
+use knx_rs_ip::RoutingLostMessage;
 use rusqlite::{
     Connection, MAIN_DB, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 use thiserror::Error;
 
-use crate::capture::{CaptureDirection, CaptureEndpoint, CaptureEvent};
+use crate::capture::{CaptureDirection, CaptureEndpoint, CaptureEvent, RoutingLossEvent};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 /// Maximum number of rows returned by one cursor query.
 pub const MAX_PAGE_SIZE: u32 = 1_000;
 const EXPORT_PAGE_SIZE: NonZeroU32 = NonZeroU32::new(500).expect("nonzero export page size");
@@ -41,6 +42,19 @@ const SCHEMA_V1: &str = "
     CREATE INDEX idx_capture_time ON capture_events(observed_at_ms);
     CREATE INDEX idx_capture_destination ON capture_events(destination_raw, id);
     PRAGMA user_version = 1;
+";
+
+const SCHEMA_V2: &str = "
+    CREATE TABLE routing_loss_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        observed_at_ms INTEGER NOT NULL CHECK (observed_at_ms >= 0),
+        endpoint TEXT NOT NULL,
+        source TEXT NOT NULL,
+        device_state INTEGER NOT NULL CHECK (device_state BETWEEN 0 AND 255),
+        lost_messages INTEGER NOT NULL CHECK (lost_messages BETWEEN 0 AND 65535)
+    );
+    CREATE INDEX idx_routing_loss_time ON routing_loss_events(observed_at_ms);
+    PRAGMA user_version = 2;
 ";
 
 /// Errors opening, writing, reading, or exporting capture history.
@@ -87,6 +101,17 @@ pub enum StorageError {
         /// Validation failure.
         reason: String,
     },
+    /// A stored router diagnostic is invalid.
+    #[error("corrupt routing-loss row {id}: {reason}")]
+    CorruptRoutingLoss {
+        /// Diagnostic ID.
+        id: i64,
+        /// Validation failure.
+        reason: String,
+    },
+    /// Router diagnostics must be associated with a multicast endpoint.
+    #[error("routing loss requires a router endpoint")]
+    InvalidRouterEndpoint,
 }
 
 /// One durable capture with its monotonic database ID.
@@ -96,6 +121,15 @@ pub struct StoredCapture {
     pub id: i64,
     /// The raw-preserving capture event.
     pub event: CaptureEvent,
+}
+
+/// One durable router-reported loss diagnostic with a monotonic ID.
+#[derive(Debug)]
+pub struct StoredRoutingLoss {
+    /// Monotonic ID within the router-loss history.
+    pub id: i64,
+    /// Source, device state and reported routing-frame loss count.
+    pub event: RoutingLossEvent,
 }
 
 /// Single-owner SQLite capture store.
@@ -145,7 +179,7 @@ impl CaptureStore {
     ///
     /// # Errors
     ///
-    /// Returns an error if the file is absent, unreadable, or not schema version 1.
+    /// Returns an error if the file is absent, unreadable, or has an unsupported schema.
     pub fn open_existing(path: &Path) -> Result<Self, StorageError> {
         let database_path = normalized_sqlite_path(path)?;
         let connection = Connection::open_with_flags(
@@ -233,6 +267,81 @@ impl CaptureStore {
         prune(&transaction, max_events)?;
         transaction.commit()?;
         Ok(id)
+    }
+
+    /// Atomically append a router-reported loss and prune its separate history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store is read-only, the endpoint is not a router,
+    /// or the transaction fails.
+    pub fn insert_routing_loss(&mut self, event: &RoutingLossEvent) -> Result<i64, StorageError> {
+        let max_events = self.max_events.ok_or(StorageError::ReadOnly)?;
+        let CaptureEndpoint::Router(endpoint) = event.endpoint() else {
+            return Err(StorageError::InvalidRouterEndpoint);
+        };
+        let observed_at_ms = i64::try_from(
+            event
+                .observed_at()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| StorageError::InvalidTimestamp)?
+                .as_millis(),
+        )
+        .map_err(|_| StorageError::InvalidTimestamp)?;
+        let report = event.report();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO routing_loss_events (
+                observed_at_ms, endpoint, source, device_state, lost_messages
+            ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                observed_at_ms,
+                endpoint.to_string(),
+                report.source.to_string(),
+                i64::from(report.device_state),
+                i64::from(report.lost_messages),
+            ],
+        )?;
+        let id = transaction.last_insert_rowid();
+        prune(&transaction, max_events)?;
+        transaction.commit()?;
+        Ok(id)
+    }
+
+    /// Read router-loss diagnostics strictly after a separate monotonic cursor.
+    ///
+    /// A read-only schema-v1 store has no diagnostics table and returns an
+    /// empty page; opening it for writing migrates it to v2.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid bounds, SQLite failure, or corrupt data.
+    pub fn read_routing_losses_after(
+        &self,
+        cursor: i64,
+        limit: NonZeroU32,
+    ) -> Result<Vec<StoredRoutingLoss>, StorageError> {
+        if cursor < 0 {
+            return Err(StorageError::InvalidCursor(cursor));
+        }
+        if limit.get() > MAX_PAGE_SIZE {
+            return Err(StorageError::PageTooLarge(limit.get()));
+        }
+        if schema_version(&self.connection)? == 1 {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT id, observed_at_ms, endpoint, source, device_state, lost_messages
+             FROM routing_loss_events WHERE id > ?1 ORDER BY id LIMIT ?2",
+        )?;
+        let mut rows = statement.query(params![cursor, limit.get()])?;
+        let mut reports = Vec::new();
+        while let Some(row) = rows.next()? {
+            reports.push(decode_routing_loss_row(row)?);
+        }
+        Ok(reports)
     }
 
     /// Read events strictly after `cursor`, ordered by ID.
@@ -448,6 +557,14 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             transaction.execute_batch(SCHEMA_V1)?;
+            transaction.execute_batch(SCHEMA_V2)?;
+            transaction.commit()?;
+            Ok(())
+        }
+        1 => {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(SCHEMA_V2)?;
             transaction.commit()?;
             Ok(())
         }
@@ -458,7 +575,7 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
 
 fn require_schema(connection: &Connection) -> Result<(), StorageError> {
     let version = schema_version(connection)?;
-    if version == SCHEMA_VERSION {
+    if (1..=SCHEMA_VERSION).contains(&version) {
         Ok(())
     } else {
         Err(StorageError::UnsupportedSchema(version))
@@ -473,6 +590,12 @@ fn prune(transaction: &Transaction<'_>, max_events: NonZeroU32) -> Result<(), St
     transaction.execute(
         "DELETE FROM capture_events WHERE id <= (
             SELECT id FROM capture_events ORDER BY id DESC LIMIT 1 OFFSET ?1
+        )",
+        [max_events.get()],
+    )?;
+    transaction.execute(
+        "DELETE FROM routing_loss_events WHERE id <= (
+            SELECT id FROM routing_loss_events ORDER BY id DESC LIMIT 1 OFFSET ?1
         )",
         [max_events.get()],
     )?;
@@ -555,6 +678,43 @@ fn decode_row(row: &rusqlite::Row<'_>) -> Result<StoredCapture, StorageError> {
     })
 }
 
+fn decode_routing_loss_row(row: &rusqlite::Row<'_>) -> Result<StoredRoutingLoss, StorageError> {
+    let id: i64 = row.get(0)?;
+    let corrupt = |reason: &str| StorageError::CorruptRoutingLoss {
+        id,
+        reason: reason.to_owned(),
+    };
+    let observed_at_ms: i64 = row.get(1)?;
+    let observed_at = u64::try_from(observed_at_ms)
+        .ok()
+        .and_then(|ms| UNIX_EPOCH.checked_add(Duration::from_millis(ms)))
+        .ok_or_else(|| corrupt("invalid timestamp"))?;
+    let endpoint: String = row.get(2)?;
+    let endpoint: SocketAddr = endpoint.parse().map_err(|_| corrupt("invalid endpoint"))?;
+    if !endpoint.ip().is_multicast() {
+        return Err(corrupt("endpoint is not multicast"));
+    }
+    let source: String = row.get(3)?;
+    let source: SocketAddr = source.parse().map_err(|_| corrupt("invalid source"))?;
+    let device_state: i64 = row.get(4)?;
+    let device_state = u8::try_from(device_state).map_err(|_| corrupt("invalid device state"))?;
+    let lost_messages: i64 = row.get(5)?;
+    let lost_messages =
+        u16::try_from(lost_messages).map_err(|_| corrupt("invalid lost-message count"))?;
+    Ok(StoredRoutingLoss {
+        id,
+        event: RoutingLossEvent::from_stored(
+            observed_at,
+            CaptureEndpoint::Router(endpoint),
+            RoutingLostMessage {
+                source,
+                device_state,
+                lost_messages,
+            },
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use knx_rs_core::address::{DestinationAddress, GroupAddress, IndividualAddress};
@@ -580,6 +740,135 @@ mod tests {
 
     fn tunnel() -> CaptureEndpoint {
         CaptureEndpoint::Tunnel("192.0.2.1:3671".parse().unwrap())
+    }
+
+    fn routing_loss(count: u16) -> RoutingLossEvent {
+        RoutingLossEvent::received(
+            CaptureEndpoint::Router("224.0.23.12:3671".parse().unwrap()),
+            RoutingLostMessage {
+                source: "192.0.2.2:3671".parse().unwrap(),
+                device_state: 3,
+                lost_messages: count,
+            },
+        )
+    }
+
+    #[test]
+    fn v1_migrates_to_v2_without_losing_captures() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("captures.sqlite");
+        let mut original = CaptureStore::open(&path, nz(10)).unwrap();
+        assert_eq!(original.insert(&event(tunnel(), 7)).unwrap(), 1);
+        drop(original);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP INDEX idx_routing_loss_time;
+                 DROP TABLE routing_loss_events;
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let legacy = CaptureStore::open_existing(&path).unwrap();
+        assert!(
+            legacy
+                .read_routing_losses_after(0, nz(10))
+                .unwrap()
+                .is_empty()
+        );
+        drop(legacy);
+
+        let mut writer = CaptureStore::open(&path, nz(10)).unwrap();
+        assert_eq!(schema_version(&writer.connection).unwrap(), 2);
+        assert_eq!(writer.insert(&event(tunnel(), 1)).unwrap(), 2);
+        assert_eq!(writer.insert_routing_loss(&routing_loss(258)).unwrap(), 1);
+        drop(writer);
+
+        let reader = CaptureStore::open_existing(&path).unwrap();
+        let captures = reader.read_after(0, nz(10)).unwrap();
+        assert_eq!(captures.len(), 2);
+        assert_eq!(captures[0].event.frame().payload(), &[0x00, 0x80, 7]);
+        let reports = reader.read_routing_losses_after(0, nz(10)).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].id, 1);
+        assert_eq!(reports[0].event.report().lost_messages, 258);
+        assert_eq!(reports[0].event.report().device_state, 3);
+    }
+
+    #[test]
+    fn failed_v1_migration_rolls_back_without_touching_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(SCHEMA_V1).unwrap();
+        connection
+            .execute_batch("CREATE TABLE routing_loss_events (incompatible TEXT);")
+            .unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            CaptureStore::open(&path, nz(10)),
+            Err(StorageError::Sqlite(_))
+        ));
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 1);
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM capture_events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert!(CaptureStore::open_existing(&path).is_ok());
+    }
+
+    #[test]
+    fn routing_losses_have_separate_bounded_monotonic_history() {
+        let mut store = CaptureStore::open(Path::new(":memory:"), nz(2)).unwrap();
+        assert_eq!(store.insert(&event(tunnel(), 1)).unwrap(), 1);
+        for count in 1..=3 {
+            assert_eq!(
+                store.insert_routing_loss(&routing_loss(count)).unwrap(),
+                i64::from(count)
+            );
+        }
+        let reports = store.read_routing_losses_after(0, nz(10)).unwrap();
+        assert_eq!(reports.iter().map(|row| row.id).collect::<Vec<_>>(), [2, 3]);
+        assert_eq!(reports[0].event.report().lost_messages, 2);
+        assert_eq!(store.read_after(0, nz(10)).unwrap().len(), 1);
+        assert!(matches!(
+            store.read_routing_losses_after(-1, nz(1)),
+            Err(StorageError::InvalidCursor(-1))
+        ));
+        assert!(matches!(
+            store.read_routing_losses_after(0, nz(MAX_PAGE_SIZE + 1)),
+            Err(StorageError::PageTooLarge(_))
+        ));
+        assert!(matches!(
+            store.insert_routing_loss(&RoutingLossEvent::received(
+                tunnel(),
+                routing_loss(1).report(),
+            )),
+            Err(StorageError::InvalidRouterEndpoint)
+        ));
+    }
+
+    #[test]
+    fn corrupt_routing_loss_does_not_decode_as_valid() {
+        let mut store = CaptureStore::open(Path::new(":memory:"), nz(10)).unwrap();
+        store.insert_routing_loss(&routing_loss(5)).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE routing_loss_events SET source = 'not-an-address' WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.read_routing_losses_after(0, nz(10)),
+            Err(StorageError::CorruptRoutingLoss { id: 1, .. })
+        ));
     }
 
     #[test]
@@ -716,7 +1005,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_schema_zero_database_migrates_to_version_one() {
+    fn empty_schema_zero_database_migrates_to_current_version() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("empty.sqlite");
         let connection = Connection::open(&path).unwrap();

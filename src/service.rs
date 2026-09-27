@@ -3,23 +3,23 @@
 
 //! Long-lived owner for one KNXnet/IP connection and its capture store.
 //!
-//! This core can run in an independent foreground process. Local IPC and
-//! supervised automatic startup are not implemented yet.
+//! This core can run in an independent foreground process with current-user
+//! local IPC. Supervised automatic startup is not implemented yet.
 //! Connection state is a watch value so late subscribers see the current state.
-//! Live frames are broadcast; a slow subscriber receives Tokio's structured
-//! `Lagged(count)` error. That count describes dropped *application events*,
-//! not lost KNX bus telegrams, which `knx-rs-ip` does not currently expose.
+//! Live frames and router-loss reports use separate broadcast channels. A slow
+//! subscriber receives Tokio's structured `Lagged(count)` error; that local
+//! loss is distinct from a router's `RoutingLostMessage` report.
 
 use std::fmt;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use knx_rs_ip::{ConnectionSpec, KnxConnection, connect};
+use knx_rs_ip::{ConnectionSpec, KnxConnection, KnxReceiveEvent, connect};
 use thiserror::Error;
 use tokio::sync::{broadcast, watch};
 
-use crate::capture::{CaptureEndpoint, CaptureEvent};
+use crate::capture::{CaptureEndpoint, CaptureEvent, RoutingLossEvent};
 use crate::storage::{CaptureStore, StorageError};
 
 /// Current lifecycle state of one configured connection.
@@ -62,6 +62,15 @@ pub struct LiveCapture {
     pub event: CaptureEvent,
 }
 
+/// One router-reported loss, emitted only after its optional database commit.
+#[derive(Clone, Debug)]
+pub struct LiveRoutingLoss {
+    /// Monotonic router-loss history ID when persistence is enabled.
+    pub id: Option<i64>,
+    /// Router source, device state and reported count.
+    pub event: RoutingLossEvent,
+}
+
 /// Reconnection delay policy.
 #[derive(Clone, Copy, Debug)]
 pub struct ReconnectPolicy {
@@ -99,7 +108,7 @@ pub enum ServiceError {
     #[error("initial reconnect delay must be positive and at most the maximum")]
     InvalidBackoff,
     /// A capture could not be committed; the service stopped.
-    #[error("capture persistence failed: {0}")]
+    #[error("event persistence failed: {0}")]
     Storage(#[from] StorageError),
 }
 
@@ -111,6 +120,7 @@ pub struct CaptureService {
     policy: ReconnectPolicy,
     state_tx: watch::Sender<ConnectionState>,
     frames_tx: broadcast::Sender<LiveCapture>,
+    routing_losses_tx: broadcast::Sender<LiveRoutingLoss>,
 }
 
 impl CaptureService {
@@ -125,6 +135,7 @@ impl CaptureService {
         let endpoint = CaptureEndpoint::from(spec.clone());
         let (state_tx, _) = watch::channel(ConnectionState::Idle);
         let (frames_tx, _) = broadcast::channel(event_capacity.get());
+        let (routing_losses_tx, _) = broadcast::channel(event_capacity.get());
         Self {
             spec,
             endpoint,
@@ -132,6 +143,7 @@ impl CaptureService {
             policy,
             state_tx,
             frames_tx,
+            routing_losses_tx,
         }
     }
 
@@ -145,6 +157,12 @@ impl CaptureService {
     #[must_use]
     pub fn subscribe_frames(&self) -> broadcast::Receiver<LiveCapture> {
         self.frames_tx.subscribe()
+    }
+
+    /// Subscribe to router-reported routing-frame losses.
+    #[must_use]
+    pub fn subscribe_routing_losses(&self) -> broadcast::Receiver<LiveRoutingLoss> {
+        self.routing_losses_tx.subscribe()
     }
 
     /// Run until shutdown, retrying failed or closed connections.
@@ -194,34 +212,59 @@ impl CaptureService {
                         endpoint: self.endpoint,
                     });
                     loop {
-                        let frame = tokio::select! {
+                        let received = tokio::select! {
                             biased;
                             () = &mut shutdown => {
                                 connection.close().await;
                                 self.state_tx.send_replace(ConnectionState::Stopped);
                                 return Ok(());
                             }
-                            frame = connection.recv() => frame,
+                            event = connection.recv_event() => event,
                         };
-                        let Some(frame) = frame else {
+                        let Some(received) = received else {
                             connection.close().await;
                             break "connection closed".to_owned();
                         };
-                        let event = CaptureEvent::received(self.endpoint, frame);
-                        let id = match self.store.as_mut() {
-                            Some(store) => match store.insert(&event) {
-                                Ok(id) => Some(id),
-                                Err(error) => {
-                                    connection.close().await;
-                                    self.state_tx.send_replace(ConnectionState::StorageFailed {
-                                        reason: error.to_string(),
-                                    });
-                                    return Err(error.into());
-                                }
-                            },
-                            None => None,
-                        };
-                        let _ = self.frames_tx.send(LiveCapture { id, event });
+                        match received {
+                            KnxReceiveEvent::Frame(frame) => {
+                                let event = CaptureEvent::received(self.endpoint, frame);
+                                let id = match self.store.as_mut() {
+                                    Some(store) => match store.insert(&event) {
+                                        Ok(id) => Some(id),
+                                        Err(error) => {
+                                            connection.close().await;
+                                            self.state_tx.send_replace(
+                                                ConnectionState::StorageFailed {
+                                                    reason: error.to_string(),
+                                                },
+                                            );
+                                            return Err(error.into());
+                                        }
+                                    },
+                                    None => None,
+                                };
+                                let _ = self.frames_tx.send(LiveCapture { id, event });
+                            }
+                            KnxReceiveEvent::RoutingLostMessage(report) => {
+                                let event = RoutingLossEvent::received(self.endpoint, report);
+                                let id = match self.store.as_mut() {
+                                    Some(store) => match store.insert_routing_loss(&event) {
+                                        Ok(id) => Some(id),
+                                        Err(error) => {
+                                            connection.close().await;
+                                            self.state_tx.send_replace(
+                                                ConnectionState::StorageFailed {
+                                                    reason: error.to_string(),
+                                                },
+                                            );
+                                            return Err(error.into());
+                                        }
+                                    },
+                                    None => None,
+                                };
+                                let _ = self.routing_losses_tx.send(LiveRoutingLoss { id, event });
+                            }
+                        }
                         delay = self.policy.initial;
                     }
                 }
@@ -253,7 +296,7 @@ mod tests {
     use knx_rs_core::cemi::CemiFrame;
     use knx_rs_core::message::MessageCode;
     use knx_rs_core::types::Priority;
-    use knx_rs_ip::{DeviceServer, KnxFuture, Result as KnxResult};
+    use knx_rs_ip::{DeviceServer, KnxFuture, Result as KnxResult, RoutingLostMessage};
     use tokio::sync::oneshot;
     use tokio::time::timeout;
 
@@ -291,6 +334,36 @@ mod tests {
         }
     }
 
+    struct FakeEventConnection {
+        events: VecDeque<KnxReceiveEvent>,
+        closed: Arc<AtomicUsize>,
+    }
+
+    impl KnxConnection for FakeEventConnection {
+        fn send(&self, _frame: CemiFrame) -> KnxFuture<'_, KnxResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn recv(&mut self) -> KnxFuture<'_, Option<CemiFrame>> {
+            Box::pin(async { None })
+        }
+
+        fn recv_event(&mut self) -> KnxFuture<'_, Option<KnxReceiveEvent>> {
+            Box::pin(async {
+                match self.events.pop_front() {
+                    Some(event) => Some(event),
+                    None => std::future::pending().await,
+                }
+            })
+        }
+
+        fn close(&mut self) -> KnxFuture<'_, ()> {
+            Box::pin(async {
+                self.closed.fetch_add(1, Ordering::SeqCst);
+            })
+        }
+    }
+
     fn frame(value: u8) -> CemiFrame {
         CemiFrame::new_l_data(
             MessageCode::LDataInd,
@@ -305,8 +378,165 @@ mod tests {
         ConnectionSpec::Tunnel("192.0.2.1:3671".parse().unwrap())
     }
 
+    fn router_spec() -> ConnectionSpec {
+        ConnectionSpec::Router("224.0.23.12:3671".parse().unwrap())
+    }
+
     fn capacity(value: usize) -> NonZeroUsize {
         NonZeroUsize::new(value).unwrap()
+    }
+
+    #[tokio::test]
+    async fn router_loss_is_committed_before_its_distinct_live_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("loss.sqlite");
+        let store = CaptureStore::open(&path, NonZeroU32::new(10).unwrap()).unwrap();
+        let mut service = CaptureService::new(
+            router_spec(),
+            Some(store),
+            ReconnectPolicy::default(),
+            capacity(8),
+        );
+        let mut losses = service.subscribe_routing_losses();
+        let mut frames = service.subscribe_frames();
+        let closed = Arc::new(AtomicUsize::new(0));
+        let report = RoutingLostMessage {
+            source: "192.0.2.2:3671".parse().unwrap(),
+            device_state: 1,
+            lost_messages: 258,
+        };
+        let connector = {
+            let closed = Arc::clone(&closed);
+            move || {
+                let closed = Arc::clone(&closed);
+                async move {
+                    Ok::<_, &'static str>(FakeEventConnection {
+                        events: VecDeque::from([KnxReceiveEvent::RoutingLostMessage(report)]),
+                        closed,
+                    })
+                }
+            }
+        };
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let observer = async {
+            let live = losses.recv().await.unwrap();
+            assert_eq!(live.id, Some(1));
+            assert_eq!(live.event.report(), report);
+            let reader = CaptureStore::open_existing(&path).unwrap();
+            assert_eq!(
+                reader
+                    .read_routing_losses_after(0, NonZeroU32::new(10).unwrap())
+                    .unwrap()[0]
+                    .event
+                    .report(),
+                report
+            );
+            assert!(
+                reader
+                    .read_after(0, NonZeroU32::new(10).unwrap())
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(matches!(
+                frames.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
+            stop_tx.send(()).unwrap();
+        };
+        let (result, ()) = timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                service.run_with(connector, async {
+                    let _ = stop_rx.await;
+                }),
+                observer
+            )
+        })
+        .await
+        .unwrap();
+        result.unwrap();
+        assert_eq!(closed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn loopback_router_diagnostic_reaches_durable_service_stream() {
+        use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+
+        // Local unicast injection into the router socket tests the complete
+        // parser-to-store path; it is not a physical multicast qualification.
+        let port_probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = port_probe.local_addr().unwrap().port();
+        drop(port_probe);
+        let endpoint = SocketAddrV4::new(Ipv4Addr::new(239, 255, 23, 12), port);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("router.sqlite");
+        let store = CaptureStore::open(&path, NonZeroU32::new(10).unwrap()).unwrap();
+        let mut service = CaptureService::new(
+            ConnectionSpec::Router(endpoint.into()),
+            Some(store),
+            ReconnectPolicy::default(),
+            capacity(8),
+        );
+        let mut states = service.subscribe_state();
+        let mut losses = service.subscribe_routing_losses();
+        let mut frames = service.subscribe_frames();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let observer = async {
+            loop {
+                states.changed().await.unwrap();
+                if matches!(
+                    &*states.borrow_and_update(),
+                    ConnectionState::Connected { .. }
+                ) {
+                    break;
+                }
+            }
+            let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+            sender
+                .send_to(
+                    &[0x06, 0x10, 0x05, 0x31, 0x00, 0x0a, 0x03, 0x03, 0x01, 0x02],
+                    target,
+                )
+                .unwrap(); // Invalid structure length must not become an event.
+            sender
+                .send_to(
+                    &[0x06, 0x10, 0x05, 0x31, 0x00, 0x0a, 0x04, 0x03, 0x01, 0x02],
+                    target,
+                )
+                .unwrap();
+            let live = losses.recv().await.unwrap();
+            assert_eq!(live.id, Some(1));
+            assert_eq!(live.event.report().device_state, 3);
+            assert_eq!(live.event.report().lost_messages, 258);
+            assert_eq!(
+                live.event.report().source.ip(),
+                sender.local_addr().unwrap().ip()
+            );
+            assert!(matches!(
+                frames.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
+            let reader = CaptureStore::open_existing(&path).unwrap();
+            assert_eq!(
+                reader
+                    .read_routing_losses_after(0, NonZeroU32::new(10).unwrap())
+                    .unwrap()
+                    .len(),
+                1
+            );
+            stop_tx.send(()).unwrap();
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                service.run_until(async {
+                    let _ = stop_rx.await;
+                }),
+                observer
+            )
+        })
+        .await
+        .expect("router diagnostic reaches service");
+        result.unwrap();
     }
 
     #[tokio::test]

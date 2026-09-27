@@ -6,7 +6,7 @@ use std::num::NonZeroU32;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use devknx::capture::{CaptureEndpoint, CaptureEvent};
+use devknx::capture::{CaptureEndpoint, CaptureEvent, RoutingLossEvent};
 use devknx::ipc::{IpcClient, IpcMessage, WireState};
 use devknx::storage::CaptureStore;
 use knx_rs_core::address::{DestinationAddress, GroupAddress, IndividualAddress};
@@ -14,6 +14,7 @@ use knx_rs_core::cemi::CemiFrame;
 use knx_rs_core::message::MessageCode;
 use knx_rs_core::types::Priority;
 use knx_rs_ip::DeviceServer;
+use knx_rs_ip::RoutingLostMessage;
 use rusqlite::{Connection, MAIN_DB};
 
 fn devknx(args: &[&str]) -> std::process::Output {
@@ -42,6 +43,7 @@ fn help_describes_available_commands() {
     assert!(stdout.contains("monitor"));
     assert!(stdout.contains("serve"));
     assert!(stdout.contains("history"));
+    assert!(stdout.contains("router-losses"));
     assert!(stdout.contains("export"));
     assert!(stdout.contains("backup"));
     assert!(stdout.contains("status"));
@@ -313,6 +315,143 @@ fn history_does_not_create_a_missing_database() {
     ]);
     assert!(!output.status.success());
     assert!(!path.exists());
+}
+
+#[test]
+fn router_loss_history_is_separate_and_survives_backup() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let source = directory.path().join("captures.sqlite");
+    let snapshot = directory.path().join("snapshot.sqlite");
+    let mut writer = CaptureStore::open(&source, NonZeroU32::new(10).unwrap()).unwrap();
+    writer
+        .insert_routing_loss(&RoutingLossEvent::received(
+            CaptureEndpoint::Router("224.0.23.12:3671".parse().unwrap()),
+            RoutingLostMessage {
+                source: "192.0.2.2:3671".parse().unwrap(),
+                device_state: 3,
+                lost_messages: 258,
+            },
+        ))
+        .unwrap();
+    let path = source.to_str().unwrap();
+    let result = devknx(&["router-losses", "--database", path]);
+    assert!(result.status.success(), "{:?}", result.stderr);
+    let row: IpcMessage = serde_json::from_slice(result.stdout.trim_ascii()).unwrap();
+    assert!(matches!(
+        row,
+        IpcMessage::RoutingLostMessage {
+            id: Some(1),
+            device_state: 3,
+            lost_messages: 258,
+            ..
+        }
+    ));
+    assert!(devknx(&["history", "--database", path]).stdout.is_empty());
+    assert!(
+        devknx(&["router-losses", "--database", path, "--after", "1"])
+            .stdout
+            .is_empty()
+    );
+    let backup = devknx(&[
+        "backup",
+        "--database",
+        path,
+        "--output",
+        snapshot.to_str().unwrap(),
+    ]);
+    assert!(backup.status.success(), "{:?}", backup.stderr);
+    let restored = devknx(&["router-losses", "--database", snapshot.to_str().unwrap()]);
+    assert!(restored.status.success());
+    assert_eq!(restored.stdout, result.stdout);
+
+    let missing = directory.path().join("missing.sqlite");
+    let result = devknx(&["router-losses", "--database", missing.to_str().unwrap()]);
+    assert!(!result.status.success());
+    assert!(!missing.exists());
+}
+
+#[tokio::test]
+async fn router_report_flows_through_service_ipc_and_history() {
+    use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+
+    struct CaptureChild(Child);
+    impl Drop for CaptureChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("router.sqlite");
+    let database = path.to_str().unwrap();
+    let endpoint = format!("router://239.255.23.12:{port}");
+    let child = Command::new(env!("CARGO_BIN_EXE_devknx"))
+        .args(["serve", &endpoint, "--database", database])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut child = CaptureChild(child);
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut client = loop {
+            if let Ok(client) = IpcClient::connect(&path, true).await {
+                break client;
+            }
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "capture process exited"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        loop {
+            match client.next().await.unwrap() {
+                Some(IpcMessage::State {
+                    value: WireState::Connected { .. },
+                }) => break,
+                Some(_) => {}
+                None => panic!("service closed before router connection"),
+            }
+        }
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        sender
+            .send_to(
+                &[0x06, 0x10, 0x05, 0x31, 0x00, 0x0a, 0x04, 0x03, 0x01, 0x02],
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+            )
+            .unwrap();
+        let live = loop {
+            match client.next().await.unwrap() {
+                Some(message @ IpcMessage::RoutingLostMessage { .. }) => break message,
+                Some(_) => {}
+                None => panic!("service closed before router diagnostic"),
+            }
+        };
+        assert!(matches!(
+            live,
+            IpcMessage::RoutingLostMessage {
+                id: Some(1),
+                device_state: 3,
+                lost_messages: 258,
+                ..
+            }
+        ));
+        let history = devknx(&["router-losses", "--database", database]);
+        assert!(history.status.success(), "{:?}", history.stderr);
+        let stored: IpcMessage = serde_json::from_slice(history.stdout.trim_ascii()).unwrap();
+        assert_eq!(stored, live);
+        assert!(
+            devknx(&["history", "--database", database])
+                .stdout
+                .is_empty()
+        );
+    })
+    .await
+    .expect("router report reaches IPC and history");
 }
 
 #[test]

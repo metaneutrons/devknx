@@ -32,7 +32,7 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Semaphore, broadcast, watch};
 
-use crate::service::{ConnectionState, LiveCapture};
+use crate::service::{ConnectionState, LiveCapture, LiveRoutingLoss};
 
 const MAX_MESSAGE_SIZE: usize = 16 * 1024;
 const MAX_CLIENTS: usize = 32;
@@ -51,7 +51,7 @@ pub enum IpcError {
     MessageTooLarge,
 }
 
-/// Version-one local protocol record. A lag count is application fan-out loss,
+/// Development-version-two local protocol record. A lag count is application fan-out loss,
 /// not a KNX bus packet-loss measurement.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -77,8 +77,38 @@ pub enum IpcMessage {
         /// Exact raw cEMI frame, lowercase hexadecimal.
         raw_cemi: String,
     },
+    /// A router report of lost KNXnet/IP routing frames, not local lag.
+    RoutingLostMessage {
+        /// Router-loss history ID when persistence is enabled.
+        id: Option<i64>,
+        /// Wall-clock receive timestamp.
+        observed_at_ms: u64,
+        /// Multicast endpoint.
+        endpoint: String,
+        /// UDP source of the reporting router.
+        source: String,
+        /// Opaque router device-state byte.
+        device_state: u8,
+        /// Number of routing frames reported lost by this router.
+        lost_messages: u16,
+    },
     /// Number of application events missed by this IPC subscriber.
-    Lagged { count: u64 },
+    Lagged {
+        /// Which local live stream fell behind.
+        stream: LaggedStream,
+        /// Number of local events missed, not a bus-loss count.
+        count: u64,
+    },
+}
+
+/// Local IPC stream whose subscriber fell behind.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LaggedStream {
+    /// Committed cEMI capture events.
+    Capture,
+    /// Committed router-loss reports.
+    RoutingLoss,
 }
 
 /// Serializable representation of [`ConnectionState`].
@@ -138,6 +168,27 @@ impl From<&LiveCapture> for IpcMessage {
             destination: frame.destination_address().to_string(),
             service: format!("{:?}", event.group_service()),
             raw_cemi: hex(frame.as_bytes()),
+        }
+    }
+}
+
+impl From<&LiveRoutingLoss> for IpcMessage {
+    fn from(live: &LiveRoutingLoss) -> Self {
+        let observed_at_ms = live
+            .event
+            .observed_at()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+            .unwrap_or(0);
+        let report = live.event.report();
+        Self::RoutingLostMessage {
+            id: live.id,
+            observed_at_ms,
+            endpoint: live.event.endpoint().to_string(),
+            source: report.source.to_string(),
+            device_state: report.device_state,
+            lost_messages: report.lost_messages,
         }
     }
 }
@@ -303,6 +354,7 @@ impl IpcServer {
         self,
         state: watch::Receiver<ConnectionState>,
         frames: broadcast::Receiver<LiveCapture>,
+        routing_losses: broadcast::Receiver<LiveRoutingLoss>,
     ) -> Result<(), IpcError> {
         let slots = Arc::new(Semaphore::new(MAX_CLIENTS));
         loop {
@@ -313,9 +365,10 @@ impl IpcServer {
             };
             let state = state.clone();
             let frames = frames.resubscribe();
+            let routing_losses = routing_losses.resubscribe();
             tokio::spawn(async move {
                 let _permit = permit;
-                let _ = handle_client(stream, state, frames).await;
+                let _ = handle_client(stream, state, frames, routing_losses).await;
             });
         }
     }
@@ -325,6 +378,7 @@ async fn handle_client(
     mut stream: Stream,
     mut state: watch::Receiver<ConnectionState>,
     mut frames: broadcast::Receiver<LiveCapture>,
+    mut routing_losses: broadcast::Receiver<LiveRoutingLoss>,
 ) -> Result<(), IpcError> {
     let mut command = [0_u8; 7];
     tokio::time::timeout(
@@ -357,7 +411,21 @@ async fn handle_client(
             result = frames.recv() => {
                 let message = match result {
                     Ok(capture) => IpcMessage::from(&capture),
-                    Err(broadcast::error::RecvError::Lagged(count)) => IpcMessage::Lagged {count},
+                    Err(broadcast::error::RecvError::Lagged(count)) => IpcMessage::Lagged {
+                        stream: LaggedStream::Capture,
+                        count,
+                    },
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                };
+                write_message(&mut stream, &message).await?;
+            }
+            result = routing_losses.recv() => {
+                let message = match result {
+                    Ok(loss) => IpcMessage::from(&loss),
+                    Err(broadcast::error::RecvError::Lagged(count)) => IpcMessage::Lagged {
+                        stream: LaggedStream::RoutingLoss,
+                        count,
+                    },
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 };
                 write_message(&mut stream, &message).await?;
@@ -439,6 +507,32 @@ mod tests {
     use std::num::NonZeroU32;
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    #[test]
+    fn router_loss_and_local_lag_have_distinct_wire_types() {
+        let router_loss = IpcMessage::RoutingLostMessage {
+            id: Some(7),
+            observed_at_ms: 123,
+            endpoint: "router://224.0.23.12:3671".to_owned(),
+            source: "192.0.2.2:3671".to_owned(),
+            device_state: 3,
+            lost_messages: 258,
+        };
+        let encoded = serde_json::to_string(&router_loss).unwrap();
+        assert!(encoded.contains("\"type\":\"routing_lost_message\""));
+        assert!(encoded.contains("\"lost_messages\":258"));
+        assert_eq!(
+            serde_json::from_str::<IpcMessage>(&encoded).unwrap(),
+            router_loss
+        );
+
+        for stream in [LaggedStream::Capture, LaggedStream::RoutingLoss] {
+            let lag = IpcMessage::Lagged { stream, count: 2 };
+            let encoded = serde_json::to_string(&lag).unwrap();
+            assert!(encoded.contains("\"type\":\"lagged\""));
+            assert_eq!(serde_json::from_str::<IpcMessage>(&encoded).unwrap(), lag);
+        }
+    }
 
     #[tokio::test]
     async fn local_ipc_has_only_one_active_listener() {

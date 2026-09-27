@@ -14,10 +14,13 @@ timestamp, endpoint, direction, parsed addresses and group-value service, and
 exact `raw_cemi` hexadecimal bytes. A `lagged.count` value measures records
 missed by this application subscriber; it is not a KNX bus loss count.
 
-On Unix, the socket is `PATH.ipc/control.sock` under a 0700 directory, with
-0600 socket permissions. A retained `PATH.ipc/owner.lock` file prevents a
-second active listener from replacing the socket; do not delete it while
-capture runs. Symlink or shared IPC directories are rejected. On
+On Unix, the socket normally is `PATH.ipc/control.sock` under a 0700 directory,
+with 0600 socket permissions. If that name would exceed the portable Unix
+socket path limit, it instead lives under a deterministic private
+`/tmp/devknx-ipc-<hash>/` directory. Both forms require the IPC directory to
+have the same owner as the database. A retained `owner.lock` file in the IPC
+directory prevents a second active listener from replacing the socket; do not
+delete it while capture runs. Symlink or shared IPC directories are rejected. On
 Windows, the endpoint is a named pipe with a DACL granting access only to the
 current process user SID. The pipe requires first-instance creation and rejects
 remote clients. This is local transport protection, not remote authentication.

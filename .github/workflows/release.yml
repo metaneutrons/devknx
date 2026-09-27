@@ -219,12 +219,12 @@ jobs:
           python3 scripts/release/release_inventory.py raw --tag "$TAG" --directory payloads
           cd payloads
           shopt -s nullglob
-          identity="^https://github.com/${REPO}/\.github/workflows/release\.yml@refs/tags/${TAG}$"
+          identity="https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/${TAG}"
           for payload in *.tar.gz *.zip *.deb; do
             syft scan "file:$payload" -o spdx-json="$payload.spdx.json"
             cosign sign-blob --yes --bundle "$payload.sigstore.json" "$payload"
             cosign verify-blob --bundle "$payload.sigstore.json" \
-              --certificate-identity-regexp "$identity" \
+              --certificate-identity "$identity" \
               --certificate-oidc-issuer https://token.actions.githubusercontent.com "$payload"
           done
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -280,13 +280,13 @@ jobs:
           python3 scripts/release/package_metadata.py --tag "$TAG" --version "$VERSION" \
             --payload-dir payloads --output-dir definitions
           cd definitions
-          identity="^https://github.com/${REPO}/\.github/workflows/release\.yml@refs/tags/${TAG}$"
+          identity="https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/${TAG}"
           for definition in devknx.rb devknx-app.rb devknx.PKGBUILD devknx-bin.PKGBUILD; do
             ruby -c "$definition" 2>/dev/null || [[ "$definition" == *.PKGBUILD ]]
             if [[ "$definition" == *.PKGBUILD ]]; then bash -n "$definition"; fi
             cosign sign-blob --yes --bundle "$definition.sigstore.json" "$definition"
             cosign verify-blob --bundle "$definition.sigstore.json" \
-              --certificate-identity-regexp "$identity" \
+              --certificate-identity "$identity" \
               --certificate-oidc-issuer https://token.actions.githubusercontent.com "$definition"
           done
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -376,7 +376,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-15, ubuntu-24.04]
+        runner: [macos-15, ubuntu-24.04, ubuntu-24.04-arm]
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -433,10 +433,18 @@ jobs:
           fi
 
   qualify-aur-bin:
-    name: Build and install the AUR binary package
+    name: Build and install the AUR binary package on ${{ matrix.arch }}
     needs: [metadata, candidate]
-    runs-on: ubuntu-24.04
-    container: archlinux:base-devel@sha256:8745817f349ed24373341ddb92776209eeec3f0364ea48f7f645ac5800d30a50
+    runs-on: ${{ matrix.runner }}
+    # Arch Linux publishes x86_64 images; the pinned ARM image derives from
+    # Arch Linux ARM. These jobs receive no secrets or write token.
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: x86_64, target: x86_64-unknown-linux-gnu, image: 'archlinux:base-devel@sha256:8745817f349ed24373341ddb92776209eeec3f0364ea48f7f645ac5800d30a50' }
+          - { runner: ubuntu-24.04-arm, arch: aarch64, target: aarch64-unknown-linux-gnu, image: 'menci/archlinuxarm:base-devel@sha256:5fd0b5a4a9e4926aacab4d6ff2f8db8abcbbb0c0961659504cd49833f4157f4d' }
     defaults:
       run:
         shell: bash
@@ -451,14 +459,16 @@ jobs:
           VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           set -euo pipefail
-          archive="devknx-$TAG-x86_64-unknown-linux-gnu.tar.gz"
+          pacman -Syu --noconfirm --needed --disable-sandbox \
+            libxkbcommon libx11 wayland libgl
+          archive="devknx-$TAG-${{ matrix.target }}.tar.gz"
           work=/home/builder/package
           useradd --create-home builder
           install -d -o builder -g builder "$work"
           cp "candidate/$archive" "$work/$archive"
           sed -E "s#https://[^']*/$archive#$archive#" \
             candidate/devknx-bin.PKGBUILD > "$work/PKGBUILD"
-          grep -Fq "source_x86_64=('$archive')" "$work/PKGBUILD"
+          grep -Fq "source_${{ matrix.arch }}=('$archive')" "$work/PKGBUILD"
           chown -R builder:builder "$work"
           su builder -c "cd '$work' && makepkg --cleanbuild --noconfirm"
           mapfile -t packages < <(find "$work" -maxdepth 1 -name '*.pkg.tar.zst' \
@@ -468,14 +478,20 @@ jobs:
           devknx --version | grep -Fx "devknx $VERSION"
           mkdir -p /tmp/archive
           tar -xzf "candidate/$archive" -C /tmp/archive
-          cmp "/tmp/archive/devknx-$TAG-x86_64-unknown-linux-gnu/devknx" /usr/bin/devknx
+          cmp "/tmp/archive/devknx-$TAG-${{ matrix.target }}/devknx" /usr/bin/devknx
           test -s /usr/share/licenses/devknx-bin/OFL-1.1.txt
 
   qualify-aur-source:
-    name: Build and install the AUR source package
+    name: Build and install the AUR source package on ${{ matrix.arch }}
     needs: [metadata, candidate]
-    runs-on: ubuntu-24.04
-    container: archlinux:base-devel@sha256:8745817f349ed24373341ddb92776209eeec3f0364ea48f7f645ac5800d30a50
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: x86_64, image: 'archlinux:base-devel@sha256:8745817f349ed24373341ddb92776209eeec3f0364ea48f7f645ac5800d30a50' }
+          - { runner: ubuntu-24.04-arm, arch: aarch64, image: 'menci/archlinuxarm:base-devel@sha256:5fd0b5a4a9e4926aacab4d6ff2f8db8abcbbb0c0961659504cd49833f4157f4d' }
     defaults:
       run:
         shell: bash
@@ -487,7 +503,7 @@ jobs:
       - name: Install declared toolchain and GUI dependencies
         run: |
           set -euo pipefail
-          pacman -Syu --noconfirm --needed base-devel git rust namcap \
+          pacman -Syu --noconfirm --needed --disable-sandbox base-devel git rust namcap \
             libxcb libxkbcommon libx11 wayland libgl
       - name: Build the tagged source and install
         env:
@@ -653,12 +669,12 @@ jobs:
           mkdir -p readback
           gh release download "$TAG" --dir readback --pattern '*'
           python3 scripts/release/release_inventory.py verify --tag "$TAG" --directory readback
-          identity="^https://github.com/${GH_REPO}/\.github/workflows/release\.yml@refs/tags/${TAG}$"
+          identity="https://github.com/${GH_REPO}/.github/workflows/release.yml@refs/tags/${TAG}"
           for asset in readback/*.tar.gz readback/*.zip readback/*.deb \
             readback/devknx.rb readback/devknx-app.rb \
             readback/devknx.PKGBUILD readback/devknx-bin.PKGBUILD; do
             cosign verify-blob --bundle "$asset.sigstore.json" \
-              --certificate-identity-regexp "$identity" \
+              --certificate-identity "$identity" \
               --certificate-oidc-issuer https://token.actions.githubusercontent.com "$asset"
             gh attestation verify "$asset" --repo "$GH_REPO"
           done

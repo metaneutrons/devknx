@@ -33,6 +33,8 @@ class PackageMetadataTests(unittest.TestCase):
             self.assertIn("depends_on arch: :arm64", formula)
             self.assertIn('depends_on "wayland"', formula)
             self.assertIn('depends_on "mesa"', formula)
+            self.assertIn('formula_opt_lib(name)', formula)
+            self.assertIn('LD_LIBRARY_PATH:', formula)
             self.assertIn('shell_output("#{bin}/devknx --version")', formula)
             self.assertNotIn("x86_64-apple-darwin", formula)
             cask = (output / "devknx-app.rb").read_text()

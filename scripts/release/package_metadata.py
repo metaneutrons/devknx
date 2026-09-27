@@ -95,7 +95,14 @@ class Devknx < Formula
     root = Dir["devknx", "devknx-v*-*/devknx"].find {{ |path| File.file?(path) }}
     raise "missing devknx executable" unless root
 
-    bin.install root
+    if OS.linux?
+      libexec.install root
+      gui_libraries = %w[libx11 libxcb libxkbcommon mesa wayland].map {{ |name| formula_opt_lib(name) }}
+      loader_path = "#{{gui_libraries.join(":")}}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
+      bin.join("devknx").write_env_script libexec/"devknx", LD_LIBRARY_PATH: loader_path
+    else
+      bin.install root
+    end
     source_root = File.dirname(root)
     doc.install File.join(source_root, "THIRD-PARTY-NOTICES.md")
     doc.install File.join(source_root, "licenses")

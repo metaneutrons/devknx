@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Fabian Schmieder
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use devknx::capture::{CaptureEvent, RoutingLossEvent};
+use devknx::ets::{CsvEncoding, EtsCatalog, EtsFormat, parse_group_address};
 use devknx::ipc::{IpcClient, IpcMessage, IpcServer};
 use devknx::service::{CaptureService, LiveRoutingLoss, ReconnectPolicy};
 use devknx::storage::CaptureStore;
@@ -23,6 +24,21 @@ mod gui;
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum EtsInputFormat {
+    Csv,
+    Xml,
+}
+
+impl From<EtsInputFormat> for EtsFormat {
+    fn from(value: EtsInputFormat) -> Self {
+        match value {
+            EtsInputFormat::Csv => Self::Csv31,
+            EtsInputFormat::Xml => Self::GaXml01,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -105,6 +121,28 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Transactionally replace ETS group-address metadata (stop `serve` first).
+    EtsImport {
+        /// Existing ETS CSV 3/1 or GA Export 01 XML file.
+        file: PathBuf,
+        /// Capture database to enrich, or a new database to create.
+        #[arg(long)]
+        database: PathBuf,
+        /// Export format; explicit to avoid guessing from a filename.
+        #[arg(long, value_enum)]
+        format: EtsInputFormat,
+        /// Decode legacy CSV as ISO-8859-1 instead of strict UTF-8.
+        #[arg(long)]
+        latin1: bool,
+    },
+    /// Read active ETS metadata for one group address.
+    EtsLookup {
+        /// Existing capture database.
+        #[arg(long)]
+        database: PathBuf,
+        /// Three-level, two-level, decimal, or ETS hexadecimal group address.
+        address: String,
+    },
     /// Open the native desktop application.
     #[cfg(feature = "gui")]
     Gui,
@@ -174,6 +212,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Backup { database, output }) => {
             let store = CaptureStore::open_existing(&database)?;
             store.backup_to(&output)?;
+        }
+        Some(Command::EtsImport {
+            file,
+            database,
+            format,
+            latin1,
+        }) => {
+            let encoding = if latin1 {
+                CsvEncoding::Latin1
+            } else {
+                CsvEncoding::Utf8
+            };
+            let catalog = EtsCatalog::from_file(&file, format.into(), encoding)?;
+            let groups = catalog.len();
+            let mut store = CaptureStore::open_for_ets_import(&database)?;
+            let revision = store.import_ets(&catalog)?;
+            println!("revision={revision} groups={groups}");
+        }
+        Some(Command::EtsLookup { database, address }) => {
+            let store = CaptureStore::open_existing(&database)?;
+            let address = parse_group_address(&address)?;
+            let result = serde_json::json!({
+                "revision": store.ets_revision()?,
+                "address_raw": address.raw(),
+                "group": store.ets_group(address)?,
+            });
+            println!("{}", serde_json::to_string(&result)?);
         }
         #[cfg(feature = "gui")]
         Some(Command::Gui) | None => gui::run()?,

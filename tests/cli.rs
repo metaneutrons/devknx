@@ -48,10 +48,59 @@ fn help_describes_available_commands() {
     assert!(stdout.contains("backup"));
     assert!(stdout.contains("status"));
     assert!(stdout.contains("follow"));
+    assert!(stdout.contains("ets-import"));
+    assert!(stdout.contains("ets-lookup"));
     #[cfg(feature = "gui")]
     assert!(stdout.contains("gui"));
     #[cfg(not(feature = "gui"))]
     assert!(!stdout.contains("gui"));
+}
+
+#[test]
+fn ets_cli_import_lookup_and_invalid_replacement_are_atomic() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = directory.path().join("captures.sqlite");
+    let xml = directory.path().join("group-addresses.xml");
+    let database = database.to_str().expect("UTF-8 path");
+    let xml_path = xml.to_str().expect("UTF-8 path");
+    std::fs::write(&xml, "<GroupAddress-Export xmlns=\"http://knx.org/xml/ga-export/01\"><GroupRange Name=\"Lighting\"><GroupAddress Name=\"Hall\" Address=\"1/2/3\" Description=\"Main lamp\" DPTs=\"DPST-1-1,DPST-1-6\" /></GroupRange></GroupAddress-Export>").unwrap();
+    let imported = devknx(&[
+        "ets-import",
+        xml_path,
+        "--database",
+        database,
+        "--format",
+        "xml",
+    ]);
+    assert!(
+        imported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    assert!(String::from_utf8_lossy(&imported.stdout).contains("revision=1 groups=1"));
+    let lookup = devknx(&["ets-lookup", "--database", database, "1/2/3"]);
+    assert!(lookup.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&lookup.stdout).unwrap();
+    assert_eq!(value["group"]["name"], "Hall");
+    assert_eq!(
+        value["group"]["dpts"],
+        serde_json::json!(["DPST-1-1", "DPST-1-6"])
+    );
+
+    std::fs::write(&xml, "<GroupAddress-Export xmlns=\"http://knx.org/xml/ga-export/01\"><GroupRange Name=\"X\"><GroupAddress Name=\"A\" Address=\"1/2/3\" /><GroupAddress Name=\"B\" Address=\"2563\" /></GroupRange></GroupAddress-Export>").unwrap();
+    let rejected = devknx(&[
+        "ets-import",
+        xml_path,
+        "--database",
+        database,
+        "--format",
+        "xml",
+    ]);
+    assert!(!rejected.status.success());
+    let unchanged = devknx(&["ets-lookup", "--database", database, "2563"]);
+    let value: serde_json::Value = serde_json::from_slice(&unchanged.stdout).unwrap();
+    assert_eq!(value["revision"], 1);
+    assert_eq!(value["group"]["name"], "Hall");
 }
 
 #[test]

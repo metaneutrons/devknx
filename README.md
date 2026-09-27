@@ -17,7 +17,7 @@
 </p>
 
 > [!IMPORTANT]
-> **Early development.** There is no stable release yet. The CLI can discover gateways, capture raw telegrams from a KNXnet/IP tunnel or router, and retain them in SQLite through a foreground capture process with local status and live-stream IPC. The native GUI is still a discovery shell. There is no automatic daemon startup, ETS import, or group-value sending. Do not use it to operate a live installation.
+> **Early development.** There is no stable release yet. The CLI can discover gateways, capture raw telegrams from a KNXnet/IP tunnel or router, retain them in SQLite, and import ETS group-address metadata. The native GUI is still a discovery shell. There is no automatic daemon startup or group-value sending. Do not use it to operate a live installation.
 
 ## What devknx is building
 
@@ -33,7 +33,7 @@ desktop button and an API call.
 | KNXnet/IP tunneling and routing capture | Experimental CLI stream with bounded reconnect and optional SQLite persistence |
 | Independent capture process | Experimental foreground `serve` command with current-user `status` and `follow` IPC; no automatic startup yet |
 | Durable, searchable telegram history | Experimental SQLite history with ID cursor, retention cap, and CSV export; filters/search and the background daemon are pending |
-| ETS group-address CSV and XML import | Planned |
+| ETS group-address CSV and XML import | Experimental CLI import and lookup; GUI integration pending |
 | DPT-validated read, write preview, and write | Planned |
 | Terminal UI and full native desktop UI | Planned |
 | Local REST and MCP interfaces | Planned |
@@ -67,6 +67,8 @@ cargo run --locked -- history --database captures.sqlite --after 0 --limit 100
 cargo run --locked -- router-losses --database captures.sqlite --after 0 --limit 100
 cargo run --locked -- export --database captures.sqlite > captures.csv
 cargo run --locked -- backup --database captures.sqlite --output captures-backup.sqlite
+cargo run --locked -- ets-import group-addresses.xml --database captures.sqlite --format xml
+cargo run --locked -- ets-lookup --database captures.sqlite 1/2/3
 cargo run --locked -- gui
 ```
 
@@ -105,8 +107,8 @@ three commands fail rather than create an empty database if the source path is
 wrong.
 `router-losses` reads a separate, bounded diagnostic history with its own
 monotonic ID cursor; it does not mix router reports with cEMI history or CSV.
-Opening a version-one database for writing migrates it transactionally to
-schema version two; read-only history remains available during migration.
+Opening a version-one or version-two database for writing migrates it transactionally to
+schema version three; read-only history remains available during migration.
 Existing databases with an unsupported schema are not rewritten. The CLI now
 runs an in-process connection owner and live event bus; capture continues if
 its terminal subscriber falls behind. The connection and database are still
@@ -126,6 +128,13 @@ uses a current-user access-control list. The GUI and other surfaces do not yet
 attach to this stream.
 The [local IPC protocol](docs/local-ipc.md) is documented for development
 clients; it is not yet a stable external API.
+
+ETS imports are bounded, validated, and all-or-nothing; they create a new
+metadata revision without modifying raw captures. Standard four-column ETS
+CSV 3/1 has no DPT declaration or description. GA Export 01 XML can include
+both, and all declared DPTs are retained rather than selecting the first.
+See [ETS import and safety rules](docs/ets-import.md). Stop `serve` before an
+import: its single-writer lease also protects metadata updates.
 
 Run `serve` under a service manager if capture must survive terminal closure;
 use another terminal for `status`, `follow`, `history`, `export`, or `backup`

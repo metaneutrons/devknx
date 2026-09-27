@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Fabian Schmieder
 
 use clap::{Parser, Subcommand, ValueEnum};
+use devknx::api::{self, ApiConfig};
 use devknx::capture::{CaptureEvent, RoutingLossEvent};
 use devknx::ets::{CsvEncoding, EtsCatalog, EtsFormat, parse_group_address};
 use devknx::ipc::{IpcClient, IpcMessage, IpcServer};
@@ -11,7 +12,7 @@ use devknx::storage::CaptureStore;
 use knx_rs_ip::{ConnectionSpec, discovery, parse_url};
 use std::fmt::Write as _;
 use std::io::{self, Write as _};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
@@ -73,6 +74,21 @@ enum Command {
         /// Maximum rows retained in the database.
         #[arg(long, default_value_t = NonZeroU32::new(100_000).expect("nonzero"))]
         max_events: NonZeroU32,
+    },
+    /// Serve the versioned REST API (off unless explicitly started).
+    Api {
+        /// Existing database owned by `serve` for live operations.
+        #[arg(long)]
+        database: PathBuf,
+        /// Listener address; non-loopback requires a bearer token.
+        #[arg(long, default_value = "127.0.0.1:8765")]
+        bind: SocketAddr,
+        /// Name of an environment variable containing a token of at least 32 bytes.
+        #[arg(long)]
+        token_env: Option<String>,
+        /// Permit DPT-validated typed writes through a non-loopback listener.
+        #[arg(long)]
+        allow_remote_writes: bool,
     },
     /// Read the current state of an independent capture process.
     Status {
@@ -266,6 +282,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }) => {
             let spec = parse_url(&endpoint)?;
             run_service(spec, database, max_events).await?;
+        }
+        Some(Command::Api {
+            database,
+            bind,
+            token_env,
+            allow_remote_writes,
+        }) => {
+            let token = token_env
+                .map(|name| {
+                    std::env::var(name).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "REST token environment variable is missing or not UTF-8",
+                        )
+                    })
+                })
+                .transpose()?;
+            api::run(ApiConfig {
+                database,
+                bind,
+                token,
+                allow_remote_writes,
+            })
+            .await?;
         }
         Some(Command::Status { database }) => run_ipc_client(&database, false).await?,
         Some(Command::Follow { database }) => run_ipc_client(&database, true).await?,

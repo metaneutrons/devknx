@@ -87,11 +87,13 @@ jobs:
         run: |
           cargo build --locked --all-features
           xvfb-run -a target/debug/devknx gui --smoke
+          xvfb-run -a cargo test --test gui_live --locked --all-features -- --ignored --nocapture
       - name: Verify native GUI window, resize and menu on macOS
         if: matrix.name == 'macos-aarch64'
         run: |
           cargo build --locked --all-features
           target/debug/devknx gui --smoke
+          cargo test --test gui_live --locked --all-features -- --ignored --nocapture
       - name: Verify native GUI window and resize on Windows
         if: runner.os == 'Windows'
         shell: pwsh
@@ -99,6 +101,8 @@ jobs:
           cargo build --locked --all-features
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & target/debug/devknx.exe gui --smoke
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --test gui_live --locked --all-features -- --ignored --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify native macOS menu and action bridge
         if: matrix.name == 'macos-aarch64'

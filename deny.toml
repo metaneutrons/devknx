@@ -1,0 +1,43 @@
+# cargo-deny. Checks advisories, licences, duplicates and registries.
+# Every entry under `ignore` needs a reason, the affected crate and the
+# condition under which it is removed again.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # Example form, remove when adopting this file:
+    # { id = "RUSTSEC-0000-0000", reason = "no patch available; pulled in through <crate>; remove once <crate> is at <version>" },
+]
+
+[licenses]
+version = 2
+# This list governs dependencies and this application's GPL-3.0-only licence.
+allow = [
+    "GPL-3.0-only",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0", # Clipboard dependencies on Windows.
+    "ISC",
+    "OFL-1.1", # eframe's bundled default fonts.
+    "Ubuntu-font-1.0", # eframe's bundled default fonts.
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

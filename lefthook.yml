@@ -1,0 +1,46 @@
+# lefthook for Rust repositories. As `lefthook.yml` in the root directory.
+# Installation:
+#   brew install lefthook   (or: mise use -g lefthook)
+#   lefthook install
+# The scripts live under scripts/hooks/ and are manager-independent.
+
+commit-msg:
+  commands:
+    conventional-commits:
+      # {1} is the path to the commit message.
+      run: sh scripts/hooks/check-commit-message.sh {1}
+
+pre-commit:
+  parallel: true
+  commands:
+    staged-guards:
+      run: sh scripts/hooks/check-staged.sh
+    secrets:
+      run: gitleaks git --pre-commit --redact --staged --verbose
+    # Formatting only: clippy compiles and blows the pre-commit budget.
+    format:
+      glob: "*.rs"
+      run: cargo fmt --all -- --check
+    toml-format:
+      glob: "*.toml"
+      run: taplo fmt --check
+      skip: true   # set to false once taplo is used in the project
+
+pre-push:
+  parallel: false
+  commands:
+    secrets:
+      run: sh scripts/hooks/check-push-secrets.sh
+    # Measure once BEFORE activating this:
+    #   time cargo clippy --workspace --all-targets
+    # Beyond 30 seconds the step does not belong in the hook but only in CI.
+    # The result is to be measured per repository.
+    clippy:
+      # --all-features deliberately omitted: it forces a complete rebuild.
+      # The full matrix runs in CI.
+      run: cargo clippy --workspace --all-targets -- -D warnings
+    # Tests off by default. Switch them on only after measuring yourself,
+    # because the runtime varies more than clippy's.
+    tests:
+      run: cargo nextest run --workspace
+      skip: true

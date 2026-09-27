@@ -1,0 +1,38 @@
+[package]
+name = "devknx"
+version = "0.1.0"
+edition = "2024"
+authors = ["Fabian Schmieder"]
+description = "KNX monitor with CLI, TUI, GUI, REST, and MCP interfaces"
+license = "GPL-3.0-only"
+repository = "https://github.com/metaneutrons/devknx"
+publish = false
+build = "build.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+# GUI platform crates pull in parallel dependency generations that cannot be
+# unified by this application without upstream changes.
+multiple_crate_versions = "allow"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+eframe = { version = "0.36", optional = true, default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
+knx-rs-core = "0.10.0"
+knx-rs-ip = "0.10.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+
+[features]
+default = ["gui"]
+gui = ["dep:eframe", "dep:image"]
+full = ["gui"]
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"

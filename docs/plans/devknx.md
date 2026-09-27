@@ -1,4 +1,4 @@
-# Initiative plan: devknx (v1)
+# Initiative plan: devknx (v2)
 
 Epic: [devknx initiative](https://github.com/metaneutrons/devknx/issues/3)
 Decision state: product scope agreed with Fabian in September 2026
@@ -96,6 +96,10 @@ Dependencies: M1
 
 - M2-A1: Tunnel, routing, and discovery use `knx-rs-ip`; connection failures,
   reconnects, and lost messages are visible as structured states or events.
+  Router-reported `RoutingLostMessage` (`0x0531`) diagnostics have a distinct
+  durable event stream with source, device state, and count. Local subscriber
+  lag is reported per stream, while connection interruptions have no inferred
+  loss count. None of these is presented as a general KNX bus-loss total.
 - M2-A2: Read, write, and response telegrams preserve raw frames and are
   classified correctly. Tests include loopback tunnel traffic, router traffic,
   malformed frames, and replay across a daemon restart.
@@ -174,13 +178,18 @@ backup/recovery test; an incompatible schema change needs a versioned migration.
 
 Gateway behavior may limit which bus telegrams a tunnel can observe. Routing
 and tunnel capture must be qualified against representative real hardware in
-addition to loopback tests. No gateway test result is claimed yet. KNX USB is
+addition to loopback tests. Measured results belong in the M2 issue; this plan
+does not itself claim a gateway result. KNX USB is
 not part of initial parity. macOS signing, package publication and APT archive
 configuration depend on provider state and are verified immediately before
 use. No time or runner-cost estimate has been measured.
 
 ## Decision changes
 
-- 2026-09-27: Fabian confirmed that KNX-USB is not a prerequisite for the
+- 2026-09-27 (v1): Fabian confirmed that KNX-USB is not a prerequisite for the
   first stable IP release or the later `KnxMonitor` deprecation. The gap must
   be disclosed at that handoff.
+- 2026-09-27 (v2): Fabian confirmed that M2-A1 includes router-reported
+  `RoutingLostMessage` diagnostics. Router reports, per-stream local subscriber
+  lag, and unquantified connection interruptions remain separate; no category
+  is presented as a general KNX bus-loss total.

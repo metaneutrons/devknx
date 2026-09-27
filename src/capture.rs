@@ -10,7 +10,7 @@ use std::time::SystemTime;
 
 use knx_rs_core::cemi::CemiFrame;
 use knx_rs_core::message::ApduType;
-use knx_rs_ip::{ConnectionSpec, KnxConnection};
+use knx_rs_ip::{ConnectionSpec, KnxConnection, RoutingLostMessage};
 
 /// Transport and remote endpoint from which a frame was observed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,6 +85,57 @@ pub struct CaptureEvent {
     endpoint: CaptureEndpoint,
     direction: CaptureDirection,
     frame: CemiFrame,
+}
+
+/// A router-reported loss of KNXnet/IP routing frames, distinct from local
+/// subscriber lag and from an unquantified connection interruption.
+#[derive(Clone, Debug)]
+pub struct RoutingLossEvent {
+    observed_at: SystemTime,
+    endpoint: CaptureEndpoint,
+    report: RoutingLostMessage,
+}
+
+impl RoutingLossEvent {
+    /// Record a diagnostic received from a multicast router.
+    #[must_use]
+    pub fn received(endpoint: CaptureEndpoint, report: RoutingLostMessage) -> Self {
+        Self {
+            observed_at: SystemTime::now(),
+            endpoint,
+            report,
+        }
+    }
+
+    pub(crate) const fn from_stored(
+        observed_at: SystemTime,
+        endpoint: CaptureEndpoint,
+        report: RoutingLostMessage,
+    ) -> Self {
+        Self {
+            observed_at,
+            endpoint,
+            report,
+        }
+    }
+
+    /// Wall-clock time at which the report was received.
+    #[must_use]
+    pub const fn observed_at(&self) -> SystemTime {
+        self.observed_at
+    }
+
+    /// Multicast endpoint on which the report was received.
+    #[must_use]
+    pub const fn endpoint(&self) -> CaptureEndpoint {
+        self.endpoint
+    }
+
+    /// Source, device state and count as reported by the router.
+    #[must_use]
+    pub const fn report(&self) -> RoutingLostMessage {
+        self.report
+    }
 }
 
 impl CaptureEvent {

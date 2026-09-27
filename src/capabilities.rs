@@ -28,6 +28,8 @@ pub enum Capability {
     ServiceStatus,
     /// Follow the independent process's live state and captures.
     ServiceFollow,
+    /// Read router-reported routing losses from the persistent database.
+    RouterLossHistory,
 }
 
 /// All currently implemented user-facing operations.
@@ -40,6 +42,7 @@ pub const ALL: &[Capability] = &[
     Capability::DatabaseBackup,
     Capability::ServiceStatus,
     Capability::ServiceFollow,
+    Capability::RouterLossHistory,
 ];
 
 /// An application surface that exposes capabilities.
@@ -93,6 +96,10 @@ pub const CLI: &[Declaration] = &[
     Declaration {
         capability: Capability::ServiceFollow,
         source_anchor: "Some(Command::Follow {",
+    },
+    Declaration {
+        capability: Capability::RouterLossHistory,
+        source_anchor: "Some(Command::RouterLosses {",
     },
 ];
 
@@ -166,6 +173,13 @@ pub const GAPS: &[Gap] = &[
         present_on: Surface::Cli,
         missing_on: Surface::Gui,
         reason: "The GUI has not yet attached to the independent capture process.",
+        target_issue: "https://github.com/metaneutrons/devknx/issues/7",
+    },
+    Gap {
+        capability: Capability::RouterLossHistory,
+        present_on: Surface::Cli,
+        missing_on: Surface::Gui,
+        reason: "The GUI has no persistent router-diagnostics view yet.",
         target_issue: "https://github.com/metaneutrons/devknx/issues/7",
     },
 ];

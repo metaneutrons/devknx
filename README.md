@@ -64,6 +64,7 @@ cargo run --locked -- serve tunnel://192.0.2.1:3671 --database captures.sqlite
 cargo run --locked -- status --database captures.sqlite
 cargo run --locked -- follow --database captures.sqlite
 cargo run --locked -- history --database captures.sqlite --after 0 --limit 100
+cargo run --locked -- router-losses --database captures.sqlite --after 0 --limit 100
 cargo run --locked -- export --database captures.sqlite > captures.csv
 cargo run --locked -- backup --database captures.sqlite --output captures-backup.sqlite
 cargo run --locked -- gui
@@ -79,14 +80,19 @@ timestamp, endpoint, source and destination addresses, group-value service,
 and the exact raw frame in hexadecimal. Connection changes are printed to
 standard error. Failed connection attempts and unexpected closes are retried
 with a bounded 1–30 second delay; press Ctrl-C to stop. Only receive-side
-frames are captured in this development build. A slow live subscriber is
-reported as application-event lag, not as a count of lost KNX bus telegrams.
+frames are captured in this development build. A router's KNXnet/IP
+`RoutingLostMessage` diagnostic is stored and streamed separately from cEMI
+frames. It includes the reporting router, device state, and count of routing
+frames the router says it lost. A slow local subscriber is reported separately
+as application-event lag; a connection interruption has no inferred loss count.
+None is a general KNX bus-loss total.
 The endpoints above are examples; substitute your own network addresses.
 Passive receive, restart, local IPC, and SQLite backup have been exercised
 against a real KNXnet/IP tunnel on macOS ARM64 and a physical multicast router
 on Linux x86_64. The observed bus traffic contained group writes, not reads or
-responses. KNX bus-loss telemetry is not yet claimed; see the
-[M2 evidence and open decision](https://github.com/metaneutrons/devknx/issues/5).
+responses. No real router loss report has been observed in the qualification
+window; parser and integration tests exercise the diagnostic path. See the
+[M2 evidence and limits](https://github.com/metaneutrons/devknx/issues/5).
 
 The optional `--database` creates a versioned SQLite capture store. Each
 committed telegram receives a monotonic ID; the default retention limit is
@@ -97,6 +103,10 @@ creates a consistent SQLite snapshot, including committed WAL transactions
 while `serve` is running; it never overwrites an existing destination. All
 three commands fail rather than create an empty database if the source path is
 wrong.
+`router-losses` reads a separate, bounded diagnostic history with its own
+monotonic ID cursor; it does not mix router reports with cEMI history or CSV.
+Opening a version-one database for writing migrates it transactionally to
+schema version two; read-only history remains available during migration.
 Existing databases with an unsupported schema are not rewritten. The CLI now
 runs an in-process connection owner and live event bus; capture continues if
 its terminal subscriber falls behind. The connection and database are still
@@ -104,8 +114,8 @@ owned only while `monitor` is running. `serve` runs the same capture owner in a
 separate foreground process; it can be kept alive by a service manager while
 `history`, `export`, and `backup` read the database from other processes.
 `status` and `follow` connect to the running owner over current-user local IPC;
-`follow` emits version-one JSON lines with connection states, committed captures,
-and explicit application-subscriber lag counts. The process does not detach or
+`follow` emits development-version-two JSON lines with connection states, committed captures,
+router reports, and explicit per-stream application-subscriber lag counts. The process does not detach or
 auto-start. One writable owner
 per database is enforced by a sidecar `.writer.lock` file, which is retained
 across restarts and must not be deleted while capture runs. On Unix, a writable

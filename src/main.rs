@@ -2,9 +2,9 @@
 // Copyright (C) 2026 Fabian Schmieder
 
 use clap::{Parser, Subcommand};
-use devknx::capture::CaptureEvent;
-use devknx::ipc::{IpcClient, IpcServer};
-use devknx::service::{CaptureService, ReconnectPolicy};
+use devknx::capture::{CaptureEvent, RoutingLossEvent};
+use devknx::ipc::{IpcClient, IpcMessage, IpcServer};
+use devknx::service::{CaptureService, LiveRoutingLoss, ReconnectPolicy};
 use devknx::storage::CaptureStore;
 use knx_rs_ip::{ConnectionSpec, discovery, parse_url};
 use std::fmt::Write as _;
@@ -75,6 +75,18 @@ enum Command {
         #[arg(long, default_value_t = NonZeroU32::new(100).expect("nonzero"))]
         limit: NonZeroU32,
     },
+    /// Read durable router-reported routing losses after a separate event ID.
+    RouterLosses {
+        /// Existing SQLite capture database.
+        #[arg(long)]
+        database: PathBuf,
+        /// Exclusive router-loss cursor; zero reads from the beginning.
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        /// Maximum rows to print (1–1000).
+        #[arg(long, default_value_t = NonZeroU32::new(100).expect("nonzero"))]
+        limit: NonZeroU32,
+    },
     /// Export captured telegrams as CSV to standard output.
     Export {
         /// Existing SQLite capture database.
@@ -137,6 +149,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 writeln!(output, "id={} {}", capture.id, format_event(&capture.event))?;
             }
         }
+        Some(Command::RouterLosses {
+            database,
+            after,
+            limit,
+        }) => {
+            let store = CaptureStore::open_existing(&database)?;
+            let stdout = io::stdout();
+            let mut output = stdout.lock();
+            for row in store.read_routing_losses_after(after, limit)? {
+                let message = IpcMessage::from(&LiveRoutingLoss {
+                    id: Some(row.id),
+                    event: row.event,
+                });
+                writeln!(output, "{}", serde_json::to_string(&message)?)?;
+            }
+        }
         Some(Command::Export { database, after }) => {
             let store = CaptureStore::open_existing(&database)?;
             let stdout = io::stdout();
@@ -172,10 +200,12 @@ async fn run_service(
         queue_capacity,
     );
     let mut states = service.subscribe_state();
+    let mut routing_losses = service.subscribe_routing_losses();
     let ipc_states = service.subscribe_state();
     let ipc_frames = service.subscribe_frames();
+    let ipc_routing_losses = service.subscribe_routing_losses();
     let ipc = IpcServer::bind(&database)?;
-    let mut ipc_task = tokio::spawn(ipc.run(ipc_states, ipc_frames));
+    let mut ipc_task = tokio::spawn(ipc.run(ipc_states, ipc_frames, ipc_routing_losses));
     let (stop_tx, stop_rx) = oneshot::channel();
     let mut task = tokio::spawn(async move {
         let mut service = service;
@@ -206,6 +236,15 @@ async fn run_service(
             changed = states.changed() => {
                 if changed.is_ok() {
                     eprintln!("connection_state={:?}", *states.borrow_and_update());
+                }
+            }
+            report = routing_losses.recv() => {
+                match report {
+                    Ok(live) => eprintln!("{}", format_routing_loss(&live.event, live.id)),
+                    Err(broadcast::error::RecvError::Lagged(count)) => {
+                        eprintln!("local_router_loss_subscriber_lagged={count}");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {}
                 }
             }
         }
@@ -250,6 +289,7 @@ async fn run_monitor(
     let service = CaptureService::new(spec, store, ReconnectPolicy::default(), queue_capacity);
     let mut states = service.subscribe_state();
     let mut frames = service.subscribe_frames();
+    let mut routing_losses = service.subscribe_routing_losses();
     let (stop_tx, stop_rx) = oneshot::channel();
     let mut stop_tx = Some(stop_tx);
     let mut task = tokio::spawn(async move {
@@ -304,6 +344,15 @@ async fn run_monitor(
                     Err(broadcast::error::RecvError::Closed) => {}
                 }
             }
+            report = routing_losses.recv() => {
+                match report {
+                    Ok(live) => eprintln!("{}", format_routing_loss(&live.event, live.id)),
+                    Err(broadcast::error::RecvError::Lagged(count)) => {
+                        eprintln!("local_router_loss_subscriber_lagged={count}");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {}
+                }
+            }
         }
     }
     if let Some(sender) = stop_tx.take() {
@@ -335,6 +384,22 @@ fn format_event(event: &CaptureEvent) -> String {
         frame.destination_address(),
         event.group_service(),
         frame.message_code_raw(),
+    )
+}
+
+fn format_routing_loss(event: &RoutingLossEvent, id: Option<i64>) -> String {
+    let timestamp_ms = event
+        .observed_at()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let report = event.report();
+    format!(
+        "routing_lost_message id={id:?} timestamp_ms={timestamp_ms} endpoint={} source={} device_state={} lost_routing_frames={}",
+        event.endpoint(),
+        report.source,
+        report.device_state,
+        report.lost_messages,
     )
 }
 

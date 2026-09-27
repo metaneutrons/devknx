@@ -1222,18 +1222,18 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "knx-rs-core"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9414eafb0767758507c7fd0f9ec20b39c3f41f25f2e9a24fbb6046cce91e95b"
+checksum = "2137371d2cc4e88a0b72618933260dee1e1a51de04cb2c700a9ac483ccf8baed"
 dependencies = [
  "libm",
 ]
 
 [[package]]
 name = "knx-rs-ip"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "564f733d6007017c56160f12d0db4faef3343911691fcbc35c62ba36f41fa838"
+checksum = "49c0f10980c4df1cf3898b2e37759e664dcdbd0df32220d465f6a959bde39445"
 dependencies = [
  "knx-rs-core",
  "socket2",

@@ -54,6 +54,13 @@ devknx serve router://224.0.23.12:3671 --database ./m2-router.sqlite
 The endpoint must receive routing indications from a real KNXnet/IP router
 over the selected network interface, not a local unicast injection into the
 same UDP port. Check `status`, `follow`, durable history, and raw cEMI as above.
+Also check `devknx router-losses --database ./m2-router.sqlite`. If a real
+router emits `RoutingLostMessage` (`0x0531`) during the passive window, confirm
+that `follow` emits a distinct `routing_lost_message` with the reporting
+router source, device state, and count, and that the same ID is durable and
+present in a restored backup. Do not induce packet loss on a production bus
+to manufacture this diagnostic. Record explicitly when none was observed;
+synthetic parser/IPC tests are not physical-router evidence for `0x0531`.
 If the host has multiple interfaces, record which interface carried the
 multicast packets. A successful `connected` state alone proves only that the
 multicast socket joined; it does not prove telegram delivery.
@@ -67,9 +74,9 @@ physical network. Keep sensitive raw captures local; if artifacts are retained,
 record a SHA-256 digest and private location rather than publishing the bytes.
 Record every missing service category or topology limitation explicitly.
 
-`lagged.count` measures application subscriber loss, not KNX bus loss. Do not
-claim bus-loss measurement from it. If a gateway reports KNXnet/IP
-`RoutingLostMessage`, its handling must be separately qualified once the
-product and crate API define that diagnostic. Close M2 only after the plan
-criteria and this real-hardware gate have evidence, or after an explicit
+`lagged.count` measures application subscriber loss, not KNX bus loss. Router
+`lost_messages` counts KNXnet/IP routing frames the reporting router says it
+lost; it is not a general KNX bus-loss count. `waiting_retry` records a
+connection interruption with no inferred loss count. Close M2 only after the
+plan criteria and this real-hardware gate have evidence, or after an explicit
 reviewed change to the normative plan.

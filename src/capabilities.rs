@@ -11,6 +11,7 @@ pub enum Capability {
     LiveCapture,
     CaptureService,
     RestApi,
+    McpServer,
     HistoryRead,
     CsvExport,
     DatabaseBackup,
@@ -32,6 +33,7 @@ pub const ALL: &[Capability] = &[
     Capability::LiveCapture,
     Capability::CaptureService,
     Capability::RestApi,
+    Capability::McpServer,
     Capability::HistoryRead,
     Capability::CsvExport,
     Capability::DatabaseBackup,
@@ -79,6 +81,10 @@ pub const CLI: &[Declaration] = &[
     Declaration {
         capability: Capability::RestApi,
         source_anchor: "Some(Command::Api {",
+    },
+    Declaration {
+        capability: Capability::McpServer,
+        source_anchor: "Some(Command::Mcp {",
     },
     Declaration {
         capability: Capability::HistoryRead,
@@ -241,6 +247,18 @@ pub const GAPS: &[Gap] = &[
         capability: Capability::RestApi,
         missing_on: Surface::Tui,
         reason: "REST listener configuration is an explicit CLI service operation",
+        target_issue: M5,
+    },
+    Gap {
+        capability: Capability::McpServer,
+        missing_on: Surface::Tui,
+        reason: "MCP stdio is an explicit CLI process for a local client",
+        target_issue: M5,
+    },
+    Gap {
+        capability: Capability::McpServer,
+        missing_on: Surface::Gui,
+        reason: "MCP stdio is an explicit CLI process for a local client",
         target_issue: M5,
     },
     Gap {

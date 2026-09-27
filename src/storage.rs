@@ -111,6 +111,7 @@ impl CaptureStore {
             std::fs::create_dir_all(parent)?;
         }
         let database_path = normalized_sqlite_path(path)?;
+        #[cfg(unix)]
         prepare_private_file(&database_path)?;
         let mut connection = Connection::open_with_flags(
             &database_path,
@@ -293,42 +294,41 @@ fn normalized_sqlite_path(path: &Path) -> Result<PathBuf, StorageError> {
     if path == Path::new(":memory:") {
         return Ok(path.to_path_buf());
     }
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing database filename"))?;
     #[cfg(unix)]
     {
         let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let file_name = path.file_name().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "missing database filename")
-        })?;
         Ok(parent.canonicalize()?.join(file_name))
     }
     #[cfg(not(unix))]
-    Ok(path.to_path_buf())
+    {
+        let _ = file_name;
+        Ok(path.to_path_buf())
+    }
 }
 
+#[cfg(unix)]
 fn prepare_private_file(path: &Path) -> Result<(), StorageError> {
-    #[cfg(unix)]
-    {
-        use std::fs::OpenOptions;
-        use std::os::unix::fs::OpenOptionsExt as _;
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt as _;
 
-        if path != Path::new(":memory:") {
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)
-            {
-                Ok(file) => drop(file),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
-            }
+    if path != Path::new(":memory:") {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+        {
+            Ok(file) => drop(file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
         }
     }
-    #[cfg(not(unix))]
-    let _ = path;
     Ok(())
 }
 

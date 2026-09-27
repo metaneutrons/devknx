@@ -36,7 +36,7 @@ desktop button and an API call.
 | ETS group-address CSV and XML import | Experimental CLI import; TUI and GUI display active ETS labels and DPT declarations |
 | DPT-validated read, write preview, and write | Experimental CLI/TUI/GUI operations through the single capture owner; loopback-qualified, not yet hardware-qualified |
 | Terminal UI and native desktop UI | Experimental; automated window, menu, sustained-capture, scrolling, and owner-restart qualification passes on the supported GUI platforms; visual review is deferred |
-| Local REST and MCP interfaces | Planned |
+| Local REST and MCP interfaces | Experimental versioned REST API with cursor history, resumable SSE, ETS lookup and DPT-validated operations; MCP planned |
 
 ETS group-address metadata is stored in separate revisions without changing
 raw captured telegrams. A typed write requires an unambiguous DPT (from ETS or
@@ -62,6 +62,7 @@ cargo run --locked -- monitor tunnel://192.0.2.1:3671
 cargo run --locked -- monitor router://224.0.23.12:3671
 cargo run --locked -- monitor tunnel://192.0.2.1:3671 --database captures.sqlite
 cargo run --locked -- serve tunnel://192.0.2.1:3671 --database captures.sqlite
+cargo run --locked -- api --database captures.sqlite
 cargo run --locked -- status --database captures.sqlite
 cargo run --locked -- follow --database captures.sqlite
 cargo run --locked -- history --database captures.sqlite --after 0 --limit 100
@@ -85,6 +86,11 @@ opened without a database to discover gateways and choose a capture database.
 The TUI requires an existing database. Start `serve` separately for live
 capture and group operations; both interfaces can inspect history while the
 owner is offline.
+
+The REST API is a separate opt-in process, bound to `127.0.0.1:8765` by
+default. It reads the same database and sends operations through the same
+capture owner. See the [REST API guide](docs/rest.md) for versioned routes,
+SSE resume, authentication and remote-write policy.
 
 The GUI shows a bounded live/history view, a text filter, ETS names and DPTs,
 raw cEMI details, read and prepared typed-write dialogs, and non-overwriting

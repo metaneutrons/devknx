@@ -76,6 +76,8 @@ pub struct LiveRoutingLoss {
 pub struct OperationEnvelope {
     /// Intent, never a caller-supplied pre-encoded frame.
     pub request: OperationRequest,
+    /// Adapter-supplied identity within the current-user IPC boundary.
+    pub origin: crate::operations::OperationOrigin,
     /// Transmission receipt or validation/transport error.
     pub response: oneshot::Sender<Result<OperationReceipt, String>>,
 }
@@ -200,6 +202,7 @@ impl CaptureService {
         &mut self,
         connection: &C,
         request: OperationRequest,
+        origin: crate::operations::OperationOrigin,
     ) -> Result<Result<OperationReceipt, String>, ServiceError> {
         let Some(store) = self.store.as_mut() else {
             return Ok(Err(
@@ -224,7 +227,7 @@ impl CaptureService {
         let dpt = prepared.dpt.map(|value| value.to_string());
         let raw_cemi = prepared.frame.as_bytes().to_vec();
         let audit_id = store.start_operation_audit(
-            "local_ipc",
+            origin.as_str(),
             kind,
             address_raw,
             dpt.as_deref(),
@@ -321,7 +324,7 @@ impl CaptureService {
                                     if operation.response.is_closed() {
                                         continue;
                                     }
-                                    match self.execute_operation(&connection, operation.request).await {
+                                    match self.execute_operation(&connection, operation.request, operation.origin).await {
                                         Ok(result) => {
                                             let _ = operation.response.send(result);
                                         }
@@ -901,6 +904,7 @@ mod tests {
                         address_raw: 0x0a03,
                         payload: crate::operations::RawPayload::Inline(1),
                     },
+                    origin: crate::operations::OperationOrigin::LocalIpc,
                     response,
                 })
                 .await

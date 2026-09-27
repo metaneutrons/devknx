@@ -10,6 +10,7 @@ pub enum Capability {
     GatewayDiscovery,
     LiveCapture,
     CaptureService,
+    RestApi,
     HistoryRead,
     CsvExport,
     DatabaseBackup,
@@ -30,6 +31,7 @@ pub const ALL: &[Capability] = &[
     Capability::GatewayDiscovery,
     Capability::LiveCapture,
     Capability::CaptureService,
+    Capability::RestApi,
     Capability::HistoryRead,
     Capability::CsvExport,
     Capability::DatabaseBackup,
@@ -73,6 +75,10 @@ pub const CLI: &[Declaration] = &[
     Declaration {
         capability: Capability::CaptureService,
         source_anchor: "Some(Command::Serve {",
+    },
+    Declaration {
+        capability: Capability::RestApi,
+        source_anchor: "Some(Command::Api {",
     },
     Declaration {
         capability: Capability::HistoryRead,
@@ -226,10 +232,23 @@ pub struct Gap {
 }
 
 const M4: &str = "https://github.com/metaneutrons/devknx/issues/7";
+const M5: &str = "https://github.com/metaneutrons/devknx/issues/8";
 
 /// Explicit exceptions. Import and backup require exclusive database ownership;
 /// raw sending and audit inspection remain expert CLI controls in this slice.
 pub const GAPS: &[Gap] = &[
+    Gap {
+        capability: Capability::RestApi,
+        missing_on: Surface::Tui,
+        reason: "REST listener configuration is an explicit CLI service operation",
+        target_issue: M5,
+    },
+    Gap {
+        capability: Capability::RestApi,
+        missing_on: Surface::Gui,
+        reason: "REST listener configuration is an explicit CLI service operation",
+        target_issue: M5,
+    },
     Gap {
         capability: Capability::CaptureService,
         missing_on: Surface::Tui,

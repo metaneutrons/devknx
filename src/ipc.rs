@@ -33,7 +33,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 
 use crate::capture::GroupService;
-use crate::operations::OperationRequest;
+use crate::operations::{OperationOrigin, OperationRequest};
 use crate::service::{ConnectionState, LiveCapture, LiveRoutingLoss, OperationEnvelope};
 
 const MAX_MESSAGE_SIZE: usize = 16 * 1024;
@@ -415,7 +415,29 @@ async fn handle_client(
     if command == b"OPERATE" {
         let request = read_line(&mut stream, MAX_MESSAGE_SIZE).await?;
         let request: OperationRequest = serde_json::from_slice(&request)?;
-        handle_operation(&mut stream, &state, &mut frames, &operations, request).await?;
+        handle_operation(
+            &mut stream,
+            &state,
+            &mut frames,
+            &operations,
+            request,
+            OperationOrigin::LocalIpc,
+        )
+        .await?;
+        return Ok(());
+    }
+    if command == b"OPERATE_AS" {
+        let body = read_line(&mut stream, MAX_MESSAGE_SIZE).await?;
+        let call: OriginatedOperation = serde_json::from_slice(&body)?;
+        handle_operation(
+            &mut stream,
+            &state,
+            &mut frames,
+            &operations,
+            call.request,
+            call.origin,
+        )
+        .await?;
         return Ok(());
     }
     if command != b"STATUS" && command != b"FOLLOW" {
@@ -486,6 +508,7 @@ async fn handle_operation(
     frames: &mut broadcast::Receiver<LiveCapture>,
     operations: &mpsc::Sender<OperationEnvelope>,
     request: OperationRequest,
+    origin: OperationOrigin,
 ) -> Result<(), IpcError> {
     if !matches!(&*state.borrow(), ConnectionState::Connected { .. }) {
         return write_message(
@@ -508,7 +531,11 @@ async fn handle_operation(
     };
     let (response, receiver) = oneshot::channel();
     if operations
-        .send(OperationEnvelope { request, response })
+        .send(OperationEnvelope {
+            request,
+            origin,
+            response,
+        })
         .await
         .is_err()
     {
@@ -625,6 +652,12 @@ pub struct IpcClient {
     reader: BufReader<Stream>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct OriginatedOperation {
+    origin: OperationOrigin,
+    request: OperationRequest,
+}
+
 impl IpcClient {
     /// Request one current state or subscribe to future records.
     ///
@@ -660,6 +693,20 @@ impl IpcClient {
         database: &Path,
         request: &OperationRequest,
     ) -> Result<IpcMessage, IpcError> {
+        Self::operate_as(database, request, OperationOrigin::LocalIpc).await
+    }
+
+    /// Send an operation from one of the named local adapters.
+    ///
+    /// # Errors
+    ///
+    /// Returns local transport or protocol failures; an operation rejection is
+    /// represented by [`IpcMessage::OperationError`].
+    pub async fn operate_as(
+        database: &Path,
+        request: &OperationRequest,
+        origin: OperationOrigin,
+    ) -> Result<IpcMessage, IpcError> {
         #[cfg(unix)]
         let mut stream = {
             let path = socket_path(database, false)?;
@@ -670,12 +717,15 @@ impl IpcClient {
             let name = pipe_name(database)?;
             Stream::connect(name.to_ns_name::<GenericNamespaced>()?).await?
         };
-        let mut body = serde_json::to_vec(request)?;
+        let mut body = serde_json::to_vec(&OriginatedOperation {
+            origin,
+            request: request.clone(),
+        })?;
         if body.len() >= MAX_MESSAGE_SIZE {
             return Err(IpcError::MessageTooLarge);
         }
         body.push(b'\n');
-        stream.write_all(b"OPERATE\n").await?;
+        stream.write_all(b"OPERATE_AS\n").await?;
         stream.write_all(&body).await?;
         let mut client = Self {
             reader: BufReader::new(stream),

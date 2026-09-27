@@ -33,6 +33,33 @@ pub enum OperationRequest {
     },
 }
 
+/// Auditable entry point for a request; callers cannot provide arbitrary text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationOrigin {
+    /// Current-user local IPC, including CLI and desktop clients.
+    LocalIpc,
+    /// HTTP listener bound exclusively to loopback.
+    RestLoopback,
+    /// Authenticated HTTP listener reachable beyond loopback.
+    RestRemote,
+    /// Local MCP stdio tool call.
+    McpStdio,
+}
+
+impl OperationOrigin {
+    /// Stable audit label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalIpc => "local_ipc",
+            Self::RestLoopback => "rest_loopback",
+            Self::RestRemote => "rest_remote",
+            Self::McpStdio => "mcp_stdio",
+        }
+    }
+}
+
 /// Explicit wire representation for the separately named raw operation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "form", content = "value", rename_all = "snake_case")]

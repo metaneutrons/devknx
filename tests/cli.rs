@@ -7,6 +7,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use devknx::capture::{CaptureEndpoint, CaptureEvent, RoutingLossEvent};
+use devknx::ets::{CsvEncoding, EtsCatalog, EtsFormat};
 use devknx::ipc::{IpcClient, IpcMessage, ReadOutcome, WireState};
 use devknx::operations::{OperationRequest, RawPayload};
 use devknx::storage::CaptureStore;
@@ -67,6 +68,10 @@ fn help_describes_available_commands() {
     assert!(stdout.contains("gui"));
     #[cfg(not(feature = "gui"))]
     assert!(!stdout.contains("gui"));
+    #[cfg(feature = "tui")]
+    assert!(stdout.contains("tui"));
+    #[cfg(not(feature = "tui"))]
+    assert!(!stdout.contains("tui"));
 }
 
 #[test]
@@ -580,6 +585,12 @@ fn history_and_export_read_the_same_committed_frame() {
         frame,
     );
     assert_eq!(store.insert(&event).expect("insert frame"), 1);
+    let ets = EtsCatalog::from_bytes(
+        br#"<GroupAddress-Export xmlns="http://knx.org/xml/ga-export/01"><GroupRange Name="Lighting"><GroupAddress Name="Hall light" Address="1/0/1" DPTs="DPST-1-1" /></GroupRange></GroupAddress-Export>"#,
+        EtsFormat::GaXml01,
+        CsvEncoding::Utf8,
+    ).unwrap();
+    store.import_ets(&ets).unwrap();
     drop(store);
 
     let path = path.to_str().expect("UTF-8 test path");
@@ -588,6 +599,14 @@ fn history_and_export_read_the_same_committed_frame() {
     let history = String::from_utf8(history.stdout).expect("UTF-8 history");
     assert!(history.contains("id=1 timestamp_ms="));
     assert!(history.contains("cemi=2900bce01101080102008001"));
+    assert!(history.contains("ets_name=\"Hall light\""));
+
+    let filtered = devknx(&["history", "--database", path, "--filter", "hall light"]);
+    assert!(filtered.status.success());
+    assert!(String::from_utf8_lossy(&filtered.stdout).contains("id=1"));
+    let absent = devknx(&["history", "--database", path, "--filter", "kitchen"]);
+    assert!(absent.status.success());
+    assert!(absent.stdout.is_empty());
 
     let export = devknx(&["export", "--database", path]);
     assert!(export.status.success());

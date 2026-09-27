@@ -17,7 +17,7 @@
 </p>
 
 > [!IMPORTANT]
-> **Early development.** There is no stable release yet. The CLI can discover gateways, capture raw telegrams, import ETS group-address metadata, and issue explicitly requested group operations through a running `serve` process. The native GUI is still a discovery shell. There is no automatic daemon startup. Group writes can affect a live installation; qualify them on an isolated test network first.
+> **Early development.** There is no stable release yet. CLI, TUI and GUI can inspect capture history and live traffic; interactive surfaces attach to a separately started `serve` process. There is no automatic daemon startup. Group writes can affect a live installation; qualify them on an isolated test network first.
 
 ## What devknx is building
 
@@ -29,13 +29,13 @@ desktop button and an API call.
 
 | Capability | Current state |
 | --- | --- |
-| KNXnet/IP gateway discovery | CLI and native GUI shell available |
+| KNXnet/IP gateway discovery | CLI, TUI, and native GUI available |
 | KNXnet/IP tunneling and routing capture | Experimental CLI stream with bounded reconnect and optional SQLite persistence |
 | Independent capture process | Experimental foreground `serve` command with current-user `status` and `follow` IPC; no automatic startup yet |
-| Durable, searchable telegram history | Experimental SQLite history with ID cursor, retention cap, and CSV export; filters/search and the background daemon are pending |
-| ETS group-address CSV and XML import | Experimental CLI import and lookup; GUI integration pending |
-| DPT-validated read, write preview, and write | Experimental CLI operations through the single capture owner; loopback-qualified, not yet hardware-qualified |
-| Terminal UI and full native desktop UI | Planned |
+| Durable telegram history | Experimental SQLite history with ID cursor and retention cap; interactive views filter the loaded window and export the full retained history |
+| ETS group-address CSV and XML import | Experimental CLI import; TUI and GUI display active ETS labels and DPT declarations |
+| DPT-validated read, write preview, and write | Experimental CLI/TUI/GUI operations through the single capture owner; loopback-qualified, not yet hardware-qualified |
+| Terminal UI and native desktop UI | Experimental; platform and sustained-traffic qualification remains |
 | Local REST and MCP interfaces | Planned |
 
 ETS group-address metadata is stored in separate revisions without changing
@@ -75,13 +75,31 @@ cargo run --locked -- read --database captures.sqlite 1/2/3
 cargo run --locked -- write --database captures.sqlite 1/2/3 true
 cargo run --locked -- write-raw --database captures.sqlite --inline 1 1/2/3
 cargo run --locked -- audit --database captures.sqlite
-cargo run --locked -- gui
+cargo run --locked -- tui --database captures.sqlite
+cargo run --locked -- gui --database captures.sqlite
 ```
 
 Gateway discovery sends KNXnet/IP multicast on the local network. Network
 equipment and host firewall rules can affect the result. The GUI can also be
-opened without a gateway; its current purpose is to exercise the native app
-shell and discovery view.
+opened without a database to discover gateways and choose a capture database.
+The TUI requires an existing database. Start `serve` separately for live
+capture and group operations; both interfaces can inspect history while the
+owner is offline.
+
+The GUI shows a bounded live/history view, a text filter, ETS names and DPTs,
+raw cEMI details, read and prepared typed-write dialogs, and non-overwriting
+CSV export. Its macOS app has native application, File, Edit, View, Operation,
+Window and Help menus. The TUI offers `/` filter, `r` read, `w` prepared typed
+write, `e` export, `h` reload, `PgUp` older history, `d` discovery,
+`j`/`k` scroll and `q` quit.
+In both interfaces, a typed write is previewed before a separate send action.
+Expert raw sending, ETS import, backup and durable audit inspection remain CLI
+commands. The [capability registry](src/capabilities.rs) records these explicit
+differences. On attach the interactive views load the latest 1,000 rows and
+can page backward into older retained history. They keep up to 5,000 rows in
+memory; a text filter narrows that window, not
+the entire database. `history --after ... --limit ... --filter ...` filters one
+bounded CLI page. CSV export still covers the complete retained capture history.
 
 `monitor` prints one line per received cEMI frame, including a millisecond
 timestamp, endpoint, source and destination addresses, group-value service,
@@ -130,8 +148,8 @@ across restarts and must not be deleted while capture runs. On Unix, a writable
 capture directory must not be group- or world-writable. The Unix IPC socket
 normally lives under a private directory beside the database, with a short
 private `/tmp` fallback for Unix socket path limits; the Windows named pipe
-uses a current-user access-control list. The GUI and other surfaces do not yet
-attach to this stream.
+uses a current-user access-control list. The GUI and TUI attach to this stream
+and reconnect after an owner restart.
 The [local IPC protocol](docs/local-ipc.md) is documented for development
 clients; it is not yet a stable external API.
 
@@ -182,11 +200,13 @@ No package listed here is available yet. Release qualification will cover:
 
 | Platform | Architectures | Deliverables |
 | --- | --- | --- |
-| macOS | ARM64 only | CLI archive, notarized `.app.zip`, Homebrew formula and cask |
+| macOS | ARM64 only | CLI archive, notarized `.app.zip`, Homebrew `devknx` CLI formula and separate `devknx-app` cask |
 | Linux | x86_64 and ARM64 | GNU and musl CLI archives, Debian packages, Homebrew formula, AUR packages |
 | Windows | x86_64 and ARM64 | CLI archives with the icon embedded in each executable |
 
-The packages will be published through GitHub Releases, the
+The Homebrew formula will put `devknx` on `PATH`; the cask will put
+`devknx.app` in `/Applications`. They will install side by side. The packages
+will be published through GitHub Releases, the
 [`metaneutrons` Homebrew tap](https://github.com/metaneutrons/homebrew-tap),
 the AUR, and the shared [`deb.metaneutrons.cc`](https://deb.metaneutrons.cc/index.html)
 archive. The macOS Intel target is intentionally excluded. Linux musl archives
@@ -200,7 +220,7 @@ defines the live method; measured results and limits are recorded in the
 [metaneutrons.cc](https://metaneutrons.cc), the overview of
 Fabian's repositories; it does not require a separate project website.
 The [capability registry](src/capabilities.rs) records which current operations
-exist in the CLI and GUI and why their coverage differs during development.
+exist in the CLI, TUI and GUI and why their coverage differs during development.
 
 ## Development and security
 

@@ -82,6 +82,9 @@ jobs:
           tool: cargo-llvm-cov
       - run: cargo clippy --workspace --all-targets --locked ${{ matrix.features }} -- -D warnings
       - run: cargo nextest run --workspace --locked ${{ matrix.features }}
+      - name: Verify native macOS menu and action bridge
+        if: matrix.name == 'macos-aarch64'
+        run: bash scripts/check-macos-menu.sh
       - name: Verify embedded Windows icon and counter-probe
         if: runner.os == 'Windows'
         shell: pwsh

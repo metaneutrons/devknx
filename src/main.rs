@@ -19,6 +19,12 @@ use tokio::sync::{broadcast, oneshot};
 
 #[cfg(feature = "gui")]
 mod gui;
+#[cfg(any(feature = "gui", feature = "tui"))]
+mod interface;
+#[cfg(feature = "gui")]
+mod platform;
+#[cfg(feature = "tui")]
+mod tui;
 
 #[derive(Parser)]
 #[command(name = "devknx", version, about = "Discover and monitor KNXnet/IP")]
@@ -91,6 +97,9 @@ enum Command {
         /// Maximum rows to print (1–1000).
         #[arg(long, default_value_t = NonZeroU32::new(100).expect("nonzero"))]
         limit: NonZeroU32,
+        /// Case-insensitive text filter within the requested history page.
+        #[arg(long)]
+        filter: Option<String>,
     },
     /// Read durable router-reported routing losses after a separate event ID.
     RouterLosses {
@@ -209,7 +218,18 @@ enum Command {
     },
     /// Open the native desktop application.
     #[cfg(feature = "gui")]
-    Gui,
+    Gui {
+        /// Existing capture database to attach on startup.
+        #[arg(long)]
+        database: Option<PathBuf>,
+    },
+    /// Open the interactive terminal monitor for an existing capture database.
+    #[cfg(feature = "tui")]
+    Tui {
+        /// Existing capture database owned by `serve` while live.
+        #[arg(long)]
+        database: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -247,12 +267,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             database,
             after,
             limit,
+            filter,
         }) => {
             let store = CaptureStore::open_existing(&database)?;
             let stdout = io::stdout();
             let mut output = stdout.lock();
             for capture in store.read_after(after, limit)? {
-                writeln!(output, "id={} {}", capture.id, format_event(&capture.event))?;
+                let mut line = format_event(&capture.event);
+                if let knx_rs_core::address::DestinationAddress::Group(address) =
+                    capture.event.frame().destination_address()
+                    && let Some(group) = store.ets_group(address)?
+                {
+                    write!(line, " ets_name={:?} dpts={:?}", group.name, group.dpts)?;
+                }
+                if filter
+                    .as_ref()
+                    .is_none_or(|query| line.to_lowercase().contains(&query.to_lowercase()))
+                {
+                    writeln!(output, "id={} {line}", capture.id)?;
+                }
             }
         }
         Some(Command::RouterLosses {
@@ -408,7 +441,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         #[cfg(feature = "gui")]
-        Some(Command::Gui) | None => gui::run()?,
+        Some(Command::Gui { database }) => gui::run(database)?,
+        #[cfg(feature = "tui")]
+        Some(Command::Tui { database }) => tui::run(database)?,
+        #[cfg(feature = "gui")]
+        None => gui::run(None)?,
         #[cfg(not(feature = "gui"))]
         None => {
             eprintln!("No command specified. Use --help for available commands.");

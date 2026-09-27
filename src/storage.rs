@@ -637,6 +637,63 @@ impl CaptureStore {
         self.read_after_up_to(cursor, limit, i64::MAX)
     }
 
+    /// Read the most recent bounded capture page, returned in chronological order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an oversized page, SQLite failure, or corrupt data.
+    pub fn read_latest(&self, limit: NonZeroU32) -> Result<Vec<StoredCapture>, StorageError> {
+        if limit.get() > MAX_PAGE_SIZE {
+            return Err(StorageError::PageTooLarge(limit.get()));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT id, observed_at_ms, transport, endpoint, direction, message_code,
+                    source_raw, destination_raw, destination_is_group, service_code,
+                    payload, raw_cemi
+             FROM capture_events ORDER BY id DESC LIMIT ?1",
+        )?;
+        let mut rows = statement.query(params![limit.get()])?;
+        let mut captures = Vec::new();
+        while let Some(row) = rows.next()? {
+            captures.push(decode_row(row)?);
+        }
+        captures.reverse();
+        Ok(captures)
+    }
+
+    /// Read captures before an exclusive ID, nearest first but returned in
+    /// chronological order for an interactive history window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid cursor, oversized page, SQLite failure,
+    /// or corrupt data.
+    pub fn read_before(
+        &self,
+        cursor: i64,
+        limit: NonZeroU32,
+    ) -> Result<Vec<StoredCapture>, StorageError> {
+        if cursor <= 0 {
+            return Err(StorageError::InvalidCursor(cursor));
+        }
+        if limit.get() > MAX_PAGE_SIZE {
+            return Err(StorageError::PageTooLarge(limit.get()));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT id, observed_at_ms, transport, endpoint, direction, message_code,
+                    source_raw, destination_raw, destination_is_group, service_code,
+                    payload, raw_cemi
+             FROM capture_events WHERE id < ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let mut rows = statement.query(params![cursor, limit.get()])?;
+        let mut captures = Vec::new();
+        while let Some(row) = rows.next()? {
+            captures.push(decode_row(row)?);
+        }
+        captures.reverse();
+        Ok(captures)
+    }
+
     fn read_after_up_to(
         &self,
         cursor: i64,
@@ -1214,6 +1271,40 @@ mod tests {
         ));
         assert!(matches!(
             store.read_after(0, nz(MAX_PAGE_SIZE + 1)),
+            Err(StorageError::PageTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn latest_page_is_bounded_and_chronological() {
+        let mut store = CaptureStore::open(Path::new(":memory:"), nz(10)).unwrap();
+        for value in 1..=5 {
+            store.insert(&event(tunnel(), value)).unwrap();
+        }
+        assert_eq!(
+            store
+                .read_latest(nz(3))
+                .unwrap()
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            [3, 4, 5]
+        );
+        assert_eq!(
+            store
+                .read_before(3, nz(2))
+                .unwrap()
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert!(matches!(
+            store.read_before(0, nz(2)),
+            Err(StorageError::InvalidCursor(0))
+        ));
+        assert!(matches!(
+            store.read_latest(nz(MAX_PAGE_SIZE + 1)),
             Err(StorageError::PageTooLarge(_))
         ));
     }

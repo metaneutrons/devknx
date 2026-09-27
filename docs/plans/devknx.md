@@ -1,4 +1,4 @@
-# Initiative plan: devknx (v2)
+# Initiative plan: devknx (v3)
 
 Epic: [devknx initiative](https://github.com/metaneutrons/devknx/issues/3)
 Decision state: product scope agreed with Fabian in September 2026
@@ -68,7 +68,11 @@ occur only at their acceptance stages.
 | Linux x86_64/ARM64 | GNU and musl targets for both architectures | `.deb` for `amd64`/`arm64`; AUR source and binary definitions |
 | Windows x86_64/ARM64 | MSVC targets for both architectures | icon embedded in each `.exe` |
 
-The Homebrew formula covers macOS ARM64 and Linux x86_64/ARM64. Native GUI
+The Homebrew formula `metaneutrons/tap/devknx` installs the online CLI binary
+on macOS ARM64 and Linux x86_64/ARM64. A separate macOS ARM64 cask,
+`metaneutrons/tap/devknx-app`, installs the signed, notarized `.app` bundle.
+Both packages must be independently installable and coexist, following
+devserial's packaging split. Native GUI
 qualification applies to GNU/glibc Linux; musl archives are headless. macOS
 Intel is excluded by the product decision. There is no Windows installer or
 Authenticode promise in the initial release.
@@ -133,6 +137,11 @@ Dependencies: M2, M3
   any unrecorded difference; every documented control has a source anchor.
 - M4-A3: GUI/TUI startup, resize, disconnect/reconnect, scrolling and capture
   under sustained traffic are qualified on their supported platforms.
+- M4-A4: The macOS app has a native application menu modeled on devserial:
+  About, standard app/edit/window actions, and working KNX-specific File/View
+  actions with keyboard shortcuts. Menu actions use the same GUI operations as
+  visible controls; source-anchored tests and a macOS app smoke test verify the
+  bridge and bundled identity.
 
 ### M5: Automation interfaces
 
@@ -157,9 +166,11 @@ Dependencies: M1 through M5
   notarized macOS `.app.zip`, and two Debian packages. Every payload has
   checksums, SBOM, signature, attestation and a clean-room smoke test. Every
   GUI payload also includes the embedded-font licence notices.
-- M6-A2: Homebrew formula/cask, AUR source/binary packages, and the shared
+- M6-A2: Homebrew CLI formula and macOS app cask, AUR source/binary packages, and the shared
   `deb.metaneutrons.cc` archive are published only after channel preflight
-  and package installation tests. Published bytes match the qualified assets.
+  and package installation tests. Both Homebrew packages install side by side;
+  the formula exposes `devknx` on `PATH` and the cask launches `devknx.app`.
+  Published bytes match the qualified assets.
 - M6-A3: The first stable release is visible on GitHub and all configured
   channels. The existing project overview is checked for its `devknx` entry.
   Then `KnxMonitor` is marked deprecated with a link and an explicit notice
@@ -193,3 +204,7 @@ use. No time or runner-cost estimate has been measured.
   `RoutingLostMessage` diagnostics. Router reports, per-stream local subscriber
   lag, and unquantified connection interruptions remain separate; no category
   is presented as a general KNX bus-loss total.
+- 2026-09-27 (v3): Fabian included a native macOS application menu in M4,
+  following devserial's system-menu integration without importing its serial
+  device controls. He reaffirmed that M6 distributes the macOS ARM64 CLI as
+  a Homebrew formula and the app bundle as a separate co-installable cask.

@@ -85,9 +85,10 @@ Gateway discovery sends KNXnet/IP multicast on the local network. Network
 equipment and host firewall rules can affect the result. For normal interactive
 use, run `cargo run --locked -- gui` or `cargo run --locked -- tui` without a
 database argument. Both create private per-user capture storage automatically.
-In the GUI, enter a numeric gateway IP address or use Gateways… and choose
-Connect; Settings… selects tunneling or multicast routing and the UDP port.
-Discovery is optional for a manually entered tunnel address. In the TUI,
+In the GUI, choose Tunneling or Routing on the start screen, enter the
+unicast gateway IP or multicast group and UDP port, then select Connect.
+Settings… uses the same connection form. Gateway discovery is optional for a
+manually entered tunnel address. In the TUI,
 press `s` to enter `tunnel://IP:3671` or `router://MULTICAST:3671`, then `c`
 to connect or disconnect. A running capture service remains active when an
 interactive window closes; use Disconnect or `c` to stop it. The optional

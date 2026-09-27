@@ -192,7 +192,7 @@ pub const TUI: &[Declaration] = &[
 pub const GUI: &[Declaration] = &[
     Declaration {
         capability: Capability::GatewayDiscovery,
-        source_anchor: "ui.button(\"Discover gateways\")",
+        source_anchor: "ui.button(\"Discover gateways…\")",
     },
     Declaration {
         capability: Capability::LiveCapture,
@@ -487,7 +487,8 @@ mod tests {
                 [
                     CLI_SOURCE,
                     TUI_SOURCE,
-                    &GUI_SOURCE.replace("ui.button(\"Discover gateways\")", "ui.button(\"Other\")")
+                    &GUI_SOURCE
+                        .replace("ui.button(\"Discover gateways…\")", "ui.button(\"Other\")")
                 ],
                 GAPS
             )

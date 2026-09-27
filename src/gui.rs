@@ -61,6 +61,67 @@ pub fn run(
     Ok(())
 }
 
+/// The same connection editor is shown on the opening screen and in Settings.
+fn render_connection_form(
+    ui: &mut egui::Ui,
+    settings: &mut ConnectionSettings,
+    id_salt: &str,
+) -> bool {
+    ui.push_id(id_salt, |ui| {
+        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.label(egui::RichText::new("Connection mode").strong());
+            egui::ComboBox::from_id_salt("connection-mode")
+                .selected_text(match settings.mode {
+                    ConnectionMode::Tunnel => "Tunneling",
+                    ConnectionMode::Routing => "Routing (multicast)",
+                })
+                .width(245.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut settings.mode, ConnectionMode::Tunnel, "Tunneling");
+                    ui.selectable_value(
+                        &mut settings.mode,
+                        ConnectionMode::Routing,
+                        "Routing (multicast)",
+                    );
+                });
+            ui.add_space(8.0);
+
+            let (address_label, address_hint, help) = match settings.mode {
+                ConnectionMode::Tunnel => (
+                    "Gateway IP address",
+                    "192.168.2.8",
+                    "Enter a unicast gateway address. Discovery is optional.",
+                ),
+                ConnectionMode::Routing => (
+                    "Multicast group",
+                    "224.0.23.12",
+                    "Enter a multicast group reachable from this computer.",
+                ),
+            };
+            ui.label(egui::RichText::new(address_label).strong());
+            ui.add(
+                egui::TextEdit::singleline(&mut settings.address)
+                    .hint_text(address_hint)
+                    .desired_width(300.0),
+            );
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("UDP port").strong());
+            ui.add(egui::DragValue::new(&mut settings.port).range(1..=u16::MAX));
+            ui.small(help);
+            ui.add_space(8.0);
+            if settings.mode == ConnectionMode::Tunnel {
+                let discover = ui.button("Discover gateways…").clicked();
+                ui.small("Discovery uses multicast; manual tunneling does not require it.");
+                discover
+            } else {
+                false
+            }
+        })
+        .inner
+    })
+    .inner
+}
+
 struct SmokeRun {
     started: Instant,
     frames: u32,
@@ -528,48 +589,15 @@ impl MonitorApp {
             egui::Window::new("Connection Settings")
                 .open(&mut open)
                 .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .default_width(400.0)
                 .show(ctx, |ui| {
-                    ui.label("KNXnet/IP connection");
-                    egui::ComboBox::from_label("Mode")
-                        .selected_text(match self.settings_draft.mode {
-                            ConnectionMode::Tunnel => "Tunneling",
-                            ConnectionMode::Routing => "Routing (multicast)",
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.settings_draft.mode,
-                                ConnectionMode::Tunnel,
-                                "Tunneling",
-                            );
-                            ui.selectable_value(
-                                &mut self.settings_draft.mode,
-                                ConnectionMode::Routing,
-                                "Routing (multicast)",
-                            );
-                        });
-                    ui.horizontal(|ui| {
-                        ui.label("Gateway IP");
-                        ui.text_edit_singleline(&mut self.settings_draft.address);
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Port");
-                        ui.add(
-                            egui::DragValue::new(&mut self.settings_draft.port).range(1..=u16::MAX),
-                        );
-                    });
-                    if self.settings_draft.mode == ConnectionMode::Routing {
-                        ui.small("Enter the multicast group, for example 224.0.23.12.");
-                    } else {
-                        ui.small("Enter the gateway's unicast IP; discovery is optional.");
-                    }
-                    discover = ui.button("Discover gateways…").clicked();
+                    discover = render_connection_form(ui, &mut self.settings_draft, "settings");
                     ui.separator();
-                    if let Some(database) = self.primary_database.as_ref() {
+                    if self.primary_database.is_some() {
                         ui.label("Capture storage");
-                        ui.small("History is stored automatically on this computer:");
-                        ui.monospace(database.display().to_string());
-                        ui.small("Open… chooses a saved capture with the system file dialog.");
+                        ui.small("History is saved automatically in this app's data folder.");
+                        ui.small("Use Open… to choose another capture in the system file dialog.");
                     }
                     ui.separator();
                     ui.horizontal(|ui| {
@@ -926,26 +954,34 @@ impl MonitorApp {
         ui.add_space((ui.available_height() * 0.18).min(110.0));
         ui.vertical_centered(|ui| {
             ui.heading("Connect to KNXnet/IP");
-            ui.label("Select a gateway or enter its IP address. Captures are saved automatically.");
+            ui.label("Choose tunneling or multicast routing. Captures are saved automatically.");
             ui.add_space(12.0);
+            let mut discover = false;
+            let mut connect = false;
             ui.horizontal(|ui| {
                 ui.add_space((ui.available_width() - 420.0).max(0.0) / 2.0);
-                ui.label("Gateway IP");
-                ui.add(egui::TextEdit::singleline(&mut self.settings.address)
-                    .hint_text("192.168.2.8").desired_width(170.0));
-                if ui.add_enabled(self.model.is_some() && self.connection_receiver.is_none(), egui::Button::new("Connect")).clicked() {
-                    self.connect();
-                }
+                egui::Frame::group(ui.style())
+                    .inner_margin(16.0)
+                    .show(ui, |ui| {
+                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                            ui.set_width(380.0);
+                            discover = render_connection_form(ui, &mut self.settings, "start");
+                            ui.add_space(8.0);
+                            connect = ui
+                                .add_enabled(
+                                    self.model.is_some() && self.connection_receiver.is_none(),
+                                    egui::Button::new("Connect"),
+                                )
+                                .clicked();
+                        });
+                    });
             });
-            ui.horizontal(|ui| {
-                ui.add_space((ui.available_width() - 265.0).max(0.0) / 2.0);
-                if ui.button("Discover gateways").clicked() { self.discover(); }
-                if ui.button("Connection settings…").clicked() {
-                    self.settings_draft = self.settings.clone();
-                    self.show_settings = true;
-                }
-            });
-            ui.small("Gateway discovery uses multicast. Manual tunneling works without multicast discovery.");
+            if discover {
+                self.discover();
+            }
+            if connect {
+                self.connect();
+            }
         });
     }
 

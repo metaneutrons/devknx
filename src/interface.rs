@@ -345,11 +345,15 @@ impl ConnectionSettings {
     }
 
     pub fn endpoint(&self) -> Result<String, String> {
+        let address_error = match self.mode {
+            ConnectionMode::Tunnel => "Enter a numeric gateway IP address",
+            ConnectionMode::Routing => "Enter a numeric multicast group address",
+        };
         let ip: IpAddr = self
             .address
             .trim()
             .parse()
-            .map_err(|_| "Enter a numeric gateway IP address".to_owned())?;
+            .map_err(|_| address_error.to_owned())?;
         if self.port == 0 {
             return Err("The KNXnet/IP port must be nonzero".into());
         }
@@ -744,6 +748,9 @@ mod tests {
 
     #[test]
     fn connection_profiles_validate_mode_and_address_without_network_access() {
+        let start = ConnectionSettings::default();
+        assert_eq!(start.mode, ConnectionMode::Tunnel);
+        assert_eq!(start.port, 3671);
         let tunnel = ConnectionSettings::from_endpoint("tunnel://192.168.2.8:3671").unwrap();
         assert_eq!(tunnel.mode, ConnectionMode::Tunnel);
         assert_eq!(tunnel.endpoint().unwrap(), "tunnel://192.168.2.8:3671");
@@ -753,6 +760,16 @@ mod tests {
         assert!(ConnectionSettings::from_endpoint("router://192.168.2.8:3671").is_err());
         assert!(ConnectionSettings::from_endpoint("tunnel://224.0.23.12:3671").is_err());
         assert!(ConnectionSettings::from_endpoint("tunnel://not-an-ip:3671").is_err());
+        assert_eq!(
+            ConnectionSettings {
+                mode: ConnectionMode::Routing,
+                address: "invalid".into(),
+                port: 3671,
+            }
+            .endpoint()
+            .unwrap_err(),
+            "Enter a numeric multicast group address"
+        );
     }
 
     #[test]

@@ -1,0 +1,933 @@
+name: Release
+
+# The only entry is a tag dispatch by release-please after its PR is merged.
+# This workflow never creates or moves a production tag.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Immutable release tag
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    name: Establish immutable release identity
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.identity.outputs.tag }}
+      version: ${{ steps.identity.outputs.version }}
+      prerelease: ${{ steps.identity.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Tag, commit and manifests agree
+        id: identity
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          semver='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+          pre='(-(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*)?'
+          if ! printf '%s' "$TAG" | grep -Eq "^v${semver}${pre}$"; then
+            echo "::error::tag is not canonical v<SemVer>"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" != "refs/tags/$TAG" ]] ||
+             [[ "$(git rev-parse "${TAG}^{}")" != "$GITHUB_SHA" ]]; then
+            echo "::error::dispatch ref does not match the immutable tag commit"
+            exit 1
+          fi
+          core="${TAG#v}"
+          core="${core%%-*}"
+          manifest=$(python3 -c "import tomllib; print(tomllib.load(open('Cargo.toml','rb'))['package']['version'])")
+          released=$(jq -r '.["."]' .release-please-manifest.json)
+          if [[ "$core" != "$manifest" ]] || [[ "$core" != "$released" ]]; then
+            echo "::error::tag core, Cargo.toml and release-please manifest disagree"
+            exit 1
+          fi
+          if [[ "$TAG" == "v$core" ]]; then prerelease=false; else prerelease=true; fi
+          {
+            echo "tag=$TAG"
+            echo "version=$core"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build and smoke-test every candidate payload
+    needs: metadata
+    permissions:
+      contents: read
+    uses: ./.github/workflows/release-candidate.yml
+    with:
+      tag: ${{ needs.metadata.outputs.tag }}
+
+  macos-app:
+    name: Sign, notarize and staple the ARM64 app
+    needs: [metadata, build]
+    runs-on: macos-15
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: candidate-aarch64-apple-darwin
+          path: unsigned
+      - name: Unpack exactly the candidate app
+        env:
+          TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ditto -x -k "unsigned/devknx-$TAG-aarch64-apple-darwin.app.zip" dist
+          test -s dist/devknx.app/Contents/Resources/THIRD-PARTY-NOTICES.md
+          test -s dist/devknx.app/Contents/Resources/licenses/OFL-1.1.txt
+      - name: Import Developer ID in a throwaway keychain
+        env:
+          CERT_P12: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password=$(openssl rand -base64 24)
+          echo "SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 900 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          p12="$RUNNER_TEMP/cert.p12"
+          printf '%s' "$CERT_P12" | base64 --decode > "$p12"
+          security import "$p12" -k "$keychain" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          rm -P "$p12" 2>/dev/null || rm -f "$p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" >/dev/null
+          existing=()
+          while IFS= read -r entry; do existing+=("${entry//\"/}"); done < <(security list-keychains -d user)
+          security list-keychains -d user -s "$keychain" "${existing[@]}"
+          identity="Developer ID Application: Fabian Schmieder (${TEAM_ID})"
+          security find-identity -v -p codesigning "$keychain" | grep -qF "$identity"
+          echo "SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
+      - name: Sign with hardened runtime
+        run: |
+          set -euo pipefail
+          codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" \
+            --keychain "$SIGNING_KEYCHAIN" dist/devknx.app
+          codesign --verify --strict --verbose=2 dist/devknx.app
+      - name: Notarize, staple and package
+        env:
+          API_KEY_ID: ${{ vars.APPLE_API_KEY }}
+          API_ISSUER: ${{ vars.APPLE_API_ISSUER }}
+          API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/api.p8"
+          (umask 077; printf '%s' "$API_KEY_CONTENT" > "$key")
+          submission="$RUNNER_TEMP/submit.zip"
+          ditto -c -k --keepParent dist/devknx.app "$submission"
+          set +e
+          out=$(xcrun notarytool submit "$submission" --key "$key" \
+            --key-id "$API_KEY_ID" --issuer "$API_ISSUER" --wait 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          id=$(printf '%s' "$out" | awk '/^  id: /{print $2; exit}')
+          if [[ "$rc" -ne 0 ]] || ! printf '%s' "$out" | grep -q 'status: Accepted'; then
+            if [[ -n "$id" ]]; then
+              xcrun notarytool log "$id" --key "$key" --key-id "$API_KEY_ID" --issuer "$API_ISSUER"
+            fi
+            exit 1
+          fi
+          rm -P "$key" 2>/dev/null || rm -f "$key"
+          xcrun stapler staple dist/devknx.app
+          xcrun stapler validate dist/devknx.app
+          ditto -c -k --keepParent dist/devknx.app \
+            "dist/devknx-$TAG-aarch64-apple-darwin.app.zip"
+      - name: Gatekeeper judges the distributed archive
+        env:
+          TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          room=$(mktemp -d)
+          ditto -x -k "dist/devknx-$TAG-aarch64-apple-darwin.app.zip" "$room"
+          app="$room/devknx.app"
+          xattr -w com.apple.quarantine "0083;00000000;Safari;" "$app"
+          xcrun stapler validate "$app"
+          spctl --assess --type execute -vv "$app"
+          "$app/Contents/MacOS/devknx" --version
+      - name: Destroy the throwaway keychain
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -n "${SIGNING_KEYCHAIN:-}" ]]; then
+            security delete-keychain "$SIGNING_KEYCHAIN" 2>/dev/null || true
+            test ! -f "$SIGNING_KEYCHAIN"
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: notarized-app
+          path: dist/*.zip
+          if-no-files-found: error
+
+  sign:
+    name: Describe, sign and attest every payload
+    needs: [metadata, macos-app]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: candidate-*
+          merge-multiple: true
+          path: payloads
+      - name: Replace the unsigned candidate with the notarized app
+        env:
+          TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          test -s "payloads/devknx-$TAG-aarch64-apple-darwin.app.zip"
+          rm -- "payloads/devknx-$TAG-aarch64-apple-darwin.app.zip"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: notarized-app
+          path: payloads
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+      - name: Exact payloads, SPDX SBOMs and keyless signatures
+        env:
+          TAG: ${{ needs.metadata.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release/release_inventory.py raw --tag "$TAG" --directory payloads
+          cd payloads
+          shopt -s nullglob
+          identity="^https://github.com/${REPO}/\.github/workflows/release\.yml@refs/tags/${TAG}$"
+          for payload in *.tar.gz *.zip *.deb; do
+            syft scan "file:$payload" -o spdx-json="$payload.spdx.json"
+            cosign sign-blob --yes --bundle "$payload.sigstore.json" "$payload"
+            cosign verify-blob --bundle "$payload.sigstore.json" \
+              --certificate-identity-regexp "$identity" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com "$payload"
+          done
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            payloads/*.tar.gz
+            payloads/*.zip
+            payloads/*.deb
+      - name: Verify provenance and exact payload set
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release/release_inventory.py payloads --tag "$TAG" --directory payloads
+          for payload in payloads/*.tar.gz payloads/*.zip payloads/*.deb; do
+            gh attestation verify "$payload" --repo "$REPO"
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: signed-payloads
+          path: payloads/*
+          if-no-files-found: error
+
+  definitions:
+    name: Generate, sign and attest channel definitions
+    needs: [metadata, sign]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: signed-payloads
+          path: payloads
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Definitions use the qualified bytes
+        env:
+          TAG: ${{ needs.metadata.outputs.tag }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release/package_metadata.py --tag "$TAG" --version "$VERSION" \
+            --payload-dir payloads --output-dir definitions
+          cd definitions
+          identity="^https://github.com/${REPO}/\.github/workflows/release\.yml@refs/tags/${TAG}$"
+          for definition in devknx.rb devknx-app.rb devknx.PKGBUILD devknx-bin.PKGBUILD; do
+            ruby -c "$definition" 2>/dev/null || [[ "$definition" == *.PKGBUILD ]]
+            if [[ "$definition" == *.PKGBUILD ]]; then bash -n "$definition"; fi
+            cosign sign-blob --yes --bundle "$definition.sigstore.json" "$definition"
+            cosign verify-blob --bundle "$definition.sigstore.json" \
+              --certificate-identity-regexp "$identity" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com "$definition"
+          done
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            definitions/devknx.rb
+            definitions/devknx-app.rb
+            definitions/devknx.PKGBUILD
+            definitions/devknx-bin.PKGBUILD
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: channel-definitions
+          path: definitions/*
+          if-no-files-found: error
+
+  candidate:
+    name: Final immutable candidate inventory
+    needs: [metadata, sign, definitions]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: signed-payloads
+          path: candidate
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: channel-definitions
+          path: candidate
+      - name: Exact set and checksums
+        env:
+          TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release/release_inventory.py write --tag "$TAG" --directory candidate
+          python3 scripts/release/release_inventory.py verify --tag "$TAG" --directory candidate
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: candidate/SHA256SUMS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: final-candidate
+          path: candidate/*
+          if-no-files-found: error
+
+  qualify-deb:
+    name: Install Debian packages in clean containers
+    needs: [metadata, candidate]
+    runs-on: ${{ matrix.runner }}
+    container: ubuntu:24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: amd64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: final-candidate
+          path: candidate
+      - name: Install with APT and execute
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y "./candidate/devknx_${VERSION}-1_${{ matrix.arch }}.deb"
+          test "$(dpkg-query -W -f='${Version}' devknx)" = "${VERSION}-1"
+          devknx --version | grep -Fx "devknx $VERSION"
+          test -s /usr/share/doc/devknx/THIRD-PARTY-NOTICES.md
+          test -s /usr/share/doc/devknx/licenses/OFL-1.1.txt
+
+  qualify-homebrew:
+    name: Install Homebrew formula and cask on ${{ matrix.runner }}
+    needs: [metadata, candidate]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, ubuntu-24.04]
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: final-candidate
+          path: candidate
+      - uses: Homebrew/actions/setup-homebrew@f8d4222eb633e65c2a0157383cf80861fc7fae7f # 2026.09.07.1
+        with:
+          core: false
+          cask: false
+      - name: Audit and install from local qualified bytes
+        shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          port=38080
+          tap=devknx/qualification
+          python3 -m http.server "$port" --bind 127.0.0.1 --directory candidate \
+            >"$RUNNER_TEMP/http.log" 2>&1 &
+          server=$!
+          cleanup() {
+            brew uninstall devknx >/dev/null 2>&1 || true
+            brew uninstall --cask "$tap/devknx-app" >/dev/null 2>&1 || true
+            brew untap "$tap" >/dev/null 2>&1 || true
+            kill "$server" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          for _ in {1..20}; do
+            if curl --fail --silent "http://127.0.0.1:$port/" >/dev/null; then break; fi
+            sleep 1
+          done
+          brew tap-new --no-git "$tap"
+          formula="$(brew --repository "$tap")/Formula/devknx.rb"
+          sed -E "s#https://github.com/[^\"]*/download/[^/\"]+#http://127.0.0.1:$port#g" \
+            candidate/devknx.rb > "$formula"
+          brew audit --strict "$tap/devknx"
+          brew install "$tap/devknx"
+          brew test "$tap/devknx"
+          command -v devknx
+          devknx --version | grep -Fx "devknx $VERSION"
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            cask="$(brew --repository "$tap")/Casks/devknx-app.rb"
+            mkdir -p "$(dirname "$cask")"
+            sed -E "s#https://github.com/[^\"]*/download/[^/\"]+#http://127.0.0.1:$port#g" \
+              candidate/devknx-app.rb > "$cask"
+            brew style --cask "$tap/devknx-app"
+            brew install --cask "$tap/devknx-app"
+            app=/Applications/devknx.app
+            xcrun stapler validate "$app"
+            spctl --assess --type execute -vv "$app"
+            "$app/Contents/MacOS/devknx" --version | grep -Fx "devknx $VERSION"
+            test "$(command -v devknx)" != "$app/Contents/MacOS/devknx"
+          fi
+
+  qualify-aur-bin:
+    name: Build and install the AUR binary package
+    needs: [metadata, candidate]
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel@sha256:8745817f349ed24373341ddb92776209eeec3f0364ea48f7f645ac5800d30a50
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: final-candidate
+          path: candidate
+      - name: makepkg against local qualified archive
+        env:
+          TAG: ${{ needs.metadata.outputs.tag }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          archive="devknx-$TAG-x86_64-unknown-linux-gnu.tar.gz"
+          work=/home/builder/package
+          useradd --create-home builder
+          install -d -o builder -g builder "$work"
+          cp "candidate/$archive" "$work/$archive"
+          sed -E "s#https://[^']*/$archive#$archive#" \
+            candidate/devknx-bin.PKGBUILD > "$work/PKGBUILD"
+          grep -Fq "source_x86_64=('$archive')" "$work/PKGBUILD"
+          chown -R builder:builder "$work"
+          su builder -c "cd '$work' && makepkg --cleanbuild --noconfirm"
+          mapfile -t packages < <(find "$work" -maxdepth 1 -name '*.pkg.tar.zst' \
+            ! -name '*-debug-*' | sort)
+          test "${#packages[@]}" -eq 1
+          pacman -U --noconfirm "${packages[0]}"
+          devknx --version | grep -Fx "devknx $VERSION"
+          mkdir -p /tmp/archive
+          tar -xzf "candidate/$archive" -C /tmp/archive
+          cmp "/tmp/archive/devknx-$TAG-x86_64-unknown-linux-gnu/devknx" /usr/bin/devknx
+          test -s /usr/share/licenses/devknx-bin/OFL-1.1.txt
+
+  qualify-aur-source:
+    name: Build and install the AUR source package
+    needs: [metadata, candidate]
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel@sha256:8745817f349ed24373341ddb92776209eeec3f0364ea48f7f645ac5800d30a50
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: final-candidate
+          path: candidate
+      - name: Install declared toolchain and GUI dependencies
+        run: |
+          set -euo pipefail
+          pacman -Syu --noconfirm --needed base-devel git rust namcap \
+            libxcb libxkbcommon libx11 wayland libgl
+      - name: Build the tagged source and install
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          work=/home/builder/package
+          archive="devknx-$TAG-source.tar.gz"
+          useradd --create-home builder
+          install -d -o builder -g builder "$work"
+          cp "candidate/$archive" "$work/$archive"
+          sed -E "s#https://[^\"]*/$archive#$archive#" \
+            candidate/devknx.PKGBUILD > "$work/PKGBUILD"
+          grep -Fq "source=(\"$archive\")" "$work/PKGBUILD"
+          chown -R builder:builder "$work"
+          su builder -c "cd '$work' && makepkg --cleanbuild --noconfirm"
+          mapfile -t packages < <(find "$work" -maxdepth 1 -name '*.pkg.tar.zst' \
+            ! -name '*-debug-*' | sort)
+          test "${#packages[@]}" -eq 1
+          namcap "$work/PKGBUILD" "${packages[0]}" | tee "$work/namcap.txt"
+          if grep -q ' E: ' "$work/namcap.txt"; then exit 1; fi
+          pacman -U --noconfirm "${packages[0]}"
+          devknx --version | grep -Fx "devknx $VERSION"
+          test -s /usr/share/licenses/devknx/OFL-1.1.txt
+
+  channel-qualification:
+    name: Every package installation test passed
+    needs: [qualify-deb, qualify-homebrew, qualify-aur-bin, qualify-aur-source]
+    runs-on: ubuntu-24.04
+    steps:
+      - run: |
+          set -euo pipefail
+          printf '%s\n' '${{ toJSON(needs) }}' | jq -e 'all(.[]; .result == "success")'
+
+  preflight:
+    name: Verify mandatory channel access before staging
+    needs: metadata
+    if: needs.metadata.outputs.prerelease == 'false'
+    runs-on: ubuntu-24.04
+    environment: release
+    steps:
+      - name: Required secrets and variables are complete
+        env:
+          HOMEBREW_APP_CLIENT_ID: ${{ vars.HOMEBREW_APP_CLIENT_ID }}
+          HOMEBREW_APP_PRIVATE_KEY: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          AUR_SSH_KNOWN_HOSTS: ${{ vars.AUR_SSH_KNOWN_HOSTS }}
+          ARCHIVE_DISPATCH_CLIENT_ID: ${{ vars.ARCHIVE_DISPATCH_CLIENT_ID }}
+          ARCHIVE_DISPATCH_PRIVATE_KEY: ${{ secrets.ARCHIVE_DISPATCH_PRIVATE_KEY }}
+          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+          APPLE_API_KEY: ${{ vars.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ vars.APPLE_API_ISSUER }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          status=0
+          for name in HOMEBREW_APP_CLIENT_ID HOMEBREW_APP_PRIVATE_KEY \
+            AUR_SSH_PRIVATE_KEY AUR_SSH_KNOWN_HOSTS ARCHIVE_DISPATCH_CLIENT_ID \
+            ARCHIVE_DISPATCH_PRIVATE_KEY APPLE_CERT_P12_BASE64 APPLE_CERT_PASSWORD \
+            APPLE_API_KEY_CONTENT APPLE_API_KEY APPLE_API_ISSUER APPLE_TEAM_ID; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::missing release configuration: $name"
+              status=1
+            fi
+          done
+          exit "$status"
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: tap-token
+        with:
+          client-id: ${{ vars.HOMEBREW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
+          owner: metaneutrons
+          repositories: homebrew-tap
+          permission-contents: write
+          permission-pull-requests: write
+          permission-checks: read
+          permission-actions: read
+      - name: Tap is writable with the dedicated app
+        env:
+          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          repos=$(gh api installation/repositories --jq '[.repositories[].full_name] | sort')
+          test "$repos" = '["metaneutrons/homebrew-tap"]'
+      - name: Pinned AUR host accepts the publishing key
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          AUR_SSH_KNOWN_HOSTS: ${{ vars.AUR_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$RUNNER_TEMP/ssh"
+          install -m 0600 /dev/null "$RUNNER_TEMP/ssh/key"
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$RUNNER_TEMP/ssh/key"
+          printf '%s\n' "$AUR_SSH_KNOWN_HOSTS" > "$RUNNER_TEMP/ssh/known_hosts"
+          out=$(ssh -F /dev/null -T -i "$RUNNER_TEMP/ssh/key" -o IdentitiesOnly=yes \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
+            aur@aur.archlinux.org 2>&1 || true)
+          printf '%s\n' "$out"
+          printf '%s' "$out" | grep -Eq '^Welcome to AUR, .+!'
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: apt-token
+        with:
+          client-id: ${{ vars.ARCHIVE_DISPATCH_CLIENT_ID }}
+          private-key: ${{ secrets.ARCHIVE_DISPATCH_PRIVATE_KEY }}
+          owner: metaneutrons
+          repositories: apt-archive
+          permission-actions: write
+          permission-contents: read
+      - name: APT dispatch app reaches only its repository
+        env:
+          GH_TOKEN: ${{ steps.apt-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          repos=$(gh api installation/repositories --jq '[.repositories[].full_name] | sort')
+          test "$repos" = '["metaneutrons/apt-archive"]'
+          gh api repos/metaneutrons/apt-archive/actions/workflows/publish.yml >/dev/null
+
+  stage:
+    name: Stage and read back the immutable GitHub prerelease
+    needs: [metadata, candidate, channel-qualification, preflight]
+    if: >-
+      !cancelled()
+      && needs.metadata.result == 'success'
+      && needs.candidate.result == 'success'
+      && needs.channel-qualification.result == 'success'
+      && (
+        (needs.metadata.outputs.prerelease == 'true'
+          && needs.preflight.result == 'skipped')
+        || (needs.metadata.outputs.prerelease == 'false'
+          && needs.preflight.result == 'success')
+      )
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: final-candidate
+          path: candidate
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Draft upload, exact read-back, signatures and attestations
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release/release_inventory.py verify --tag "$TAG" --directory candidate
+          state=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || echo absent)
+          case "$state" in
+            absent) gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes 'Pipeline test tag.' ;;
+            true) : ;;
+            false) echo "::error::refusing to mutate an already published release"; exit 1 ;;
+          esac
+          gh release upload "$TAG" candidate/* --clobber
+          mkdir -p readback
+          gh release download "$TAG" --dir readback --pattern '*'
+          python3 scripts/release/release_inventory.py verify --tag "$TAG" --directory readback
+          identity="^https://github.com/${GH_REPO}/\.github/workflows/release\.yml@refs/tags/${TAG}$"
+          for asset in readback/*.tar.gz readback/*.zip readback/*.deb \
+            readback/devknx.rb readback/devknx-app.rb \
+            readback/devknx.PKGBUILD readback/devknx-bin.PKGBUILD; do
+            cosign verify-blob --bundle "$asset.sigstore.json" \
+              --certificate-identity-regexp "$identity" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com "$asset"
+            gh attestation verify "$asset" --repo "$GH_REPO"
+          done
+          gh attestation verify readback/SHA256SUMS --repo "$GH_REPO"
+      - name: Publish only as prerelease, never latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --draft=false --prerelease --latest=false
+          gh release view "$TAG" --json isDraft,isPrerelease,tagName --jq \
+            'if .isDraft or (.isPrerelease | not) then halt_error(1) else .tagName end'
+          latest=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name 2>/dev/null || echo '')
+          test "$latest" != "$TAG"
+
+  publish-homebrew:
+    name: Publish and read back formula and cask
+    needs: [metadata, stage]
+    if: needs.metadata.outputs.prerelease == 'false'
+    runs-on: ubuntu-24.04
+    environment: release
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: final-candidate
+          path: candidate
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: tap-token
+        with:
+          client-id: ${{ vars.HOMEBREW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
+          owner: metaneutrons
+          repositories: homebrew-tap
+          permission-contents: write
+          permission-pull-requests: write
+          permission-checks: read
+          permission-actions: read
+      - name: Open tap PR and wait for its checks
+        id: tap-pr
+        env:
+          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          tap=metaneutrons/homebrew-tap
+          gh auth setup-git
+          gh repo clone "$tap" tap -- --depth 1
+          cd tap
+          mkdir -p Formula Casks
+          if cmp -s ../candidate/devknx.rb Formula/devknx.rb &&
+             cmp -s ../candidate/devknx-app.rb Casks/devknx-app.rb; then
+            echo "tap already carries qualified definitions"
+            echo "already_current=true" >> "$GITHUB_OUTPUT"
+          else
+            base=$(gh repo view "$tap" --json defaultBranchRef --jq .defaultBranchRef.name)
+            branch="devknx-$VERSION"
+            git switch -c "$branch"
+            install -m 0644 ../candidate/devknx.rb Formula/devknx.rb
+            install -m 0644 ../candidate/devknx-app.rb Casks/devknx-app.rb
+            if [[ -x scripts/generate-readme.sh ]]; then
+              scripts/generate-readme.sh README.md
+            fi
+            git config user.name 'devknx release automation'
+            git config user.email 'devknx-release@users.noreply.github.com'
+            git add Formula/devknx.rb Casks/devknx-app.rb README.md
+            git commit -m "devknx $VERSION"
+            git push --set-upstream origin "$branch"
+            pr=$(gh pr create --repo "$tap" --base "$base" --head "$branch" \
+              --title "devknx $VERSION" \
+              --body "Generated from verified devknx release assets.")
+            checks=0
+            for _ in $(seq 1 30); do
+              checks=$(gh pr checks "$pr" --repo "$tap" 2>/dev/null | grep -c . || true)
+              if [[ "$checks" -gt 0 ]]; then break; fi
+              sleep 10
+            done
+            test "$checks" -gt 0
+            gh pr checks "$pr" --repo "$tap" --watch --fail-fast
+            echo "pr=$pr" >> "$GITHUB_OUTPUT"
+            echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: tap-merge-token
+        with:
+          client-id: ${{ vars.HOMEBREW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
+          owner: metaneutrons
+          repositories: homebrew-tap
+          permission-contents: write
+          permission-pull-requests: write
+          permission-checks: read
+          permission-actions: read
+      - name: Recheck exact PR head, merge and read both definitions back
+        env:
+          GH_TOKEN: ${{ steps.tap-merge-token.outputs.token }}
+          PR: ${{ steps.tap-pr.outputs.pr }}
+          HEAD_SHA: ${{ steps.tap-pr.outputs.head }}
+          ALREADY_CURRENT: ${{ steps.tap-pr.outputs.already_current }}
+        run: |
+          set -euo pipefail
+          tap=metaneutrons/homebrew-tap
+          if [[ "$ALREADY_CURRENT" != true ]]; then
+            test -n "$PR"
+            test "$(gh pr view "$PR" --repo "$tap" --json headRefOid --jq .headRefOid)" = "$HEAD_SHA"
+            gh pr checks "$PR" --repo "$tap" --watch --fail-fast
+            gh pr merge "$PR" --repo "$tap" --squash --delete-branch
+          fi
+          for pair in "Formula/devknx.rb:devknx.rb" \
+            "Casks/devknx-app.rb:devknx-app.rb"; do
+            remote=${pair%%:*}
+            local=${pair##*:}
+            gh api "repos/$tap/contents/$remote" --jq .content | base64 --decode > published
+            cmp published "candidate/$local"
+          done
+
+  publish-aur:
+    name: Publish and read back AUR ${{ matrix.package }}
+    needs: [metadata, stage]
+    if: needs.metadata.outputs.prerelease == 'false'
+    runs-on: ubuntu-24.04
+    environment: release
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [devknx, devknx-bin]
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: final-candidate
+          path: candidate
+      - name: Push recipe and .SRCINFO with the pinned key
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          AUR_SSH_KNOWN_HOSTS: ${{ vars.AUR_SSH_KNOWN_HOSTS }}
+          PACKAGE: ${{ matrix.package }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$RUNNER_TEMP/ssh"
+          install -m 0600 /dev/null "$RUNNER_TEMP/ssh/key"
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$RUNNER_TEMP/ssh/key"
+          printf '%s\n' "$AUR_SSH_KNOWN_HOSTS" > "$RUNNER_TEMP/ssh/known_hosts"
+          export GIT_SSH_COMMAND="ssh -F /dev/null -i $RUNNER_TEMP/ssh/key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$RUNNER_TEMP/ssh/known_hosts"
+          git -c init.defaultBranch=master clone "ssh://aur@aur.archlinux.org/$PACKAGE.git" aur
+          cd aur
+          install -m 0644 "../candidate/$PACKAGE.PKGBUILD" PKGBUILD
+          docker run --rm --user "$(id -u):$(id -g)" --env HOME=/tmp \
+            --volume "$PWD:/pkg" --workdir /pkg \
+            archlinux:base-devel@sha256:8745817f349ed24373341ddb92776209eeec3f0364ea48f7f645ac5800d30a50 \
+            makepkg --printsrcinfo > .SRCINFO
+          if [[ -n "$(git status --short)" ]]; then
+            git config user.name 'devknx release automation'
+            git config user.email 'devknx-release@users.noreply.github.com'
+            git add PKGBUILD .SRCINFO
+            git commit -m "$PACKAGE $VERSION-1"
+            git push origin HEAD:master
+          fi
+          cd ..
+          git clone --depth 1 "ssh://aur@aur.archlinux.org/$PACKAGE.git" readback
+          cmp aur/PKGBUILD readback/PKGBUILD
+          cmp aur/.SRCINFO readback/.SRCINFO
+          for attempt in $(seq 1 40); do
+            if curl --fail --silent --get --data-urlencode 'v=5' \
+              --data-urlencode 'type=info' --data-urlencode "arg[]=$PACKAGE" \
+              https://aur.archlinux.org/rpc | jq -e --arg v "$VERSION-1" \
+              '.resultcount == 1 and .results[0].Version == $v' >/dev/null; then
+              exit 0
+            fi
+            if [[ "$attempt" -eq 40 ]]; then
+              echo "::error::AUR index did not converge within twenty minutes"
+              exit 1
+            fi
+            sleep 30
+          done
+
+  promote:
+    name: Promote unchanged prerelease to latest
+    needs: [metadata, stage, publish-homebrew, publish-aur]
+    if: needs.metadata.outputs.prerelease == 'false'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: All mandatory channels succeeded
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' '${{ toJSON(needs) }}' | jq -e 'all(.[]; .result == "success")'
+          gh release edit "$TAG" --prerelease=false --latest
+          gh release view "$TAG" --json isDraft,isPrerelease,tagName --jq \
+            'if .isDraft or .isPrerelease then halt_error(1) else .tagName end'
+          test "$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name)" = "$TAG"
+
+  notify-apt:
+    name: Ask the central archive to import the finished release
+    needs: [metadata, promote]
+    runs-on: ubuntu-24.04
+    environment: release
+    steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: apt-token
+        with:
+          client-id: ${{ vars.ARCHIVE_DISPATCH_CLIENT_ID }}
+          private-key: ${{ secrets.ARCHIVE_DISPATCH_PRIVATE_KEY }}
+          owner: metaneutrons
+          repositories: apt-archive
+          permission-actions: write
+          permission-contents: read
+      - name: Dispatch after stable promotion only
+        env:
+          GH_TOKEN: ${{ steps.apt-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run publish.yml --repo metaneutrons/apt-archive \
+            --ref main -f domain=metaneutrons.cc -f project=devknx
+
+  verify-apt:
+    name: Read back signed APT index and ${{ matrix.arch }} package
+    needs: [metadata, notify-apt]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: amd64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    steps:
+      - name: Configure the signed archive and poll the client path
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location \
+            https://deb.metaneutrons.cc/metaneutrons-archive-keyring.pgp \
+            -o "$RUNNER_TEMP/metaneutrons-archive-keyring.pgp"
+          fingerprint=$(gpg --show-keys --with-colons \
+            "$RUNNER_TEMP/metaneutrons-archive-keyring.pgp" |
+            awk -F: '$1 == "fpr" {print $10; exit}')
+          test "$fingerprint" = 1B7B79417383648BBFBE282E01AB8296EF0FCD76
+          sudo install -m 0644 "$RUNNER_TEMP/metaneutrons-archive-keyring.pgp" \
+            /usr/share/keyrings/metaneutrons-archive-keyring.pgp
+          source_file="$RUNNER_TEMP/metaneutrons.sources"
+          printf 'Types: deb\nURIs: https://deb.metaneutrons.cc\nSuites: rolling\nComponents: main\nSigned-By: /usr/share/keyrings/metaneutrons-archive-keyring.pgp\n' > "$source_file"
+          sudo install -m 0644 "$source_file" /etc/apt/sources.list.d/metaneutrons.sources
+          found=false
+          for attempt in $(seq 1 40); do
+            sudo apt-get update
+            if apt-cache madison devknx | awk '{print $3}' | grep -Fx "${VERSION}-1"; then
+              found=true
+              break
+            fi
+            if [[ "$attempt" -eq 40 ]]; then break; fi
+            sleep 30
+          done
+          test "$found" = true
+          mkdir -p "$RUNNER_TEMP/apt-readback" "$RUNNER_TEMP/github-readback"
+          cd "$RUNNER_TEMP/apt-readback"
+          apt-get download "devknx=${VERSION}-1"
+          package="devknx_${VERSION}-1_${ARCH}.deb"
+          test -s "$package"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "$package" --dir "$RUNNER_TEMP/github-readback"
+          cmp "$package" "$RUNNER_TEMP/github-readback/$package"
+          sudo apt-get install -y "./$package"
+          devknx --version | grep -Fx "devknx $VERSION"

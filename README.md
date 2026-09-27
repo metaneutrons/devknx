@@ -216,6 +216,10 @@ cover:
 | Linux | x86_64 and ARM64 | GNU and musl CLI archives, Debian packages, Homebrew formula, AUR packages |
 | Windows | x86_64 and ARM64 | CLI archives with the icon embedded in each executable |
 
+Windows binaries are not Authenticode-signed. SmartScreen may warn on first
+launch; verify the release's checksum, cosign bundle and provenance before
+running a downloaded binary.
+
 The Homebrew formula will put `devknx` on `PATH`; the cask will put
 `devknx.app` in `/Applications`. They will install side by side. The packages
 will be published through GitHub Releases, the

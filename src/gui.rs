@@ -391,6 +391,7 @@ impl eframe::App for MonitorApp {
             ));
             let mut selected = None;
             egui::ScrollArea::vertical()
+                .stick_to_bottom(true)
                 .max_height((ui.available_height() - 190.0).max(120.0))
                 .show_rows(ui, 23.0, visible.len(), |ui, range| {
                     for row in &visible[range] {

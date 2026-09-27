@@ -221,7 +221,14 @@ impl App {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the terminal key map is a single explicit state machine"
+    )]
     fn key(&mut self, key: crossterm::event::KeyEvent) -> bool {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return true;
+        }
         if key.code == KeyCode::Esc {
             self.mode = Mode::Normal;
             self.input.clear();

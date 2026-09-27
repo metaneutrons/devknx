@@ -192,7 +192,6 @@ impl CaptureService {
                     self.state_tx.send_replace(ConnectionState::Connected {
                         endpoint: self.endpoint,
                     });
-                    delay = self.policy.initial;
                     loop {
                         let frame = tokio::select! {
                             biased;
@@ -222,6 +221,7 @@ impl CaptureService {
                             None => None,
                         };
                         let _ = self.frames_tx.send(LiveCapture { id, event });
+                        delay = self.policy.initial;
                     }
                 }
                 Err(error) => error.to_string(),
@@ -449,7 +449,7 @@ mod tests {
     #[tokio::test]
     async fn closed_connection_enters_retry_state() {
         let policy =
-            ReconnectPolicy::new(Duration::from_millis(20), Duration::from_millis(20)).unwrap();
+            ReconnectPolicy::new(Duration::from_millis(10), Duration::from_millis(40)).unwrap();
         let mut service = CaptureService::new(spec(), None, policy, capacity(1));
         let mut states = service.subscribe_state();
         let closed = Arc::new(AtomicUsize::new(0));
@@ -472,12 +472,20 @@ mod tests {
             }
         };
         let observer = async {
+            let mut retry_delays = Vec::new();
             loop {
                 states.changed().await.unwrap();
-                if let ConnectionState::WaitingRetry { reason, .. } = &*states.borrow() {
+                if let ConnectionState::WaitingRetry { reason, delay } = &*states.borrow() {
                     assert_eq!(reason, "connection closed");
-                    stop_tx.send(()).unwrap();
-                    break;
+                    retry_delays.push(*delay);
+                    if retry_delays.len() == 2 {
+                        assert_eq!(
+                            retry_delays,
+                            [Duration::from_millis(10), Duration::from_millis(20)]
+                        );
+                        stop_tx.send(()).unwrap();
+                        break;
+                    }
                 }
             }
         };
@@ -492,7 +500,7 @@ mod tests {
         .await
         .unwrap();
         result.unwrap();
-        assert_eq!(closed.load(Ordering::SeqCst), 1);
+        assert_eq!(closed.load(Ordering::SeqCst), 2);
         assert_eq!(*states.borrow(), ConnectionState::Stopped);
     }
 

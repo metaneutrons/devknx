@@ -35,7 +35,9 @@ class PackageMetadataTests(unittest.TestCase):
             self.assertIn('depends_on "mesa"', formula)
             self.assertIn('shell_output("#{bin}/devknx --version")', formula)
             self.assertNotIn("x86_64-apple-darwin", formula)
-            self.assertIn('cask "devknx-app"', (output / "devknx-app.rb").read_text())
+            cask = (output / "devknx-app.rb").read_text()
+            self.assertIn('cask "devknx-app"', cask)
+            self.assertIn("depends_on :macos", cask)
             self.assertIn("devknx-v0.2.0-x86_64-unknown-linux-gnu",
                           (output / "devknx-bin.PKGBUILD").read_text())
             self.assertIn('_srcdir="devknx-v0.2.0"', (output / "devknx.PKGBUILD").read_text())

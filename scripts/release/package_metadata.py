@@ -122,7 +122,7 @@ cask "devknx-app" do
   desc "{DESCRIPTION}"
   homepage "{HOMEPAGE}"
 
-  depends_on macos: :big_sur
+  depends_on :macos
 
   app "devknx.app"
 

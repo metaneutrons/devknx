@@ -150,8 +150,10 @@ archive. The macOS Intel target is intentionally excluded. Linux musl archives
 are headless; native GUI qualification is for GNU/glibc Linux.
 
 The [versioned initiative plan](docs/plans/devknx.md) defines the architecture,
-milestones, acceptance evidence, and the later KnxMonitor handoff. The project
-will also appear on [metaneutrons.cc](https://metaneutrons.cc), the overview of
+milestones, acceptance evidence, and the later KnxMonitor handoff. An
+[M2 real-hardware qualification procedure](docs/qualification/m2-hardware.md)
+covers the remaining live tunnel and routing gate. The project will appear on
+[metaneutrons.cc](https://metaneutrons.cc), the overview of
 Fabian's repositories; it does not require a separate project website.
 The [capability registry](src/capabilities.rs) records which current operations
 exist in the CLI and GUI and why their coverage differs during development.

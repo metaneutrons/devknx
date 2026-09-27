@@ -81,8 +81,12 @@ standard error. Failed connection attempts and unexpected closes are retried
 with a bounded 1–30 second delay; press Ctrl-C to stop. Only receive-side
 frames are captured in this development build. A slow live subscriber is
 reported as application-event lag, not as a count of lost KNX bus telegrams.
-The endpoints above are examples, not verified gateways; substitute your own
-network addresses. No live-bus qualification has been performed yet.
+The endpoints above are examples; substitute your own network addresses.
+Passive receive, restart, local IPC, and SQLite backup have been exercised
+against a real KNXnet/IP tunnel on macOS ARM64 and a physical multicast router
+on Linux x86_64. The observed bus traffic contained group writes, not reads or
+responses. KNX bus-loss telemetry is not yet claimed; see the
+[M2 evidence and open decision](https://github.com/metaneutrons/devknx/issues/5).
 
 The optional `--database` creates a versioned SQLite capture store. Each
 committed telegram receives a monotonic ID; the default retention limit is
@@ -153,7 +157,8 @@ are headless; native GUI qualification is for GNU/glibc Linux.
 The [versioned initiative plan](docs/plans/devknx.md) defines the architecture,
 milestones, acceptance evidence, and the later KnxMonitor handoff. An
 [M2 real-hardware qualification procedure](docs/qualification/m2-hardware.md)
-covers the remaining live tunnel and routing gate. The project will appear on
+defines the live method; measured results and limits are recorded in the
+[M2 issue](https://github.com/metaneutrons/devknx/issues/5). The project will appear on
 [metaneutrons.cc](https://metaneutrons.cc), the overview of
 Fabian's repositories; it does not require a separate project website.
 The [capability registry](src/capabilities.rs) records which current operations

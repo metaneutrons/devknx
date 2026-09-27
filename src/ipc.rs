@@ -8,6 +8,8 @@
 //! first pipe instance must be created by this server; a pre-existing instance
 //! makes startup fail rather than silently accepting an impostor endpoint.
 
+#[cfg(unix)]
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::path::Path;
 #[cfg(unix)]
@@ -190,6 +192,42 @@ fn pipe_name(database: &Path) -> io::Result<String> {
 /// One authenticated local listener owned by the capture process.
 pub struct IpcServer {
     listener: Listener,
+    #[cfg(unix)]
+    _owner_lease: File,
+}
+
+#[cfg(unix)]
+fn acquire_ipc_lease(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let lease_path = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing IPC directory"))?
+        .join("owner.lock");
+    match std::fs::symlink_metadata(&lease_path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "IPC owner lock is not a regular file",
+            ));
+        }
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lease_path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "local IPC listener is already active",
+        )),
+        Err(TryLockError::Error(error)) => Err(error),
+    }
 }
 
 impl IpcServer {
@@ -200,10 +238,11 @@ impl IpcServer {
     /// Fails closed if the endpoint cannot be protected or is already active.
     pub fn bind(database: &Path) -> Result<Self, IpcError> {
         #[cfg(unix)]
-        let listener = {
+        let (listener, owner_lease) = {
             use std::os::unix::fs::PermissionsExt as _;
 
             let path = socket_path(database, true)?;
+            let owner_lease = acquire_ipc_lease(&path)?;
             let name = path.as_os_str().to_fs_name::<GenericFilePath>()?;
             let options = ListenerOptions::new().name(name).try_overwrite(true);
             #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
@@ -213,7 +252,7 @@ impl IpcServer {
             };
             let listener = options.create_tokio()?;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-            listener
+            (listener, owner_lease)
         };
         #[cfg(windows)]
         let listener = {
@@ -232,7 +271,11 @@ impl IpcServer {
                 .security_descriptor(descriptor)
                 .create_tokio()?
         };
-        Ok(Self { listener })
+        Ok(Self {
+            listener,
+            #[cfg(unix)]
+            _owner_lease: owner_lease,
+        })
     }
 
     /// Serve concurrent status and live-subscription clients.
@@ -373,13 +416,26 @@ impl IpcClient {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::CaptureStore;
     use std::num::NonZeroU32;
+    #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt as _, symlink};
 
+    #[tokio::test]
+    async fn local_ipc_has_only_one_active_listener() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("captures.sqlite");
+        drop(CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap());
+        let first = IpcServer::bind(&database).unwrap();
+        assert!(IpcServer::bind(&database).is_err());
+        drop(first);
+        assert!(IpcServer::bind(&database).is_ok());
+    }
+
+    #[cfg(unix)]
     #[test]
     fn local_ipc_rejects_shared_or_symlink_directories() {
         let directory = tempfile::tempdir().unwrap();
@@ -398,5 +454,24 @@ mod tests {
             IpcServer::bind(&database),
             Err(IpcError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_ipc_rejects_symlink_owner_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("captures.sqlite");
+        drop(CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap());
+        let ipc_directory = directory.path().join("captures.sqlite.ipc");
+        std::fs::create_dir(&ipc_directory).unwrap();
+        std::fs::set_permissions(&ipc_directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let victim = directory.path().join("victim");
+        std::fs::write(&victim, b"unchanged").unwrap();
+        symlink(&victim, ipc_directory.join("owner.lock")).unwrap();
+        assert!(matches!(
+            IpcServer::bind(&database),
+            Err(IpcError::Io(error)) if error.kind() == io::ErrorKind::InvalidInput
+        ));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"unchanged");
     }
 }

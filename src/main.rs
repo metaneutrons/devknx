@@ -222,6 +222,9 @@ enum Command {
         /// Existing capture database to attach on startup.
         #[arg(long)]
         database: Option<PathBuf>,
+        /// Run a bounded native window and menu smoke test, then exit.
+        #[arg(long, hide = true)]
+        smoke: bool,
     },
     /// Open the interactive terminal monitor for an existing capture database.
     #[cfg(feature = "tui")]
@@ -441,11 +444,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         #[cfg(feature = "gui")]
-        Some(Command::Gui { database }) => gui::run(database)?,
+        Some(Command::Gui { database, smoke }) => gui::run(database, smoke)?,
         #[cfg(feature = "tui")]
         Some(Command::Tui { database }) => tui::run(database)?,
         #[cfg(feature = "gui")]
-        None => gui::run(None)?,
+        None => gui::run(None, false)?,
         #[cfg(not(feature = "gui"))]
         None => {
             eprintln!("No command specified. Use --help for available commands.");

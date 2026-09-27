@@ -97,6 +97,18 @@ bool devknx_take_menu_action(uint32_t action) {
     return requested;
 }
 
+bool devknx_macos_menu_installed(void) {
+    NSMenu *main = [NSApp mainMenu];
+    NSArray<NSString *> *titles = @[@"devknx", @"File", @"Edit", @"View",
+                                   @"Operation", @"Window", @"Help"];
+    if ([main numberOfItems] != (NSInteger)[titles count]) return false;
+    for (NSUInteger index = 0; index < [titles count]; index++) {
+        NSMenuItem *item = [main itemAtIndex:index];
+        if (![[item title] isEqualToString:titles[index]] || ![item submenu]) return false;
+    }
+    return [[[[main itemAtIndex:0] submenu] itemWithTitle:@"About devknx"] action] == @selector(showAbout:);
+}
+
 static void add_item(NSMenu *menu, NSString *title, SEL selector, NSString *key,
                      id target, NSEventModifierFlags modifiers) {
     NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title action:selector keyEquivalent:key];

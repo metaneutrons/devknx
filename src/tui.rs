@@ -422,4 +422,61 @@ mod tests {
         assert_eq!(app.model.filter, "light");
         app.draw(&mut terminal).unwrap();
     }
+
+    #[test]
+    fn sustained_rows_scroll_filter_and_resize() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("capture.sqlite");
+        drop(CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap());
+        let mut app = App::new(database).unwrap();
+        for id in 0..5_000 {
+            app.model.rows.push(interface::DisplayCapture {
+                id: Some(id),
+                timestamp_ms: u64::try_from(id).unwrap(),
+                direction: "in".into(),
+                source: "1.1.1".into(),
+                destination: format!("1/1/{id}"),
+                service: "GroupValueWrite".into(),
+                label: (id == 2_500).then(|| "kitchen light".into()),
+                dpts: vec!["DPT 1.001".into()],
+                raw_cemi: "29 00".into(),
+            });
+        }
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        app.selected = 4_999;
+        app.draw(&mut terminal).unwrap();
+        app.key(crossterm::event::KeyEvent::new(
+            KeyCode::Home,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(app.selected, 0);
+        assert!(!app.follow_tail);
+        app.draw(&mut terminal).unwrap();
+        app.key(crossterm::event::KeyEvent::new(
+            KeyCode::End,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(app.selected, 4_999);
+        assert!(app.follow_tail);
+        app.key(crossterm::event::KeyEvent::new(
+            KeyCode::Up,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(app.selected, 4_998);
+        assert!(!app.follow_tail);
+        terminal.resize(Rect::new(0, 0, 40, 12)).unwrap();
+        app.draw(&mut terminal).unwrap();
+        app.model.filter = "kitchen light".into();
+        assert_eq!(app.visible_count(), 1);
+        app.selected = 0;
+        app.draw(&mut terminal).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(screen.contains("kitchen light"));
+    }
 }

@@ -2,8 +2,10 @@
 // Copyright (C) 2026 Fabian Schmieder
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use knx_rs_ip::discovery::GatewayInfo;
@@ -11,12 +13,15 @@ use knx_rs_ip::discovery::GatewayInfo;
 use crate::interface::{self, DisplayCapture, Follower, MonitorModel};
 use crate::platform::{self, MenuAction};
 
-pub fn run(database: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
-    platform::init_app();
+pub fn run(database: Option<PathBuf>, smoke: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let smoke_result = smoke.then(|| Arc::new(AtomicBool::new(false)));
+    let app_smoke_result = smoke_result.clone();
     let icon =
         image::load_from_memory(include_bytes!("../resources/png/devknx-256.png"))?.to_rgba8();
     let (width, height) = icon.dimensions();
     let options = eframe::NativeOptions {
+        #[cfg(target_os = "windows")]
+        renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
             .with_app_id("devknx")
             .with_title("devknx")
@@ -32,9 +37,23 @@ pub fn run(database: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> 
     eframe::run_native(
         "devknx",
         options,
-        Box::new(move |_cc| Ok(Box::new(MonitorApp::new(database)))),
+        Box::new(move |_cc| {
+            platform::init_app();
+            Ok(Box::new(MonitorApp::new(database, app_smoke_result)))
+        }),
     )?;
+    if let Some(result) = smoke_result
+        && !result.load(Ordering::Acquire)
+    {
+        return Err("GUI smoke: window resize or native menu verification failed".into());
+    }
     Ok(())
+}
+
+struct SmokeRun {
+    started: Instant,
+    frames: u32,
+    result: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -61,11 +80,19 @@ struct MonitorApp {
     write_value: String,
     preview: Option<(String, String, String, String)>,
     selected: Option<DisplayCapture>,
+    smoke: Option<SmokeRun>,
 }
 
 impl MonitorApp {
-    fn new(database: Option<PathBuf>) -> Self {
-        let mut app = Self::default();
+    fn new(database: Option<PathBuf>, smoke_result: Option<Arc<AtomicBool>>) -> Self {
+        let mut app = Self {
+            smoke: smoke_result.map(|result| SmokeRun {
+                started: Instant::now(),
+                frames: 0,
+                result,
+            }),
+            ..Self::default()
+        };
         if let Some(database) = database {
             app.database_input = database.display().to_string();
             app.attach();
@@ -169,6 +196,38 @@ impl MonitorApp {
             self.show_write = true;
         }
         platform::take(MenuAction::FocusFilter)
+    }
+
+    fn smoke_step(&mut self, ctx: &egui::Context) {
+        let Some(smoke) = &mut self.smoke else { return };
+        if smoke.result.load(Ordering::Acquire) {
+            return;
+        }
+        smoke.frames += 1;
+        if smoke.frames == 1 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(800.0, 520.0)));
+        } else {
+            let size = ctx.input(|input| input.content_rect().size());
+            if smoke.frames >= 2
+                && (size.x - 800.0).abs() <= 30.0
+                && (size.y - 520.0).abs() <= 30.0
+                && platform::menu_installed()
+            {
+                eprintln!("GUI smoke: window, resize and native menu verified");
+                smoke.result.store(true, Ordering::Release);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+        if smoke.started.elapsed() > Duration::from_secs(12) {
+            let size = ctx.input(|input| input.content_rect().size());
+            eprintln!(
+                "GUI smoke: timed out after {} frames (size={size:?}, menu={})",
+                smoke.frames,
+                platform::menu_installed()
+            );
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        ctx.request_repaint_after(Duration::from_millis(50));
     }
 
     #[expect(clippy::too_many_lines, reason = "four independent small modal forms")]
@@ -320,6 +379,7 @@ impl eframe::App for MonitorApp {
         self.process_background();
         let focus_filter = self.process_menu();
         let ctx = ui.ctx().clone();
+        self.smoke_step(&ctx);
         ctx.request_repaint_after(Duration::from_millis(100));
         ui.heading("devknx · KNXnet/IP monitor");
         ui.horizontal(|ui| {

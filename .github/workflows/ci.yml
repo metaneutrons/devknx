@@ -32,7 +32,7 @@ jobs:
       - name: Install Linux GUI build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-0 xvfb
       # The lefthook repository has no install.sh. Binary from the release
       # asset, version pinned like any other dependency.
       - name: Check the hook configuration
@@ -72,7 +72,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-0 xvfb
       - uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
         with:
           tool: cargo-nextest
@@ -82,6 +82,24 @@ jobs:
           tool: cargo-llvm-cov
       - run: cargo clippy --workspace --all-targets --locked ${{ matrix.features }} -- -D warnings
       - run: cargo nextest run --workspace --locked ${{ matrix.features }}
+      - name: Verify native GUI window and resize on Linux
+        if: runner.os == 'Linux' && matrix.features == '--all-features'
+        run: |
+          cargo build --locked --all-features
+          xvfb-run -a target/debug/devknx gui --smoke
+      - name: Verify native GUI window, resize and menu on macOS
+        if: matrix.name == 'macos-aarch64'
+        run: |
+          cargo build --locked --all-features
+          target/debug/devknx gui --smoke
+      - name: Verify native GUI window and resize on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --locked --all-features
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & target/debug/devknx.exe gui --smoke
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify native macOS menu and action bridge
         if: matrix.name == 'macos-aarch64'
         run: bash scripts/check-macos-menu.sh

@@ -311,14 +311,16 @@ mod tests {
 
     #[tokio::test]
     async fn real_loopback_tunnel_commits_and_replays_across_owner_restart() {
-        let server = DeviceServer::start_at("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
-        let address = server.local_addr();
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("loopback.sqlite");
         let mut originals = Vec::new();
         for (id, value) in [(1, 42), (2, 43)] {
+            // A fresh gateway stub avoids platform-specific UDP reset behavior
+            // after the previous tunnel closes; the persistent database is shared.
+            let server = DeviceServer::start_at("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+            let address = server.local_addr();
             let store = CaptureStore::open(&path, NonZeroU32::new(10).unwrap()).unwrap();
             let mut service = CaptureService::new(
                 ConnectionSpec::Tunnel(address),
@@ -360,6 +362,7 @@ mod tests {
             result.unwrap();
             assert_eq!(*states.borrow(), ConnectionState::Stopped);
             originals.push(original);
+            server.stop().await;
         }
         let history = CaptureStore::open_existing(&path).unwrap();
         assert_eq!(
@@ -371,7 +374,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             originals
         );
-        server.stop().await;
     }
 
     #[tokio::test]

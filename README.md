@@ -17,7 +17,7 @@
 </p>
 
 > [!IMPORTANT]
-> **Early development.** There is no stable release yet. The CLI can discover gateways and print raw telegrams from a KNXnet/IP tunnel or router. The native GUI is still a discovery shell. There is no persistent history, ETS import, or group-value sending. Do not use it to operate a live installation.
+> **Early development.** There is no stable release yet. The CLI can discover gateways, capture raw telegrams from a KNXnet/IP tunnel or router, and optionally retain them in SQLite. The native GUI is still a discovery shell. There is no background capture daemon, ETS import, or group-value sending. Do not use it to operate a live installation.
 
 ## What devknx is building
 
@@ -31,7 +31,7 @@ desktop button and an API call.
 | --- | --- |
 | KNXnet/IP gateway discovery | CLI and native GUI shell available |
 | KNXnet/IP tunneling and routing capture | Experimental CLI stream; no persistence or automatic reconnect yet |
-| Durable, searchable telegram history | Planned |
+| Durable, searchable telegram history | Experimental SQLite history with ID cursor, retention cap, and CSV export; filters/search and the background daemon are pending |
 | ETS group-address CSV and XML import | Planned |
 | DPT-validated read, write preview, and write | Planned |
 | Terminal UI and full native desktop UI | Planned |
@@ -58,6 +58,9 @@ cd devknx
 cargo run --locked -- discover
 cargo run --locked -- monitor tunnel://192.0.2.1:3671
 cargo run --locked -- monitor router://224.0.23.12:3671
+cargo run --locked -- monitor tunnel://192.0.2.1:3671 --database captures.sqlite
+cargo run --locked -- history --database captures.sqlite --after 0 --limit 100
+cargo run --locked -- export --database captures.sqlite > captures.csv
 cargo run --locked -- gui
 ```
 
@@ -73,6 +76,19 @@ An unexpected connection close is an error; the current stream does not
 reconnect. Only receive-side frames are captured in this development build.
 The endpoints above are examples, not verified gateways; substitute your own
 network addresses. No live-bus qualification has been performed yet.
+
+The optional `--database` creates a versioned SQLite capture store. Each
+committed telegram receives a monotonic ID; the default retention limit is
+100,000 frames and can be changed with `--max-events`. `history` reads an
+existing store using an exclusive `--after` ID and a bounded page size.
+`export` streams CSV up to the highest ID present when export begins. Both
+commands fail rather than create an empty database if the path is wrong.
+Existing databases with an unsupported schema are not rewritten. The CLI
+currently owns the connection and database only while `monitor` is running;
+the planned persistent local service and live event bus are not implemented.
+Capture files can reveal activity in a building. Newly created SQLite files
+are private to the current user on Unix; choose a protected directory and
+apply suitable access controls for existing files and on Windows.
 
 For a headless CLI build:
 

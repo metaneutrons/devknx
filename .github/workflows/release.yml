@@ -661,7 +661,7 @@ jobs:
           python3 scripts/release/release_inventory.py verify --tag "$TAG" --directory candidate
           state=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || echo absent)
           case "$state" in
-            absent) gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes 'Pipeline test tag.' ;;
+            absent) gh release create "$TAG" --draft --verify-tag --title "$TAG" --generate-notes ;;
             true) : ;;
             false) echo "::error::refusing to mutate an already published release"; exit 1 ;;
           esac

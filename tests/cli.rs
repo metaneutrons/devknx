@@ -13,6 +13,7 @@ use knx_rs_core::cemi::CemiFrame;
 use knx_rs_core::message::MessageCode;
 use knx_rs_core::types::Priority;
 use knx_rs_ip::DeviceServer;
+use rusqlite::{Connection, MAIN_DB};
 
 fn devknx(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_devknx"))
@@ -31,6 +32,7 @@ fn help_describes_available_commands() {
     assert!(stdout.contains("serve"));
     assert!(stdout.contains("history"));
     assert!(stdout.contains("export"));
+    assert!(stdout.contains("backup"));
     #[cfg(feature = "gui")]
     assert!(stdout.contains("gui"));
     #[cfg(not(feature = "gui"))]
@@ -189,6 +191,84 @@ fn history_does_not_create_a_missing_database() {
     ]);
     assert!(!output.status.success());
     assert!(!path.exists());
+}
+
+#[test]
+fn backup_is_restorable_and_never_overwrites_a_destination() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let source = directory.path().join("captures.sqlite");
+    let snapshot = directory.path().join("snapshot.sqlite");
+    let mut writer = CaptureStore::open(&source, NonZeroU32::new(10).expect("nonzero"))
+        .expect("create capture store");
+    let frame = CemiFrame::new_l_data(
+        MessageCode::LDataInd,
+        IndividualAddress::from_raw(0x1101),
+        DestinationAddress::Group(GroupAddress::from_raw(0x0801)),
+        Priority::Low,
+        &[0x00, 0x80, 0x01],
+    );
+    writer
+        .insert(&CaptureEvent::received(
+            CaptureEndpoint::Tunnel("192.0.2.1:3671".parse().expect("socket address")),
+            frame,
+        ))
+        .expect("commit first frame");
+    let source_path = source.to_str().expect("UTF-8 path");
+    let snapshot_path = snapshot.to_str().expect("UTF-8 path");
+    let result = devknx(&[
+        "backup",
+        "--database",
+        source_path,
+        "--output",
+        snapshot_path,
+    ]);
+    assert!(result.status.success(), "{:?}", result.stderr);
+    let snapshot_store = CaptureStore::open_existing(&snapshot).expect("open snapshot");
+    let restored = snapshot_store
+        .read_after(0, NonZeroU32::new(10).expect("nonzero"))
+        .expect("read snapshot");
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].event.frame().payload(), &[0x00, 0x80, 0x01]);
+    drop(snapshot_store);
+
+    let recovery_path = directory.path().join("recovered.sqlite");
+    Connection::open(&recovery_path)
+        .expect("create recovery database")
+        .restore(MAIN_DB, &snapshot, None::<fn(rusqlite::backup::Progress)>)
+        .expect("restore snapshot through SQLite");
+    assert_eq!(
+        CaptureStore::open_existing(&recovery_path)
+            .expect("open recovered database")
+            .read_after(0, NonZeroU32::new(10).expect("nonzero"))
+            .expect("read recovered frame")[0]
+            .event
+            .frame()
+            .payload(),
+        &[0x00, 0x80, 0x01]
+    );
+
+    let snapshot_bytes = std::fs::read(&snapshot).expect("read snapshot bytes");
+
+    let result = devknx(&[
+        "backup",
+        "--database",
+        source_path,
+        "--output",
+        snapshot_path,
+    ]);
+    assert!(!result.status.success());
+    assert_eq!(
+        std::fs::read(&snapshot).expect("read preserved bytes"),
+        snapshot_bytes
+    );
+    assert_eq!(
+        CaptureStore::open_existing(&snapshot)
+            .expect("original snapshot preserved")
+            .read_after(0, NonZeroU32::new(10).expect("nonzero"))
+            .expect("read preserved snapshot")
+            .len(),
+        1
+    );
 }
 
 #[test]

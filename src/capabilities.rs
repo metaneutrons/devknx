@@ -22,6 +22,8 @@ pub enum Capability {
     HistoryRead,
     /// Export committed telegrams as CSV.
     CsvExport,
+    /// Create a consistent, non-overwriting SQLite snapshot.
+    DatabaseBackup,
 }
 
 /// All currently implemented user-facing operations.
@@ -31,6 +33,7 @@ pub const ALL: &[Capability] = &[
     Capability::CaptureService,
     Capability::HistoryRead,
     Capability::CsvExport,
+    Capability::DatabaseBackup,
 ];
 
 /// An application surface that exposes capabilities.
@@ -72,6 +75,10 @@ pub const CLI: &[Declaration] = &[
     Declaration {
         capability: Capability::CsvExport,
         source_anchor: "Some(Command::Export {",
+    },
+    Declaration {
+        capability: Capability::DatabaseBackup,
+        source_anchor: "Some(Command::Backup {",
     },
 ];
 
@@ -124,6 +131,13 @@ pub const GAPS: &[Gap] = &[
         present_on: Surface::Cli,
         missing_on: Surface::Gui,
         reason: "CSV export exists only in the CLI until the GUI shares the history operation.",
+        target_issue: "https://github.com/metaneutrons/devknx/issues/7",
+    },
+    Gap {
+        capability: Capability::DatabaseBackup,
+        present_on: Surface::Cli,
+        missing_on: Surface::Gui,
+        reason: "Database snapshots are available in the CLI; the GUI has no history controls yet.",
         target_issue: "https://github.com/metaneutrons/devknx/issues/7",
     },
 ];

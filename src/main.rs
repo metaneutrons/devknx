@@ -71,6 +71,15 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         after: i64,
     },
+    /// Save a consistent, non-overwriting SQLite capture snapshot.
+    Backup {
+        /// Existing SQLite capture database.
+        #[arg(long)]
+        database: PathBuf,
+        /// New snapshot file; an existing file is never replaced.
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Open the native desktop application.
     #[cfg(feature = "gui")]
     Gui,
@@ -118,6 +127,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let stdout = io::stdout();
             let mut output = stdout.lock();
             store.export_csv(&mut output, after)?;
+        }
+        Some(Command::Backup { database, output }) => {
+            let store = CaptureStore::open_existing(&database)?;
+            store.backup_to(&output)?;
         }
         #[cfg(feature = "gui")]
         Some(Command::Gui) | None => gui::run()?,

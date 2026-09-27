@@ -12,7 +12,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use knx_rs_core::cemi::CemiFrame;
 use rusqlite::{
-    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+    Connection, MAIN_DB, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 use thiserror::Error;
 
@@ -159,6 +159,29 @@ impl CaptureStore {
             max_events: None,
             _writer_lease: None,
         })
+    }
+
+    /// Create a consistent, standalone SQLite snapshot without overwriting a file.
+    ///
+    /// SQLite's online backup API includes committed WAL transactions while a
+    /// capture writer is active. The temporary snapshot is installed only after
+    /// backup succeeds; an existing destination remains untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backup cannot be made or the destination exists.
+    pub fn backup_to(&self, destination: &Path) -> Result<(), StorageError> {
+        let parent = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let temporary = tempfile::NamedTempFile::new_in(parent)?;
+        self.connection.backup(MAIN_DB, temporary.path(), None)?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist_noclobber(destination)
+            .map_err(|error| StorageError::Io(error.error))?;
+        Ok(())
     }
 
     /// Atomically append a raw event and prune the oldest rows to the cap.
@@ -690,6 +713,30 @@ mod tests {
         let mut store = CaptureStore::open(&path, nz(10)).unwrap();
         assert_eq!(store.read_after(0, nz(10)).unwrap().len(), 1);
         assert_eq!(store.insert(&event(tunnel(), 2)).unwrap(), 2);
+    }
+
+    #[test]
+    fn empty_schema_zero_database_migrates_to_version_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("empty.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 0);
+        drop(connection);
+
+        let mut store = CaptureStore::open(&path, nz(10)).unwrap();
+        assert_eq!(schema_version(&store.connection).unwrap(), SCHEMA_VERSION);
+        assert_eq!(store.insert(&event(tunnel(), 7)).unwrap(), 1);
+        drop(store);
+        assert_eq!(
+            CaptureStore::open_existing(&path)
+                .unwrap()
+                .read_after(0, nz(10))
+                .unwrap()[0]
+                .event
+                .frame()
+                .payload(),
+            &[0x00, 0x80, 7]
+        );
     }
 
     #[test]

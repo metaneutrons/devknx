@@ -27,7 +27,8 @@ eframe = { version = "0.36", optional = true, default-features = false, features
 image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 knx-rs-core = "0.10.0"
 knx-rs-ip = "0.10.0"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["backup", "bundled"] }
+tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 
@@ -35,9 +36,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "syn
 default = ["gui"]
 gui = ["dep:eframe", "dep:image"]
 full = ["gui"]
-
-[dev-dependencies]
-tempfile = "3"
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"

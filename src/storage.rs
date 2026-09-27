@@ -10,16 +10,19 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
+use knx_rs_core::address::GroupAddress;
 use knx_rs_core::cemi::CemiFrame;
 use knx_rs_ip::RoutingLostMessage;
 use rusqlite::{
     Connection, MAIN_DB, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::capture::{CaptureDirection, CaptureEndpoint, CaptureEvent, RoutingLossEvent};
+use crate::ets::{EtsCatalog, EtsGroup, parse_dpt, parse_group_address};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 4;
 /// Maximum number of rows returned by one cursor query.
 pub const MAX_PAGE_SIZE: u32 = 1_000;
 const EXPORT_PAGE_SIZE: NonZeroU32 = NonZeroU32::new(500).expect("nonzero export page size");
@@ -57,12 +60,47 @@ const SCHEMA_V2: &str = "
     PRAGMA user_version = 2;
 ";
 
+const SCHEMA_V3: &str = "
+    CREATE TABLE ets_imports (
+        revision INTEGER PRIMARY KEY AUTOINCREMENT,
+        imported_at_ms INTEGER NOT NULL CHECK (imported_at_ms >= 0),
+        format TEXT NOT NULL CHECK (format IN ('csv_3_1', 'ga_xml_01'))
+    );
+    CREATE TABLE ets_groups (
+        revision INTEGER NOT NULL,
+        address_raw INTEGER NOT NULL CHECK (address_raw BETWEEN 0 AND 65535),
+        entry_json TEXT NOT NULL,
+        PRIMARY KEY (revision, address_raw)
+    );
+    CREATE INDEX idx_ets_groups_address ON ets_groups(address_raw, revision DESC);
+    PRAGMA user_version = 3;
+";
+
+const SCHEMA_V4: &str = "
+    CREATE TABLE operation_audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        started_at_ms INTEGER NOT NULL CHECK (started_at_ms >= 0),
+        origin TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('read', 'typed_write', 'raw_write')),
+        address_raw INTEGER NOT NULL CHECK (address_raw BETWEEN 0 AND 65535),
+        dpt TEXT,
+        raw_cemi BLOB NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('started', 'transmitted', 'failed')),
+        detail TEXT
+    );
+    CREATE INDEX idx_operation_audit_time ON operation_audit(started_at_ms);
+    PRAGMA user_version = 4;
+";
+
 /// Errors opening, writing, reading, or exporting capture history.
 #[derive(Debug, Error)]
 pub enum StorageError {
     /// SQLite returned an error.
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    /// A persisted ETS entry could not be serialized or decoded.
+    #[error("ETS metadata JSON error: {0}")]
+    Json(#[from] serde_json::Error),
     /// Filesystem or export writer returned an error.
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
@@ -112,6 +150,21 @@ pub enum StorageError {
     /// Router diagnostics must be associated with a multicast endpoint.
     #[error("routing loss requires a router endpoint")]
     InvalidRouterEndpoint,
+    /// A persisted ETS entry is inconsistent with its canonical key.
+    #[error(
+        "corrupt ETS group address at revision {revision}, raw address {address_raw}: {reason}"
+    )]
+    CorruptEtsGroup {
+        /// Import revision.
+        revision: i64,
+        /// Canonical group-address key.
+        address_raw: u16,
+        /// Validation failure.
+        reason: String,
+    },
+    /// An audit row was missing or already finalized.
+    #[error("operation audit row {0} is missing or already finalized")]
+    CorruptOperationAudit(i64),
 }
 
 /// One durable capture with its monotonic database ID.
@@ -132,10 +185,34 @@ pub struct StoredRoutingLoss {
     pub event: RoutingLossEvent,
 }
 
+/// One durable operation attempt, including an explicit raw/typed distinction.
+#[derive(Debug, Serialize)]
+pub struct OperationAuditEntry {
+    /// Monotonic audit cursor.
+    pub id: i64,
+    /// Unix millisecond timestamp before attempted transmission.
+    pub started_at_ms: i64,
+    /// Interface that requested the operation.
+    pub origin: String,
+    /// `read`, `typed_write`, or `raw_write`.
+    pub kind: String,
+    /// Canonical group address.
+    pub address_raw: u16,
+    /// Chosen DPT for typed writes.
+    pub dpt: Option<String>,
+    /// Exact prepared cEMI bytes.
+    pub raw_cemi: String,
+    /// `started`, `transmitted`, or `failed`.
+    pub status: String,
+    /// Transport failure if one occurred.
+    pub detail: Option<String>,
+}
+
 /// Single-owner SQLite capture store.
 pub struct CaptureStore {
     connection: Connection,
     max_events: Option<NonZeroU32>,
+    writable: bool,
     _writer_lease: Option<File>,
 }
 
@@ -146,6 +223,20 @@ impl CaptureStore {
     ///
     /// Returns an error for I/O failure, an unsupported schema, or migration failure.
     pub fn open(path: &Path, max_events: NonZeroU32) -> Result<Self, StorageError> {
+        Self::open_writable(path, Some(max_events))
+    }
+
+    /// Open a writable store for metadata replacement without pruning capture history.
+    /// The same single-writer lease applies; stop `serve` before importing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for I/O, unsupported schema, or an active writer.
+    pub fn open_for_ets_import(path: &Path) -> Result<Self, StorageError> {
+        Self::open_writable(path, None)
+    }
+
+    fn open_writable(path: &Path, max_events: Option<NonZeroU32>) -> Result<Self, StorageError> {
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -165,14 +256,202 @@ impl CaptureStore {
         connection.busy_timeout(Duration::from_secs(5))?;
         migrate(&mut connection)?;
         connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        prune(&transaction, max_events)?;
-        transaction.commit()?;
+        if let Some(cap) = max_events {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            prune(&transaction, cap)?;
+            transaction.commit()?;
+        }
         Ok(Self {
             connection,
-            max_events: Some(max_events),
+            max_events,
+            writable: true,
             _writer_lease: writer_lease,
         })
+    }
+
+    /// Replace the active ETS catalogue in one transaction while retaining prior revisions.
+    /// Capture rows and their raw cEMI bytes are never modified.
+    ///
+    /// # Errors
+    ///
+    /// Returns a read-only, SQLite, or JSON serialization error.
+    pub fn import_ets(&mut self, catalog: &EtsCatalog) -> Result<i64, StorageError> {
+        if !self.writable {
+            return Err(StorageError::ReadOnly);
+        }
+        let now_ms = unix_now_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO ets_imports (imported_at_ms, format) VALUES (?1, ?2)",
+            params![now_ms, catalog.format().as_str()],
+        )?;
+        let revision = transaction.last_insert_rowid();
+        for group in catalog.groups() {
+            transaction.execute(
+                "INSERT INTO ets_groups (revision, address_raw, entry_json) VALUES (?1, ?2, ?3)",
+                params![
+                    revision,
+                    i64::from(group.address_raw),
+                    serde_json::to_string(group)?
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(revision)
+    }
+
+    /// Current ETS import revision, if a catalogue has been imported.
+    ///
+    /// # Errors
+    ///
+    /// Returns a SQLite query error.
+    pub fn ets_revision(&self) -> Result<Option<i64>, StorageError> {
+        if schema_version(&self.connection)? < 3 {
+            return Ok(None);
+        }
+        Ok(self
+            .connection
+            .query_row("SELECT MAX(revision) FROM ets_imports", [], |row| {
+                row.get(0)
+            })?)
+    }
+
+    /// Look up the active ETS metadata by canonical group address.
+    ///
+    /// # Errors
+    ///
+    /// Returns a SQLite or corrupt-metadata error.
+    pub fn ets_group(&self, address: GroupAddress) -> Result<Option<EtsGroup>, StorageError> {
+        let Some(revision) = self.ets_revision()? else {
+            return Ok(None);
+        };
+        let raw = address.raw();
+        let json: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT entry_json FROM ets_groups WHERE revision = ?1 AND address_raw = ?2",
+                params![revision, i64::from(raw)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(json) = json else {
+            return Ok(None);
+        };
+        let corrupt = |reason: String| StorageError::CorruptEtsGroup {
+            revision,
+            address_raw: raw,
+            reason,
+        };
+        let group: EtsGroup =
+            serde_json::from_str(&json).map_err(|error| corrupt(error.to_string()))?;
+        if group.address_raw != raw
+            || parse_group_address(&group.notation)
+                .map_err(|error| corrupt(error.to_string()))?
+                .raw()
+                != raw
+            || group.dpts.iter().any(|dpt| parse_dpt(dpt).is_err())
+        {
+            return Err(corrupt(
+                "stored fields disagree with canonical address or DPT declaration".to_owned(),
+            ));
+        }
+        Ok(Some(group))
+    }
+
+    /// Durably record a prepared operation before transmission. A crash leaves
+    /// the row as `started`, never as a false success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this store is read-only or the audit write fails.
+    pub fn start_operation_audit(
+        &mut self,
+        origin: &str,
+        kind: &str,
+        address_raw: u16,
+        dpt: Option<&str>,
+        raw_cemi: &[u8],
+    ) -> Result<i64, StorageError> {
+        if !self.writable {
+            return Err(StorageError::ReadOnly);
+        }
+        self.connection.execute(
+            "INSERT INTO operation_audit (started_at_ms, origin, kind, address_raw, dpt, raw_cemi, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'started')",
+            params![unix_now_ms()?, origin, kind, i64::from(address_raw), dpt, raw_cemi],
+        )?;
+        Ok(self.connection.last_insert_rowid())
+    }
+
+    /// Mark a durable operation attempt as transmitted or failed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the audit row cannot be updated.
+    pub fn finish_operation_audit(
+        &mut self,
+        id: i64,
+        transmitted: bool,
+        detail: Option<&str>,
+    ) -> Result<(), StorageError> {
+        if !self.writable {
+            return Err(StorageError::ReadOnly);
+        }
+        let status = if transmitted { "transmitted" } else { "failed" };
+        let updated = self.connection.execute(
+            "UPDATE operation_audit SET status = ?1, detail = ?2 WHERE id = ?3 AND status = 'started'",
+            params![status, detail, id],
+        )?;
+        if updated != 1 {
+            return Err(StorageError::CorruptOperationAudit(id));
+        }
+        Ok(())
+    }
+
+    /// Read a bounded page of operation attempts after an exclusive cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid cursor, oversized page, or SQLite failure.
+    pub fn read_operation_audit_after(
+        &self,
+        after: i64,
+        limit: NonZeroU32,
+    ) -> Result<Vec<OperationAuditEntry>, StorageError> {
+        if after < 0 {
+            return Err(StorageError::InvalidCursor(after));
+        }
+        if limit.get() > MAX_PAGE_SIZE {
+            return Err(StorageError::PageTooLarge(limit.get()));
+        }
+        if schema_version(&self.connection)? < 4 {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT id, started_at_ms, origin, kind, address_raw, dpt, raw_cemi, status, detail
+             FROM operation_audit WHERE id > ?1 ORDER BY id LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![after, limit.get()], |row| {
+            let raw: Vec<u8> = row.get(6)?;
+            let address_raw: i64 = row.get(4)?;
+            let address_raw = u16::try_from(address_raw)
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(4, address_raw))?;
+            Ok(OperationAuditEntry {
+                id: row.get(0)?,
+                started_at_ms: row.get(1)?,
+                origin: row.get(2)?,
+                kind: row.get(3)?,
+                address_raw,
+                dpt: row.get(5)?,
+                raw_cemi: hex(&raw),
+                status: row.get(7)?,
+                detail: row.get(8)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// Open an existing database for history reads without creating or migrating it.
@@ -191,6 +470,7 @@ impl CaptureStore {
         Ok(Self {
             connection,
             max_events: None,
+            writable: false,
             _writer_lease: None,
         })
     }
@@ -558,6 +838,8 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             transaction.execute_batch(SCHEMA_V1)?;
             transaction.execute_batch(SCHEMA_V2)?;
+            transaction.execute_batch(SCHEMA_V3)?;
+            transaction.execute_batch(SCHEMA_V4)?;
             transaction.commit()?;
             Ok(())
         }
@@ -565,6 +847,23 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             transaction.execute_batch(SCHEMA_V2)?;
+            transaction.execute_batch(SCHEMA_V3)?;
+            transaction.execute_batch(SCHEMA_V4)?;
+            transaction.commit()?;
+            Ok(())
+        }
+        2 => {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(SCHEMA_V3)?;
+            transaction.execute_batch(SCHEMA_V4)?;
+            transaction.commit()?;
+            Ok(())
+        }
+        3 => {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(SCHEMA_V4)?;
             transaction.commit()?;
             Ok(())
         }
@@ -584,6 +883,16 @@ fn require_schema(connection: &Connection) -> Result<(), StorageError> {
 
 fn schema_version(connection: &Connection) -> Result<i64, StorageError> {
     Ok(connection.query_row("PRAGMA user_version", [], |row| row.get(0))?)
+}
+
+fn unix_now_ms() -> Result<i64, StorageError> {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| StorageError::InvalidTimestamp)?
+            .as_millis(),
+    )
+    .map_err(|_| StorageError::InvalidTimestamp)
 }
 
 fn prune(transaction: &Transaction<'_>, max_events: NonZeroU32) -> Result<(), StorageError> {
@@ -722,6 +1031,14 @@ mod tests {
     use knx_rs_core::types::Priority;
 
     use super::*;
+    use crate::ets::{CsvEncoding, EtsFormat};
+
+    fn ets_fixture(name: &str) -> EtsCatalog {
+        let xml = format!(
+            "<GroupAddress-Export xmlns=\"http://knx.org/xml/ga-export/01\"><GroupRange Name=\"Main\"><GroupAddress Name=\"{name}\" Address=\"1/2/3\" Description=\"Fixture\" DPTs=\"DPST-1-1,DPST-1-6\" /></GroupRange></GroupAddress-Export>"
+        );
+        EtsCatalog::from_bytes(xml.as_bytes(), EtsFormat::GaXml01, CsvEncoding::Utf8).unwrap()
+    }
 
     fn nz(value: u32) -> NonZeroU32 {
         NonZeroU32::new(value).expect("positive fixture")
@@ -754,7 +1071,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_migrates_to_v2_without_losing_captures() {
+    fn v1_migrates_to_v4_without_losing_captures() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("captures.sqlite");
         let mut original = CaptureStore::open(&path, nz(10)).unwrap();
@@ -763,7 +1080,12 @@ mod tests {
         let connection = Connection::open(&path).unwrap();
         connection
             .execute_batch(
-                "DROP INDEX idx_routing_loss_time;
+                "DROP INDEX idx_operation_audit_time;
+                 DROP TABLE operation_audit;
+                 DROP INDEX idx_ets_groups_address;
+                 DROP TABLE ets_groups;
+                 DROP TABLE ets_imports;
+                 DROP INDEX idx_routing_loss_time;
                  DROP TABLE routing_loss_events;
                  PRAGMA user_version = 1;",
             )
@@ -780,7 +1102,7 @@ mod tests {
         drop(legacy);
 
         let mut writer = CaptureStore::open(&path, nz(10)).unwrap();
-        assert_eq!(schema_version(&writer.connection).unwrap(), 2);
+        assert_eq!(schema_version(&writer.connection).unwrap(), SCHEMA_VERSION);
         assert_eq!(writer.insert(&event(tunnel(), 1)).unwrap(), 2);
         assert_eq!(writer.insert_routing_loss(&routing_loss(258)).unwrap(), 1);
         drop(writer);
@@ -1026,6 +1348,135 @@ mod tests {
                 .payload(),
             &[0x00, 0x80, 7]
         );
+    }
+
+    #[test]
+    fn ets_import_revisions_preserve_raw_captures_and_backup_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("captures.sqlite");
+        let backup = directory.path().join("backup.sqlite");
+        let mut writer = CaptureStore::open(&path, nz(10)).unwrap();
+        writer.insert(&event(tunnel(), 42)).unwrap();
+        drop(writer);
+
+        let mut importer = CaptureStore::open_for_ets_import(&path).unwrap();
+        assert_eq!(importer.import_ets(&ets_fixture("First")).unwrap(), 1);
+        assert_eq!(importer.import_ets(&ets_fixture("Second")).unwrap(), 2);
+        let address = "1/2/3".parse().unwrap();
+        assert_eq!(importer.ets_group(address).unwrap().unwrap().name, "Second");
+        assert_eq!(
+            importer.read_after(0, nz(10)).unwrap()[0]
+                .event
+                .frame()
+                .payload(),
+            &[0, 0x80, 42]
+        );
+        importer.backup_to(&backup).unwrap();
+        drop(importer);
+
+        let mut reader = CaptureStore::open_existing(&backup).unwrap();
+        assert_eq!(reader.ets_revision().unwrap(), Some(2));
+        assert_eq!(
+            reader.ets_group(address).unwrap().unwrap().dpts,
+            ["DPST-1-1", "DPST-1-6"]
+        );
+        assert!(matches!(
+            reader.import_ets(&ets_fixture("Third")),
+            Err(StorageError::ReadOnly)
+        ));
+        let revisions: i64 = reader
+            .connection
+            .query_row("SELECT COUNT(*) FROM ets_imports", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(revisions, 2);
+    }
+
+    #[test]
+    fn v2_migration_and_failed_ets_import_leave_capture_history_intact() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("captures.sqlite");
+        let mut writer = CaptureStore::open(&path, nz(10)).unwrap();
+        writer.insert(&event(tunnel(), 7)).unwrap();
+        drop(writer);
+        let legacy = Connection::open(&path).unwrap();
+        legacy.execute_batch("DROP INDEX idx_operation_audit_time; DROP TABLE operation_audit; DROP INDEX idx_ets_groups_address; DROP TABLE ets_groups; DROP TABLE ets_imports; PRAGMA user_version = 2;").unwrap();
+        drop(legacy);
+        assert_eq!(
+            CaptureStore::open_existing(&path)
+                .unwrap()
+                .ets_revision()
+                .unwrap(),
+            None
+        );
+
+        let mut importer = CaptureStore::open_for_ets_import(&path).unwrap();
+        assert_eq!(
+            schema_version(&importer.connection).unwrap(),
+            SCHEMA_VERSION
+        );
+        let address = "1/2/3".parse().unwrap();
+        assert_eq!(importer.import_ets(&ets_fixture("Good")).unwrap(), 1);
+        importer.connection.execute_batch("CREATE TRIGGER reject_second_ets_group BEFORE INSERT ON ets_groups WHEN NEW.revision = 2 BEGIN SELECT RAISE(ABORT, 'fixture rollback'); END;").unwrap();
+        assert!(matches!(
+            importer.import_ets(&ets_fixture("Rejected")),
+            Err(StorageError::Sqlite(_))
+        ));
+        assert_eq!(importer.ets_revision().unwrap(), Some(1));
+        assert_eq!(importer.ets_group(address).unwrap().unwrap().name, "Good");
+        assert_eq!(importer.read_after(0, nz(10)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn v3_audit_migration_preserves_ets_and_rolls_back_on_conflict() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v3.sqlite");
+        let mut writer = CaptureStore::open(&path, nz(10)).unwrap();
+        writer.insert(&event(tunnel(), 11)).unwrap();
+        writer.import_ets(&ets_fixture("Preserved")).unwrap();
+        drop(writer);
+        let legacy = Connection::open(&path).unwrap();
+        legacy.execute_batch("DROP INDEX idx_operation_audit_time; DROP TABLE operation_audit; PRAGMA user_version = 3;").unwrap();
+        drop(legacy);
+
+        let migrated = CaptureStore::open_for_ets_import(&path).unwrap();
+        assert_eq!(
+            schema_version(&migrated.connection).unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            migrated
+                .ets_group("1/2/3".parse().unwrap())
+                .unwrap()
+                .unwrap()
+                .name,
+            "Preserved"
+        );
+        assert_eq!(migrated.read_after(0, nz(10)).unwrap().len(), 1);
+        drop(migrated);
+
+        let conflicting = Connection::open(&path).unwrap();
+        conflicting.execute_batch("DROP INDEX idx_operation_audit_time; DROP TABLE operation_audit; CREATE TABLE operation_audit (marker TEXT); PRAGMA user_version = 3;").unwrap();
+        drop(conflicting);
+        assert!(matches!(
+            CaptureStore::open_for_ets_import(&path),
+            Err(StorageError::Sqlite(_))
+        ));
+        let check = Connection::open(&path).unwrap();
+        assert_eq!(schema_version(&check).unwrap(), 3);
+        let marker: i64 = check
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('operation_audit') WHERE name = 'marker'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, 1);
+        let revision: i64 = check
+            .query_row("SELECT MAX(revision) FROM ets_imports", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(revision, 1);
     }
 
     #[test]

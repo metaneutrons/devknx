@@ -23,11 +23,13 @@ multiple_crate_versions = "allow"
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
+csv = "1.4"
 eframe = { version = "0.36", optional = true, default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 interprocess = { version = "2.4.4", features = ["tokio"] }
 knx-rs-core = "0.10.1"
 knx-rs-ip = "0.10.1"
+quick-xml = "0.42"
 rusqlite = { version = "0.40", features = ["backup", "bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

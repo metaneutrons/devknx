@@ -7,14 +7,15 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use devknx::capture::{CaptureEndpoint, CaptureEvent, RoutingLossEvent};
-use devknx::ipc::{IpcClient, IpcMessage, WireState};
+use devknx::ipc::{IpcClient, IpcMessage, ReadOutcome, WireState};
+use devknx::operations::{OperationRequest, RawPayload};
 use devknx::storage::CaptureStore;
 use knx_rs_core::address::{DestinationAddress, GroupAddress, IndividualAddress};
 use knx_rs_core::cemi::CemiFrame;
 use knx_rs_core::message::MessageCode;
 use knx_rs_core::types::Priority;
-use knx_rs_ip::DeviceServer;
 use knx_rs_ip::RoutingLostMessage;
+use knx_rs_ip::{DeviceServer, ServerEvent};
 use rusqlite::{Connection, MAIN_DB};
 
 fn devknx(args: &[&str]) -> std::process::Output {
@@ -22,6 +23,15 @@ fn devknx(args: &[&str]) -> std::process::Output {
         .args(args)
         .output()
         .expect("run devknx")
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(output, "{byte:02x}").unwrap();
+    }
+    output
 }
 
 fn response_frame() -> CemiFrame {
@@ -48,10 +58,296 @@ fn help_describes_available_commands() {
     assert!(stdout.contains("backup"));
     assert!(stdout.contains("status"));
     assert!(stdout.contains("follow"));
+    assert!(stdout.contains("ets-import"));
+    assert!(stdout.contains("ets-lookup"));
+    assert!(stdout.contains("write-preview"));
+    assert!(stdout.contains("write-raw"));
+    assert!(stdout.contains("audit"));
     #[cfg(feature = "gui")]
     assert!(stdout.contains("gui"));
     #[cfg(not(feature = "gui"))]
     assert!(!stdout.contains("gui"));
+}
+
+#[test]
+fn ets_cli_import_lookup_and_invalid_replacement_are_atomic() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = directory.path().join("captures.sqlite");
+    let xml = directory.path().join("group-addresses.xml");
+    let database = database.to_str().expect("UTF-8 path");
+    let xml_path = xml.to_str().expect("UTF-8 path");
+    std::fs::write(&xml, "<GroupAddress-Export xmlns=\"http://knx.org/xml/ga-export/01\"><GroupRange Name=\"Lighting\"><GroupAddress Name=\"Hall\" Address=\"1/2/3\" Description=\"Main lamp\" DPTs=\"DPST-1-1,DPST-1-6\" /></GroupRange></GroupAddress-Export>").unwrap();
+    let imported = devknx(&[
+        "ets-import",
+        xml_path,
+        "--database",
+        database,
+        "--format",
+        "xml",
+    ]);
+    assert!(
+        imported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    assert!(String::from_utf8_lossy(&imported.stdout).contains("revision=1 groups=1"));
+    let lookup = devknx(&["ets-lookup", "--database", database, "1/2/3"]);
+    assert!(lookup.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&lookup.stdout).unwrap();
+    assert_eq!(value["group"]["name"], "Hall");
+    assert_eq!(
+        value["group"]["dpts"],
+        serde_json::json!(["DPST-1-1", "DPST-1-6"])
+    );
+
+    std::fs::write(&xml, "<GroupAddress-Export xmlns=\"http://knx.org/xml/ga-export/01\"><GroupRange Name=\"X\"><GroupAddress Name=\"A\" Address=\"1/2/3\" /><GroupAddress Name=\"B\" Address=\"2563\" /></GroupRange></GroupAddress-Export>").unwrap();
+    let rejected = devknx(&[
+        "ets-import",
+        xml_path,
+        "--database",
+        database,
+        "--format",
+        "xml",
+    ]);
+    assert!(!rejected.status.success());
+    let unchanged = devknx(&["ets-lookup", "--database", database, "2563"]);
+    let value: serde_json::Value = serde_json::from_slice(&unchanged.stdout).unwrap();
+    assert_eq!(value["revision"], 1);
+    assert_eq!(value["group"]["name"], "Hall");
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "single loopback scenario validates transport, response, timeout and audit in order"
+)]
+async fn loopback_operations_match_preview_audit_raw_and_observe_read_response_or_timeout() {
+    struct CaptureChild(Child);
+    impl Drop for CaptureChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("operations.sqlite");
+    let xml = directory.path().join("groups.xml");
+    std::fs::write(&xml, "<GroupAddress-Export xmlns=\"http://knx.org/xml/ga-export/01\"><GroupRange Name=\"Test\"><GroupAddress Name=\"Only boolean\" Address=\"1/2/5\" DPTs=\"DPST-1-1\" /></GroupRange></GroupAddress-Export>").unwrap();
+    assert!(
+        devknx(&[
+            "ets-import",
+            xml.to_str().unwrap(),
+            "--database",
+            path.to_str().unwrap(),
+            "--format",
+            "xml"
+        ])
+        .status
+        .success()
+    );
+    let mut server = DeviceServer::start_at("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let endpoint = format!("tunnel://{}", server.local_addr());
+    let child = Command::new(env!("CARGO_BIN_EXE_devknx"))
+        .args(["serve", &endpoint, "--database", path.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = CaptureChild(child);
+    let connected = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                panic!("capture owner exited: {status}");
+            }
+            if let Ok(mut client) = IpcClient::connect(&path, false).await
+                && matches!(
+                    client.next().await.unwrap(),
+                    Some(IpcMessage::State {
+                        value: WireState::Connected { .. }
+                    })
+                )
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    assert!(connected.is_ok(), "capture owner did not connect");
+
+    let rejected = IpcClient::operate(
+        &path,
+        &OperationRequest::TypedWrite {
+            address_raw: 0x0a05,
+            dpt: Some("5.010".to_owned()),
+            value: "42".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(rejected, IpcMessage::OperationError { reason } if reason.contains("not declared"))
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), server.recv())
+            .await
+            .is_err()
+    );
+
+    for (dpt, value) in [
+        ("1.001", "true"),
+        ("5.010", "42"),
+        ("9.001", "21.5"),
+        ("13.001", "123456"),
+    ] {
+        let preview = devknx(&["write-preview", "--dpt", dpt, "1/2/3", value]);
+        assert!(
+            preview.status.success(),
+            "{}",
+            String::from_utf8_lossy(&preview.stderr)
+        );
+        let preview: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+        let result = IpcClient::operate(
+            &path,
+            &OperationRequest::TypedWrite {
+                address_raw: 0x0a03,
+                dpt: Some(dpt.to_owned()),
+                value: value.to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        let transmitted = match result {
+            IpcMessage::OperationResult { raw_cemi, .. } => raw_cemi,
+            other => panic!("unexpected operation result: {other:?}"),
+        };
+        assert_eq!(preview["raw_cemi"], transmitted);
+        let Some(ServerEvent::TunnelFrame(frame)) =
+            tokio::time::timeout(Duration::from_secs(3), server.recv())
+                .await
+                .unwrap()
+        else {
+            panic!("server did not receive typed write");
+        };
+        let wire = hex(frame.as_bytes());
+        assert_eq!(wire, transmitted);
+    }
+
+    let raw = IpcClient::operate(
+        &path,
+        &OperationRequest::RawWrite {
+            address_raw: 0x0a03,
+            payload: RawPayload::Inline(1),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(raw, IpcMessage::OperationResult { .. }));
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(3), server.recv())
+            .await
+            .unwrap(),
+        Some(ServerEvent::TunnelFrame(_))
+    ));
+
+    let read_path = path.clone();
+    let read = tokio::spawn(async move {
+        IpcClient::operate(
+            &read_path,
+            &OperationRequest::Read {
+                address_raw: 0x0a03,
+                timeout_ms: 1_000,
+            },
+        )
+        .await
+        .unwrap()
+    });
+    let Some(ServerEvent::TunnelFrame(read_frame)) =
+        tokio::time::timeout(Duration::from_secs(3), server.recv())
+            .await
+            .unwrap()
+    else {
+        panic!("server did not receive read");
+    };
+    assert_eq!(read_frame.payload(), [0, 0]);
+    let unrelated = CemiFrame::new_l_data(
+        MessageCode::LDataInd,
+        IndividualAddress::from_raw(0x1101),
+        DestinationAddress::Group("1/2/4".parse().unwrap()),
+        Priority::Low,
+        &[0, 0x40, 1],
+    );
+    server.send_frame(unrelated).await.unwrap();
+    let matching = CemiFrame::new_l_data(
+        MessageCode::LDataInd,
+        IndividualAddress::from_raw(0x1101),
+        DestinationAddress::Group("1/2/3".parse().unwrap()),
+        Priority::Low,
+        &[0, 0x40, 1],
+    );
+    server.send_frame(matching.clone()).await.unwrap();
+    let result = read.await.unwrap();
+    let matching_hex = hex(matching.as_bytes());
+    assert!(
+        matches!(result, IpcMessage::OperationResult { read: Some(ReadOutcome::Response { raw_cemi }), .. } if raw_cemi == matching_hex)
+    );
+
+    let no_response = IpcClient::operate(
+        &path,
+        &OperationRequest::Read {
+            address_raw: 0x0a03,
+            timeout_ms: 50,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        no_response,
+        IpcMessage::OperationResult {
+            read: Some(ReadOutcome::NoResponse),
+            ..
+        }
+    ));
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(3), server.recv())
+            .await
+            .unwrap(),
+        Some(ServerEvent::TunnelFrame(_))
+    ));
+
+    let connection = Connection::open(&path).unwrap();
+    let raw_count: i64 = connection.query_row("SELECT COUNT(*) FROM operation_audit WHERE kind = 'raw_write' AND status = 'transmitted'", [], |row| row.get(0)).unwrap();
+    let typed_count: i64 = connection.query_row("SELECT COUNT(*) FROM operation_audit WHERE kind = 'typed_write' AND status = 'transmitted'", [], |row| row.get(0)).unwrap();
+    assert_eq!(raw_count, 1);
+    assert_eq!(typed_count, 4);
+    let captures = CaptureStore::open_existing(&path)
+        .unwrap()
+        .read_after(0, NonZeroU32::new(100).unwrap())
+        .unwrap();
+    assert_eq!(
+        captures
+            .iter()
+            .filter(|row| row.event.direction() == devknx::capture::CaptureDirection::Sent)
+            .count(),
+        7
+    );
+    let audit = devknx(&["audit", "--database", path.to_str().unwrap()]);
+    assert!(audit.status.success());
+    let rows: Vec<serde_json::Value> = String::from_utf8(audit.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 7);
+    assert!(
+        rows.iter()
+            .any(|row| row["kind"] == "raw_write" && row["status"] == "transmitted")
+    );
+    drop(child);
+    server.stop().await;
 }
 
 #[test]

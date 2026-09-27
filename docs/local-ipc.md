@@ -1,11 +1,26 @@
-# Local capture protocol (development version 2)
+# Local capture protocol (development version 3)
 
 `devknx serve` owns the configured KNXnet/IP connection and SQLite writer.
 `devknx status --database PATH` requests one current connection state.
 `devknx follow --database PATH` receives that state and subsequent state,
 capture, router-loss, and application-subscriber-lag records as newline-delimited JSON.
 
-The client sends exactly one seven-byte command: `STATUS\n` or `FOLLOW\n`.
+The client sends `STATUS\n` or `FOLLOW\n` for status or the live stream.
+For one group operation it sends `OPERATE\n` followed by one bounded JSON line
+containing a tagged `read`, `typed_write`, or `raw_write` intent. Pre-encoded
+frames are not accepted: the connection owner resolves ETS metadata, validates
+the DPT and value, constructs the cEMI frame, and records an audit attempt
+before calling the transport. The reply is one JSON line with `type` set to
+`operation_result` or `operation_error`. A successful result includes an audit
+ID, a sent-capture ID, and exact transmitted cEMI bytes. For a read, `read`
+is separately tagged `response` with the matching response frame, or
+`no_response` after the requested timeout. A local subscriber lag during
+response observation is an error, not a timeout.
+The response match uses the requested group address and an observation after
+the sent-capture ID. KNX group reads have no transaction ID, so an unrelated
+response to the same address during that interval cannot be distinguished.
+A connection interruption while waiting is reported as an error rather than
+`no_response`.
 The server closes unknown commands. Each JSON record has a `type` discriminator:
 `state`, `capture`, `routing_lost_message`, or `lagged`. A `state` record has a `value.state`
 discriminator (`idle`, `connecting`, `connected`, `waiting_retry`, `stopped`,
@@ -33,8 +48,8 @@ Windows, the endpoint is a named pipe with a DACL granting access only to the
 current process user SID. The pipe requires first-instance creation and rejects
 remote clients. This is local transport protection, not remote authentication.
 
-There is no automatic startup, replay request, version negotiation, or write
-operation in this development protocol. Durable replay is read from SQLite
+There is no automatic startup, replay request, or version negotiation in this
+development protocol. Durable replay is read from SQLite
 with `history`, `router-losses`, or `export`; frontends must not interpret a transient stream as
 complete history. A stable wire contract will be specified before the REST,
 MCP, GUI, and TUI adapters rely on it.

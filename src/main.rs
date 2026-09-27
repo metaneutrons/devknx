@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Fabian Schmieder
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use devknx::capture::{CaptureEvent, RoutingLossEvent};
+use devknx::ets::{CsvEncoding, EtsCatalog, EtsFormat, parse_group_address};
 use devknx::ipc::{IpcClient, IpcMessage, IpcServer};
+use devknx::operations::{OperationRequest, RawPayload, prepare};
 use devknx::service::{CaptureService, LiveRoutingLoss, ReconnectPolicy};
 use devknx::storage::CaptureStore;
 use knx_rs_ip::{ConnectionSpec, discovery, parse_url};
@@ -23,6 +25,21 @@ mod gui;
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum EtsInputFormat {
+    Csv,
+    Xml,
+}
+
+impl From<EtsInputFormat> for EtsFormat {
+    fn from(value: EtsInputFormat) -> Self {
+        match value {
+            EtsInputFormat::Csv => Self::Csv31,
+            EtsInputFormat::Xml => Self::GaXml01,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -105,12 +122,101 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Transactionally replace ETS group-address metadata (stop `serve` first).
+    EtsImport {
+        /// Existing ETS CSV 3/1 or GA Export 01 XML file.
+        file: PathBuf,
+        /// Capture database to enrich, or a new database to create.
+        #[arg(long)]
+        database: PathBuf,
+        /// Export format; explicit to avoid guessing from a filename.
+        #[arg(long, value_enum)]
+        format: EtsInputFormat,
+        /// Decode legacy CSV as ISO-8859-1 instead of strict UTF-8.
+        #[arg(long)]
+        latin1: bool,
+    },
+    /// Read active ETS metadata for one group address.
+    EtsLookup {
+        /// Existing capture database.
+        #[arg(long)]
+        database: PathBuf,
+        /// Three-level, two-level, decimal, or ETS hexadecimal group address.
+        address: String,
+    },
+    /// Preview exact DPT-encoded cEMI bytes without sending.
+    WritePreview {
+        /// Existing capture database for ETS DPT declarations.
+        #[arg(long)]
+        database: Option<PathBuf>,
+        /// Explicit DPT, required when ETS is absent or ambiguous.
+        #[arg(long)]
+        dpt: Option<String>,
+        /// KNX group address.
+        address: String,
+        /// Typed value, for example `true`, `42`, or `21.5`.
+        value: String,
+    },
+    /// Transmit a DPT-validated group value through the active `serve` owner.
+    Write {
+        /// Database owned by the active capture process.
+        #[arg(long)]
+        database: PathBuf,
+        /// Explicit DPT, required when ETS is absent or ambiguous.
+        #[arg(long)]
+        dpt: Option<String>,
+        /// KNX group address.
+        address: String,
+        /// Typed value.
+        value: String,
+    },
+    /// Send an explicit raw group value; expert use only, audited separately.
+    WriteRaw {
+        /// Database owned by the active capture process.
+        #[arg(long)]
+        database: PathBuf,
+        /// Inline APCI value, 0–63; exclusive with `--bytes`.
+        #[arg(long, conflicts_with = "bytes")]
+        inline: Option<u8>,
+        /// Complete octets in hexadecimal; exclusive with `--inline`.
+        #[arg(long, conflicts_with = "inline")]
+        bytes: Option<String>,
+        /// KNX group address.
+        address: String,
+    },
+    /// Send a group read and report a matching response or no response.
+    Read {
+        /// Database owned by the active capture process.
+        #[arg(long)]
+        database: PathBuf,
+        /// Response deadline in milliseconds (1–30000).
+        #[arg(long, default_value_t = 2_000)]
+        timeout_ms: u32,
+        /// KNX group address.
+        address: String,
+    },
+    /// Read durable operation attempts, including raw/typed distinction.
+    Audit {
+        /// Existing capture database.
+        #[arg(long)]
+        database: PathBuf,
+        /// Exclusive audit cursor.
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        /// Maximum rows to print (1–1000).
+        #[arg(long, default_value_t = NonZeroU32::new(100).expect("nonzero"))]
+        limit: NonZeroU32,
+    },
     /// Open the native desktop application.
     #[cfg(feature = "gui")]
     Gui,
 }
 
 #[tokio::main]
+#[expect(
+    clippy::too_many_lines,
+    reason = "top-level CLI dispatch names each application command explicitly"
+)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match Cli::parse().command {
         Some(Command::Discover) => {
@@ -175,6 +281,132 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let store = CaptureStore::open_existing(&database)?;
             store.backup_to(&output)?;
         }
+        Some(Command::EtsImport {
+            file,
+            database,
+            format,
+            latin1,
+        }) => {
+            let encoding = if latin1 {
+                CsvEncoding::Latin1
+            } else {
+                CsvEncoding::Utf8
+            };
+            let catalog = EtsCatalog::from_file(&file, format.into(), encoding)?;
+            let groups = catalog.len();
+            let mut store = CaptureStore::open_for_ets_import(&database)?;
+            let revision = store.import_ets(&catalog)?;
+            println!("revision={revision} groups={groups}");
+        }
+        Some(Command::EtsLookup { database, address }) => {
+            let store = CaptureStore::open_existing(&database)?;
+            let address = parse_group_address(&address)?;
+            let result = serde_json::json!({
+                "revision": store.ets_revision()?,
+                "address_raw": address.raw(),
+                "group": store.ets_group(address)?,
+            });
+            println!("{}", serde_json::to_string(&result)?);
+        }
+        Some(Command::WritePreview {
+            database,
+            dpt,
+            address,
+            value,
+        }) => {
+            let address_raw = parse_group_address(&address)?.raw();
+            let group = match database {
+                Some(database) => CaptureStore::open_existing(&database)?
+                    .ets_group(knx_rs_core::address::GroupAddress::from_raw(address_raw))?,
+                None => None,
+            };
+            let prepared = prepare(
+                OperationRequest::TypedWrite {
+                    address_raw,
+                    dpt,
+                    value,
+                },
+                group.as_ref(),
+            )?;
+            let result = serde_json::json!({
+                "address_raw": address_raw,
+                "dpt": prepared.dpt.map(|dpt| dpt.to_string()),
+                "raw_cemi": to_hex(prepared.frame.as_bytes()),
+                "transmitted": false,
+            });
+            println!("{}", serde_json::to_string(&result)?);
+        }
+        Some(Command::Write {
+            database,
+            dpt,
+            address,
+            value,
+        }) => {
+            let address_raw = parse_group_address(&address)?.raw();
+            execute_remote_operation(
+                &database,
+                OperationRequest::TypedWrite {
+                    address_raw,
+                    dpt,
+                    value,
+                },
+            )
+            .await?;
+        }
+        Some(Command::WriteRaw {
+            database,
+            inline,
+            bytes,
+            address,
+        }) => {
+            let address_raw = parse_group_address(&address)?.raw();
+            let payload = match (inline, bytes) {
+                (Some(value), None) => RawPayload::Inline(value),
+                (None, Some(bytes)) => RawPayload::Bytes(parse_hex_bytes(&bytes)?),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "specify --inline or --bytes",
+                    )
+                    .into());
+                }
+            };
+            execute_remote_operation(
+                &database,
+                OperationRequest::RawWrite {
+                    address_raw,
+                    payload,
+                },
+            )
+            .await?;
+        }
+        Some(Command::Read {
+            database,
+            timeout_ms,
+            address,
+        }) => {
+            let address_raw = parse_group_address(&address)?.raw();
+            execute_remote_operation(
+                &database,
+                OperationRequest::Read {
+                    address_raw,
+                    timeout_ms,
+                },
+            )
+            .await?;
+        }
+        Some(Command::Audit {
+            database,
+            after,
+            limit,
+        }) => {
+            let store = CaptureStore::open_existing(&database)?;
+            let stdout = io::stdout();
+            let mut output = stdout.lock();
+            for entry in store.read_operation_audit_after(after, limit)? {
+                writeln!(output, "{}", serde_json::to_string(&entry)?)?;
+            }
+        }
         #[cfg(feature = "gui")]
         Some(Command::Gui) | None => gui::run()?,
         #[cfg(not(feature = "gui"))]
@@ -184,6 +416,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+async fn execute_remote_operation(
+    database: &std::path::Path,
+    request: OperationRequest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let result = IpcClient::operate(database, &request).await?;
+    match result {
+        IpcMessage::OperationResult { .. } => {
+            println!("{}", serde_json::to_string(&result)?);
+            Ok(())
+        }
+        IpcMessage::OperationError { reason } => Err(io::Error::other(reason).into()),
+        _ => Err(io::Error::other("unexpected operation response").into()),
+    }
+}
+
+fn parse_hex_bytes(value: &str) -> Result<Vec<u8>, io::Error> {
+    let value = value.trim();
+    if value.is_empty() || !value.len().is_multiple_of(2) || value.len() > 64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "raw bytes need 1–32 hexadecimal octets",
+        ));
+    }
+    value
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "non-ASCII hex"))?;
+            u8::from_str_radix(pair, 16)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid hex byte"))
+        })
+        .collect()
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(output, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    output
 }
 
 async fn run_service(
@@ -204,8 +481,10 @@ async fn run_service(
     let ipc_states = service.subscribe_state();
     let ipc_frames = service.subscribe_frames();
     let ipc_routing_losses = service.subscribe_routing_losses();
+    let ipc_operations = service.operation_sender();
     let ipc = IpcServer::bind(&database)?;
-    let mut ipc_task = tokio::spawn(ipc.run(ipc_states, ipc_frames, ipc_routing_losses));
+    let mut ipc_task =
+        tokio::spawn(ipc.run(ipc_states, ipc_frames, ipc_routing_losses, ipc_operations));
     let (stop_tx, stop_rx) = oneshot::channel();
     let mut task = tokio::spawn(async move {
         let mut service = service;

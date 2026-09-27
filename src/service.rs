@@ -17,9 +17,10 @@ use std::time::Duration;
 
 use knx_rs_ip::{ConnectionSpec, KnxConnection, KnxReceiveEvent, connect};
 use thiserror::Error;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::capture::{CaptureEndpoint, CaptureEvent, RoutingLossEvent};
+use crate::operations::{OperationRequest, prepare};
 use crate::storage::{CaptureStore, StorageError};
 
 /// Current lifecycle state of one configured connection.
@@ -69,6 +70,25 @@ pub struct LiveRoutingLoss {
     pub id: Option<i64>,
     /// Router source, device state and reported count.
     pub event: RoutingLossEvent,
+}
+
+/// A local operation request sent to the sole connection owner.
+pub struct OperationEnvelope {
+    /// Intent, never a caller-supplied pre-encoded frame.
+    pub request: OperationRequest,
+    /// Transmission receipt or validation/transport error.
+    pub response: oneshot::Sender<Result<OperationReceipt, String>>,
+}
+
+/// A confirmed transport send, not confirmation of actuator state.
+#[derive(Clone, Debug)]
+pub struct OperationReceipt {
+    /// Durable audit ID.
+    pub audit_id: i64,
+    /// Durable sent-capture ID.
+    pub capture_id: i64,
+    /// Exact bytes passed to the transport.
+    pub raw_cemi: Vec<u8>,
 }
 
 /// Reconnection delay policy.
@@ -121,6 +141,8 @@ pub struct CaptureService {
     state_tx: watch::Sender<ConnectionState>,
     frames_tx: broadcast::Sender<LiveCapture>,
     routing_losses_tx: broadcast::Sender<LiveRoutingLoss>,
+    operations_tx: mpsc::Sender<OperationEnvelope>,
+    operations_rx: mpsc::Receiver<OperationEnvelope>,
 }
 
 impl CaptureService {
@@ -136,6 +158,7 @@ impl CaptureService {
         let (state_tx, _) = watch::channel(ConnectionState::Idle);
         let (frames_tx, _) = broadcast::channel(event_capacity.get());
         let (routing_losses_tx, _) = broadcast::channel(event_capacity.get());
+        let (operations_tx, operations_rx) = mpsc::channel(32);
         Self {
             spec,
             endpoint,
@@ -144,6 +167,8 @@ impl CaptureService {
             state_tx,
             frames_tx,
             routing_losses_tx,
+            operations_tx,
+            operations_rx,
         }
     }
 
@@ -165,6 +190,65 @@ impl CaptureService {
         self.routing_losses_tx.subscribe()
     }
 
+    /// A bounded channel to request validated operations from the connection owner.
+    #[must_use]
+    pub fn operation_sender(&self) -> mpsc::Sender<OperationEnvelope> {
+        self.operations_tx.clone()
+    }
+
+    async fn execute_operation<C: KnxConnection + Sync>(
+        &mut self,
+        connection: &C,
+        request: OperationRequest,
+    ) -> Result<Result<OperationReceipt, String>, ServiceError> {
+        let Some(store) = self.store.as_mut() else {
+            return Ok(Err(
+                "operations require a persistent capture store".to_owned()
+            ));
+        };
+        let address_raw = match &request {
+            OperationRequest::Read { address_raw, .. }
+            | OperationRequest::TypedWrite { address_raw, .. }
+            | OperationRequest::RawWrite { address_raw, .. } => *address_raw,
+        };
+        let group = store.ets_group(knx_rs_core::address::GroupAddress::from_raw(address_raw))?;
+        let prepared = match prepare(request, group.as_ref()) {
+            Ok(prepared) => prepared,
+            Err(error) => return Ok(Err(error.to_string())),
+        };
+        let kind = match &prepared.request {
+            OperationRequest::Read { .. } => "read",
+            OperationRequest::TypedWrite { .. } => "typed_write",
+            OperationRequest::RawWrite { .. } => "raw_write",
+        };
+        let dpt = prepared.dpt.map(|value| value.to_string());
+        let raw_cemi = prepared.frame.as_bytes().to_vec();
+        let audit_id = store.start_operation_audit(
+            "local_ipc",
+            kind,
+            address_raw,
+            dpt.as_deref(),
+            &raw_cemi,
+        )?;
+        if let Err(error) = connection.send(prepared.frame.clone()).await {
+            let detail = error.to_string();
+            store.finish_operation_audit(audit_id, false, Some(&detail))?;
+            return Ok(Err(format!("KNXnet/IP transmission failed: {detail}")));
+        }
+        store.finish_operation_audit(audit_id, true, None)?;
+        let event = CaptureEvent::sent(self.endpoint, prepared.frame);
+        let capture_id = store.insert(&event)?;
+        let _ = self.frames_tx.send(LiveCapture {
+            id: Some(capture_id),
+            event,
+        });
+        Ok(Ok(OperationReceipt {
+            audit_id,
+            capture_id,
+            raw_cemi,
+        }))
+    }
+
     /// Run until shutdown, retrying failed or closed connections.
     ///
     /// # Errors
@@ -173,23 +257,27 @@ impl CaptureService {
     /// state transitions and are retried, not returned as terminal errors.
     pub async fn run_until<S>(&mut self, shutdown: S) -> Result<(), ServiceError>
     where
-        S: Future<Output = ()>,
+        S: Future<Output = ()> + Send,
     {
         let spec = self.spec.clone();
         self.run_with(move || connect(spec.clone()), shutdown).await
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "connection lifecycle and event handling remain in one owner loop"
+    )]
     async fn run_with<C, F, Fut, E, S>(
         &mut self,
         mut connector: F,
         shutdown: S,
     ) -> Result<(), ServiceError>
     where
-        C: KnxConnection,
-        F: FnMut() -> Fut,
-        Fut: Future<Output = Result<C, E>>,
-        E: fmt::Display,
-        S: Future<Output = ()>,
+        C: KnxConnection + Sync,
+        F: FnMut() -> Fut + Send,
+        Fut: Future<Output = Result<C, E>> + Send,
+        E: fmt::Display + Send,
+        S: Future<Output = ()> + Send,
     {
         let mut shutdown = Box::pin(shutdown);
         let mut attempt = 0_u64;
@@ -198,13 +286,22 @@ impl CaptureService {
             attempt = attempt.saturating_add(1);
             self.state_tx
                 .send_replace(ConnectionState::Connecting { attempt });
-            let connection = tokio::select! {
-                biased;
-                () = &mut shutdown => {
-                    self.state_tx.send_replace(ConnectionState::Stopped);
-                    return Ok(());
+            let connect_attempt = connector();
+            tokio::pin!(connect_attempt);
+            let connection = loop {
+                tokio::select! {
+                    biased;
+                    () = &mut shutdown => {
+                        self.state_tx.send_replace(ConnectionState::Stopped);
+                        return Ok(());
+                    }
+                    operation = self.operations_rx.recv() => {
+                        if let Some(operation) = operation {
+                            let _ = operation.response.send(Err("KNXnet/IP connection is connecting".to_owned()));
+                        }
+                    }
+                    result = &mut connect_attempt => break result,
                 }
-                result = connector() => result,
             };
             let reason = match connection {
                 Ok(mut connection) => {
@@ -218,6 +315,26 @@ impl CaptureService {
                                 connection.close().await;
                                 self.state_tx.send_replace(ConnectionState::Stopped);
                                 return Ok(());
+                            }
+                            operation = self.operations_rx.recv() => {
+                                if let Some(operation) = operation {
+                                    if operation.response.is_closed() {
+                                        continue;
+                                    }
+                                    match self.execute_operation(&connection, operation.request).await {
+                                        Ok(result) => {
+                                            let _ = operation.response.send(result);
+                                        }
+                                        Err(error) => {
+                                            connection.close().await;
+                                            self.state_tx.send_replace(ConnectionState::StorageFailed {
+                                                reason: error.to_string(),
+                                            });
+                                            return Err(error);
+                                        }
+                                    }
+                                }
+                                continue;
                             }
                             event = connection.recv_event() => event,
                         };
@@ -272,13 +389,22 @@ impl CaptureService {
             };
             self.state_tx
                 .send_replace(ConnectionState::WaitingRetry { reason, delay });
-            tokio::select! {
-                biased;
-                () = &mut shutdown => {
-                    self.state_tx.send_replace(ConnectionState::Stopped);
-                    return Ok(());
+            let sleep = tokio::time::sleep(delay);
+            tokio::pin!(sleep);
+            loop {
+                tokio::select! {
+                    biased;
+                    () = &mut shutdown => {
+                        self.state_tx.send_replace(ConnectionState::Stopped);
+                        return Ok(());
+                    }
+                    operation = self.operations_rx.recv() => {
+                        if let Some(operation) = operation {
+                            let _ = operation.response.send(Err("KNXnet/IP connection is disconnected".to_owned()));
+                        }
+                    }
+                    () = &mut sleep => break,
                 }
-                () = tokio::time::sleep(delay) => {}
             }
             delay = delay.saturating_mul(2).min(self.policy.maximum);
         }
@@ -740,6 +866,65 @@ mod tests {
         result.unwrap();
         assert_eq!(closed.load(Ordering::SeqCst), 2);
         assert_eq!(*states.borrow(), ConnectionState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn queued_operation_is_rejected_during_retry_not_sent_after_reconnect() {
+        let policy =
+            ReconnectPolicy::new(Duration::from_millis(100), Duration::from_millis(100)).unwrap();
+        let mut service = CaptureService::new(spec(), None, policy, capacity(1));
+        let mut states = service.subscribe_state();
+        let operations = service.operation_sender();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let connector = || async {
+            Ok::<_, &'static str>(FakeConnection {
+                frames: VecDeque::new(),
+                close_when_empty: true,
+                closed: Arc::new(AtomicUsize::new(0)),
+                received: Arc::new(AtomicUsize::new(0)),
+            })
+        };
+        let observer = async {
+            loop {
+                states.changed().await.unwrap();
+                if matches!(
+                    &*states.borrow_and_update(),
+                    ConnectionState::WaitingRetry { .. }
+                ) {
+                    break;
+                }
+            }
+            let (response, receiver) = oneshot::channel();
+            operations
+                .send(OperationEnvelope {
+                    request: OperationRequest::RawWrite {
+                        address_raw: 0x0a03,
+                        payload: crate::operations::RawPayload::Inline(1),
+                    },
+                    response,
+                })
+                .await
+                .unwrap();
+            assert!(
+                receiver
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .contains("disconnected")
+            );
+            stop_tx.send(()).unwrap();
+        };
+        let (result, ()) = timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                service.run_with(connector, async {
+                    let _ = stop_rx.await;
+                }),
+                observer
+            )
+        })
+        .await
+        .unwrap();
+        result.unwrap();
     }
 
     #[tokio::test]

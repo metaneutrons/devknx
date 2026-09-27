@@ -30,6 +30,20 @@ pub enum Capability {
     ServiceFollow,
     /// Read router-reported routing losses from the persistent database.
     RouterLossHistory,
+    /// Import versioned ETS display and DPT metadata.
+    EtsImport,
+    /// Look up active ETS metadata by canonical address.
+    EtsLookup,
+    /// Preview a typed write without transmission.
+    WritePreview,
+    /// Transmit a DPT-validated group write.
+    TypedWrite,
+    /// Transmit an explicitly raw group write.
+    RawWrite,
+    /// Read a group value and await a matching response.
+    GroupRead,
+    /// Read durable operation audit records.
+    OperationAudit,
 }
 
 /// All currently implemented user-facing operations.
@@ -43,6 +57,13 @@ pub const ALL: &[Capability] = &[
     Capability::ServiceStatus,
     Capability::ServiceFollow,
     Capability::RouterLossHistory,
+    Capability::EtsImport,
+    Capability::EtsLookup,
+    Capability::WritePreview,
+    Capability::TypedWrite,
+    Capability::RawWrite,
+    Capability::GroupRead,
+    Capability::OperationAudit,
 ];
 
 /// An application surface that exposes capabilities.
@@ -101,6 +122,34 @@ pub const CLI: &[Declaration] = &[
         capability: Capability::RouterLossHistory,
         source_anchor: "Some(Command::RouterLosses {",
     },
+    Declaration {
+        capability: Capability::EtsImport,
+        source_anchor: "Some(Command::EtsImport {",
+    },
+    Declaration {
+        capability: Capability::EtsLookup,
+        source_anchor: "Some(Command::EtsLookup {",
+    },
+    Declaration {
+        capability: Capability::WritePreview,
+        source_anchor: "Some(Command::WritePreview {",
+    },
+    Declaration {
+        capability: Capability::TypedWrite,
+        source_anchor: "Some(Command::Write {",
+    },
+    Declaration {
+        capability: Capability::RawWrite,
+        source_anchor: "Some(Command::WriteRaw {",
+    },
+    Declaration {
+        capability: Capability::GroupRead,
+        source_anchor: "Some(Command::Read {",
+    },
+    Declaration {
+        capability: Capability::OperationAudit,
+        source_anchor: "Some(Command::Audit {",
+    },
 ];
 
 /// Operations exposed by the native GUI in `src/gui.rs`.
@@ -126,6 +175,55 @@ pub struct Gap {
 
 /// Reviewed CLI/GUI differences. A new or removed difference requires an edit here.
 pub const GAPS: &[Gap] = &[
+    Gap {
+        capability: Capability::OperationAudit,
+        present_on: Surface::Cli,
+        missing_on: Surface::Gui,
+        reason: "The GUI audit view is part of M4.",
+        target_issue: "https://github.com/metaneutrons/devknx/issues/7",
+    },
+    Gap {
+        capability: Capability::WritePreview,
+        present_on: Surface::Cli,
+        missing_on: Surface::Gui,
+        reason: "The GUI write-preview control is part of M4.",
+        target_issue: "https://github.com/metaneutrons/devknx/issues/7",
+    },
+    Gap {
+        capability: Capability::TypedWrite,
+        present_on: Surface::Cli,
+        missing_on: Surface::Gui,
+        reason: "The GUI typed-write control is part of M4.",
+        target_issue: "https://github.com/metaneutrons/devknx/issues/7",
+    },
+    Gap {
+        capability: Capability::RawWrite,
+        present_on: Surface::Cli,
+        missing_on: Surface::Gui,
+        reason: "Expert raw sending is not exposed by the GUI shell.",
+        target_issue: "https://github.com/metaneutrons/devknx/issues/7",
+    },
+    Gap {
+        capability: Capability::GroupRead,
+        present_on: Surface::Cli,
+        missing_on: Surface::Gui,
+        reason: "The GUI group-read control is part of M4.",
+        target_issue: "https://github.com/metaneutrons/devknx/issues/7",
+    },
+    Gap {
+        capability: Capability::EtsImport,
+        present_on: Surface::Cli,
+        missing_on: Surface::Gui,
+        reason: "The GUI has no ETS import control until M4.",
+        target_issue: "https://github.com/metaneutrons/devknx/issues/7",
+    },
+    Gap {
+        capability: Capability::EtsLookup,
+        present_on: Surface::Cli,
+        missing_on: Surface::Gui,
+        reason: "The GUI has no ETS metadata view until M4.",
+        target_issue: "https://github.com/metaneutrons/devknx/issues/7",
+    },
     Gap {
         capability: Capability::LiveCapture,
         present_on: Surface::Cli,

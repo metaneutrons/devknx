@@ -3,7 +3,9 @@
 
 //! Current-user local IPC for an independent capture process.
 //!
-//! Unix sockets live below a private directory beside the capture database.
+//! Unix sockets live below a private directory beside the capture database,
+//! or below a short private directory in `/tmp` if the adjacent path exceeds
+//! the portable Unix-domain socket path limit.
 //! Windows named pipes use a protected DACL for the current process SID. The
 //! first pipe instance must be created by this server; a pre-existing instance
 //! makes startup fail rather than silently accepting an impostor endpoint.
@@ -151,7 +153,9 @@ fn hex(bytes: &[u8]) -> String {
 
 #[cfg(unix)]
 fn socket_path(database: &Path, create: bool) -> io::Result<PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+    use std::hash::{Hash as _, Hasher as _};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 
     let database = database.canonicalize()?;
     let mut directory_name = database
@@ -159,7 +163,16 @@ fn socket_path(database: &Path, create: bool) -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing database filename"))?
         .to_os_string();
     directory_name.push(".ipc");
-    let directory = database.with_file_name(directory_name);
+    let adjacent = database.with_file_name(directory_name);
+    // Darwin has a shorter sun_path than Linux. Stay below both limits, including
+    // the terminating NUL, instead of letting the bind fail on ordinary TMPDIRs.
+    let directory = if adjacent.join("control.sock").as_os_str().as_bytes().len() < 100 {
+        adjacent
+    } else {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        database.hash(&mut hasher);
+        Path::new("/tmp").join(format!("devknx-ipc-{:016x}", hasher.finish()))
+    };
     if create {
         let mut builder = std::fs::DirBuilder::new();
         builder.mode(0o700);
@@ -170,10 +183,13 @@ fn socket_path(database: &Path, create: bool) -> io::Result<PathBuf> {
         }
     }
     let metadata = std::fs::symlink_metadata(&directory)?;
-    if !metadata.file_type().is_dir() || metadata.permissions().mode() & 0o077 != 0 {
+    if !metadata.file_type().is_dir()
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.uid() != database.metadata()?.uid()
+    {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "local IPC directory must be a private, non-symlink directory",
+            "local IPC directory must be private, owned by the database owner, and not a symlink",
         ));
     }
     Ok(directory.join("control.sock"))
@@ -438,7 +454,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn local_ipc_rejects_shared_or_symlink_directories() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
         let database = directory.path().join("captures.sqlite");
         drop(CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap());
         let ipc_directory = directory.path().join("captures.sqlite.ipc");
@@ -459,7 +475,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn local_ipc_rejects_symlink_owner_lock() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
         let database = directory.path().join("captures.sqlite");
         drop(CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap());
         let ipc_directory = directory.path().join("captures.sqlite.ipc");
@@ -473,5 +489,40 @@ mod tests {
             Err(IpcError::Io(error)) if error.kind() == io::ErrorKind::InvalidInput
         ));
         assert_eq!(std::fs::read(&victim).unwrap(), b"unchanged");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn long_database_path_uses_short_private_ipc_directory() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let long_directory = directory.path().join("long-path-component-".repeat(5));
+        std::fs::create_dir(&long_directory).unwrap();
+        let database = long_directory.join("captures.sqlite");
+        drop(CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap());
+
+        let path = socket_path(&database, true).unwrap();
+        assert_eq!(path.parent().unwrap().parent(), Some(Path::new("/tmp")));
+        assert!(
+            path.parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .as_bytes()
+                .starts_with(b"devknx-ipc-")
+        );
+        assert!(path.as_os_str().as_bytes().len() < 100);
+        assert_eq!(path, socket_path(&database, false).unwrap());
+        assert!(IpcServer::bind(&database).is_ok());
+
+        let ipc_directory = path.parent().unwrap();
+        std::fs::set_permissions(ipc_directory, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(matches!(
+            socket_path(&database, false),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        std::fs::set_permissions(ipc_directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(ipc_directory).unwrap();
     }
 }

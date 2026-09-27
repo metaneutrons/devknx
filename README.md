@@ -106,7 +106,8 @@ auto-start. One writable owner
 per database is enforced by a sidecar `.writer.lock` file, which is retained
 across restarts and must not be deleted while capture runs. On Unix, a writable
 capture directory must not be group- or world-writable. The Unix IPC socket
-lives under a private directory beside the database; the Windows named pipe
+normally lives under a private directory beside the database, with a short
+private `/tmp` fallback for Unix socket path limits; the Windows named pipe
 uses a current-user access-control list. The GUI and other surfaces do not yet
 attach to this stream.
 The [local IPC protocol](docs/local-ipc.md) is documented for development

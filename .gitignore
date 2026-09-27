@@ -6,6 +6,8 @@ dist/
 *.iconset/
 **/*.rs.bk
 *.pdb
+__pycache__/
+*.pyc
 
 # Coverage
 lcov.info

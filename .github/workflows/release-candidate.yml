@@ -1,0 +1,243 @@
+name: Release candidate packaging
+
+# This workflow produces short-lived CI artifacts only. It cannot create a
+# GitHub Release, push a package, sign with publication credentials, or tag.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/release-candidate.yml
+      - Cargo.toml
+      - Cargo.lock
+      - scripts/release/**
+      - scripts/build-macos-app.sh
+      - licenses/**
+      - THIRD-PARTY-NOTICES.md
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: candidate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package-tests:
+    name: Package script probes
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - run: python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
+      - run: bash -n scripts/release/build-deb.sh scripts/build-macos-app.sh
+
+  build-linux:
+    name: Build Linux ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu, kind: gnu }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, kind: gnu }
+          - { runner: ubuntu-24.04, target: x86_64-unknown-linux-musl, kind: musl }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, kind: musl }
+    runs-on: ${{ matrix.runner }}
+    container: rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: rustup show
+      - name: Install native build dependencies
+        run: |
+          set -euo pipefail
+          apt-get update
+          if [[ '${{ matrix.kind }}' == gnu ]]; then
+            apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-0
+          else
+            apt-get install -y musl-tools
+            rustup target add '${{ matrix.target }}'
+          fi
+      - name: Build shipping features
+        run: |
+          set -euo pipefail
+          if [[ '${{ matrix.kind }}' == gnu ]]; then
+            cargo build --release --locked --no-default-features --features full
+            binary=target/release/devknx
+          else
+            cargo build --release --locked --no-default-features --target '${{ matrix.target }}'
+            binary=target/${{ matrix.target }}/release/devknx
+          fi
+          mkdir -p candidate
+          command cp "$binary" candidate/devknx
+          chmod +x candidate/devknx
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-${{ matrix.target }}
+          path: candidate/devknx
+          if-no-files-found: error
+          retention-days: 7
+
+  package-linux:
+    name: Package Linux ${{ matrix.target }}
+    needs: [package-tests, build-linux]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu, kind: gnu }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, kind: gnu }
+          - { runner: ubuntu-24.04, target: x86_64-unknown-linux-musl, kind: musl }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, kind: musl }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-${{ matrix.target }}
+          path: native
+      - name: Create and smoke-test CLI archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x native/devknx
+          version=$(cargo metadata --offline --no-deps --locked --format-version 1 |
+            jq -r '.packages[] | select(.name == "devknx") | .version')
+          tag="v$version"
+          epoch=$(git show -s --format=%ct HEAD)
+          python3 scripts/release/package_cli.py --tag "$tag" \
+            --target '${{ matrix.target }}' --binary native/devknx \
+            --output-dir packages --source-date-epoch "$epoch"
+          archive="packages/devknx-$tag-${{ matrix.target }}.tar.gz"
+          mkdir -p unpacked
+          tar -xzf "$archive" -C unpacked
+          "unpacked/devknx-$tag-${{ matrix.target }}/devknx" --version |
+            grep -Fx "devknx $version"
+      - name: Build and smoke-test Debian package
+        if: matrix.kind == 'gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install cargo-deb --version 3.8.0 --locked
+          mkdir -p target/release
+          command cp native/devknx target/release/devknx
+          chmod +x target/release/devknx
+          version=$(cargo metadata --offline --no-deps --locked --format-version 1 |
+            jq -r '.packages[] | select(.name == "devknx") | .version')
+          bash scripts/release/build-deb.sh "v$version" packages
+          package="packages/devknx_${version}-1_$(dpkg --print-architecture).deb"
+          mkdir -p deb-root
+          dpkg-deb --extract "$package" deb-root
+          deb-root/usr/bin/devknx --version | grep -Fx "devknx $version"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: candidate-${{ matrix.target }}
+          path: packages/
+          if-no-files-found: error
+          retention-days: 7
+
+  package-macos:
+    name: Package macOS ARM64
+    needs: package-tests
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - run: cargo build --release --locked --no-default-features --features full
+      - name: Create and smoke-test CLI and unsigned app candidates
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --offline --no-deps --locked --format-version 1 |
+            jq -r '.packages[] | select(.name == "devknx") | .version')
+          tag="v$version"
+          epoch=$(git show -s --format=%ct HEAD)
+          python3 scripts/release/package_cli.py --tag "$tag" \
+            --target aarch64-apple-darwin --binary target/release/devknx \
+            --output-dir packages --source-date-epoch "$epoch"
+          mkdir -p unpacked
+          tar -xzf "packages/devknx-$tag-aarch64-apple-darwin.tar.gz" -C unpacked
+          "unpacked/devknx-$tag-aarch64-apple-darwin/devknx" --version |
+            grep -Fx "devknx $version"
+          DEVKNX_APP_OUTPUT=dist/devknx.app scripts/build-macos-app.sh --no-build
+          test -s dist/devknx.app/Contents/Resources/THIRD-PARTY-NOTICES.md
+          test -s dist/devknx.app/Contents/Resources/licenses/OFL-1.1.txt
+          file dist/devknx.app/Contents/MacOS/devknx | grep -F arm64
+          ditto -c -k --keepParent dist/devknx.app \
+            "packages/devknx-$tag-aarch64-apple-darwin.app.zip"
+          mkdir -p app-unpacked
+          ditto -x -k "packages/devknx-$tag-aarch64-apple-darwin.app.zip" app-unpacked
+          app-unpacked/devknx.app/Contents/MacOS/devknx --version |
+            grep -Fx "devknx $version"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: candidate-aarch64-apple-darwin
+          path: packages/
+          if-no-files-found: error
+          retention-days: 7
+
+  package-windows:
+    name: Package Windows ${{ matrix.target }}
+    needs: package-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-2025, target: x86_64-pc-windows-msvc }
+          - { runner: windows-11-arm, target: aarch64-pc-windows-msvc }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - run: cargo build --release --locked --no-default-features --features full
+      - name: Create and smoke-test Windows archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = (cargo metadata --offline --no-deps --locked --format-version 1 |
+            ConvertFrom-Json).packages | Where-Object name -eq 'devknx' |
+            Select-Object -ExpandProperty version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $epoch = [int64](git show -s --format=%ct HEAD)
+          python scripts/release/package_cli.py --tag "v$version" `
+            --target '${{ matrix.target }}' --binary target/release/devknx.exe `
+            --output-dir packages --source-date-epoch $epoch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $archive = "packages/devknx-v$version-${{ matrix.target }}.zip"
+          Expand-Archive -Path $archive -DestinationPath unpacked
+          & "unpacked/devknx-v$version-${{ matrix.target }}/devknx.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ((& "unpacked/devknx-v$version-${{ matrix.target }}/devknx.exe" --version) -ne "devknx $version") {
+            throw 'The extracted executable has the wrong version.'
+          }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: candidate-${{ matrix.target }}
+          path: packages/
+          if-no-files-found: error
+          retention-days: 7
+
+  candidate-success:
+    name: Candidate packaging success
+    if: always()
+    needs: [package-tests, build-linux, package-linux, package-macos, package-windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every package job
+        run: |
+          set -euo pipefail
+          printf '%s\n' '${{ toJSON(needs) }}' |
+            jq -e 'all(.[]; .result == "success")'

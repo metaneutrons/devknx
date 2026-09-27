@@ -7,7 +7,18 @@ if [[ "$(uname -s)" != Darwin ]]; then
 fi
 
 cd "$(dirname "$0")/.."
-cargo build --release --locked --no-default-features --features full
+if [[ "${1:-}" == "--no-build" ]]; then
+  if [[ $# -ne 1 ]]; then
+    echo 'Usage: build-macos-app.sh [--no-build]' >&2
+    exit 2
+  fi
+else
+  if [[ $# -ne 0 ]]; then
+    echo 'Usage: build-macos-app.sh [--no-build]' >&2
+    exit 2
+  fi
+  cargo build --release --locked --no-default-features --features full
+fi
 
 version=$(cargo metadata --offline --no-deps --format-version 1 \
   | jq -r '.packages[] | select(.name == "devknx") | .version')
@@ -16,11 +27,17 @@ if [[ -z "$version" ]]; then
   exit 1
 fi
 
-bundle=dist/devknx.app
-mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
+bundle=${DEVKNX_APP_OUTPUT:-dist/devknx.app}
+if [[ -e "$bundle" ]]; then
+  echo "The app output already exists: $bundle" >&2
+  exit 1
+fi
+mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources/licenses"
 command cp target/release/devknx "$bundle/Contents/MacOS/devknx"
 command cp resources/devknx.icns "$bundle/Contents/Resources/devknx.icns"
 command cp resources/Info.plist "$bundle/Contents/Info.plist"
+command cp LICENSE THIRD-PARTY-NOTICES.md "$bundle/Contents/Resources/"
+command cp licenses/* "$bundle/Contents/Resources/licenses/"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" \
   "$bundle/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${version//./}" \

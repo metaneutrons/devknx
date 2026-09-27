@@ -205,7 +205,10 @@ listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 ## Planned distribution
 
-No package listed here is available yet. Release qualification will cover:
+No package listed here is available yet. The non-publishing
+[release-candidate build](docs/release-preparation.md) produces temporary CI
+artifacts for packaging tests; it is not a release. Release qualification will
+cover:
 
 | Platform | Architectures | Deliverables |
 | --- | --- | --- |

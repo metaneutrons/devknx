@@ -7,14 +7,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
+use devknx::ipc::WireState;
 use eframe::egui;
 use knx_rs_ip::discovery::GatewayInfo;
 
 use crate::interface::{self, DisplayCapture, Follower, MonitorModel};
 use crate::platform::{self, MenuAction};
 
-pub fn run(database: Option<PathBuf>, smoke: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let smoke_result = smoke.then(|| Arc::new(AtomicBool::new(false)));
+pub fn run(
+    database: Option<PathBuf>,
+    smoke: bool,
+    smoke_live: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let smoke_result = (smoke || smoke_live).then(|| Arc::new(AtomicBool::new(false)));
     let app_smoke_result = smoke_result.clone();
     let icon =
         image::load_from_memory(include_bytes!("../resources/png/devknx-256.png"))?.to_rgba8();
@@ -39,13 +44,17 @@ pub fn run(database: Option<PathBuf>, smoke: bool) -> Result<(), Box<dyn std::er
         options,
         Box::new(move |_cc| {
             platform::init_app();
-            Ok(Box::new(MonitorApp::new(database, app_smoke_result)))
+            Ok(Box::new(MonitorApp::new(
+                database,
+                app_smoke_result,
+                smoke_live,
+            )))
         }),
     )?;
     if let Some(result) = smoke_result
         && !result.load(Ordering::Acquire)
     {
-        return Err("GUI smoke: window resize or native menu verification failed".into());
+        return Err("GUI smoke: native window or live-capture qualification failed".into());
     }
     Ok(())
 }
@@ -53,6 +62,22 @@ pub fn run(database: Option<PathBuf>, smoke: bool) -> Result<(), Box<dyn std::er
 struct SmokeRun {
     started: Instant,
     frames: u32,
+    result: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LiveSmokePhase {
+    Stream { baseline_id: i64 },
+    Scroll { first_id: i64 },
+    Disconnect { last_id: i64 },
+    Reconnect { last_id: i64 },
+}
+
+struct LiveSmoke {
+    started: Instant,
+    last_reported: Instant,
+    phase: LiveSmokePhase,
+    pin_to_top: bool,
     result: Arc<AtomicBool>,
 }
 
@@ -81,14 +106,29 @@ struct MonitorApp {
     preview: Option<(String, String, String, String)>,
     selected: Option<DisplayCapture>,
     smoke: Option<SmokeRun>,
+    live_smoke: Option<LiveSmoke>,
 }
 
 impl MonitorApp {
-    fn new(database: Option<PathBuf>, smoke_result: Option<Arc<AtomicBool>>) -> Self {
+    fn new(
+        database: Option<PathBuf>,
+        smoke_result: Option<Arc<AtomicBool>>,
+        smoke_live: bool,
+    ) -> Self {
         let mut app = Self {
-            smoke: smoke_result.map(|result| SmokeRun {
+            smoke: smoke_result
+                .clone()
+                .filter(|_| !smoke_live)
+                .map(|result| SmokeRun {
+                    started: Instant::now(),
+                    frames: 0,
+                    result,
+                }),
+            live_smoke: smoke_result.filter(|_| smoke_live).map(|result| LiveSmoke {
                 started: Instant::now(),
-                frames: 0,
+                last_reported: Instant::now(),
+                phase: LiveSmokePhase::Stream { baseline_id: 0 },
+                pin_to_top: false,
                 result,
             }),
             ..Self::default()
@@ -96,6 +136,11 @@ impl MonitorApp {
         if let Some(database) = database {
             app.database_input = database.display().to_string();
             app.attach();
+        }
+        if let (Some(smoke), Some(model)) = (&mut app.live_smoke, &app.model) {
+            smoke.phase = LiveSmokePhase::Stream {
+                baseline_id: model.rows.last().and_then(|row| row.id).unwrap_or(0),
+            };
         }
         app
     }
@@ -226,6 +271,84 @@ impl MonitorApp {
                 platform::menu_installed()
             );
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        ctx.request_repaint_after(Duration::from_millis(50));
+    }
+
+    fn live_smoke_step(&mut self, ctx: &egui::Context, scroll_offset: Option<f32>) {
+        let Some(smoke) = &mut self.live_smoke else {
+            return;
+        };
+        if smoke.result.load(Ordering::Acquire) {
+            return;
+        }
+        if smoke.started.elapsed() > Duration::from_secs(45) {
+            eprintln!("GUI live smoke: timed out");
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        let Some(model) = &self.model else {
+            return;
+        };
+        let ordered = model.rows.iter().all(|row| row.id.is_some())
+            && model.rows.windows(2).all(|pair| pair[0].id < pair[1].id);
+        if !ordered {
+            eprintln!("GUI live smoke: capture IDs are missing, repeated or unordered");
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        let last_id = model.rows.last().and_then(|row| row.id).unwrap_or(0);
+        if smoke.last_reported.elapsed() >= Duration::from_secs(5) {
+            eprintln!(
+                "GUI live diagnostic: phase={:?} state={:?} rows={} last_id={last_id} scroll={scroll_offset:?}",
+                smoke.phase,
+                model.state,
+                model.rows.len()
+            );
+            smoke.last_reported = Instant::now();
+        }
+        match smoke.phase {
+            LiveSmokePhase::Stream { baseline_id }
+                if matches!(model.state, WireState::Connected { .. })
+                    && last_id >= baseline_id + 100
+                    && scroll_offset.is_some_and(|offset| offset > 100.0) =>
+            {
+                smoke.pin_to_top = true;
+                smoke.phase = LiveSmokePhase::Scroll { first_id: last_id };
+            }
+            LiveSmokePhase::Scroll { first_id }
+                if matches!(model.state, WireState::Connected { .. })
+                    && last_id >= first_id + 50
+                    && scroll_offset.is_some_and(|offset| offset <= 2.0) =>
+            {
+                eprintln!("GUI live smoke: streaming");
+                smoke.phase = LiveSmokePhase::Disconnect { last_id };
+            }
+            LiveSmokePhase::Disconnect {
+                last_id: previous_id,
+            } if matches!(
+                &model.state,
+                WireState::WaitingRetry { reason, .. }
+                    if reason == "capture owner unavailable"
+            ) && last_id >= previous_id
+                && scroll_offset.is_some_and(|offset| offset <= 2.0) =>
+            {
+                eprintln!("GUI live smoke: disconnected");
+                smoke.phase = LiveSmokePhase::Reconnect {
+                    last_id: previous_id,
+                };
+            }
+            LiveSmokePhase::Reconnect {
+                last_id: previous_id,
+            } if matches!(model.state, WireState::Connected { .. })
+                && last_id >= previous_id + 50
+                && scroll_offset.is_some_and(|offset| offset <= 2.0) =>
+            {
+                eprintln!("GUI live smoke: recovered");
+                smoke.result.store(true, Ordering::Release);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            _ => {}
         }
         ctx.request_repaint_after(Duration::from_millis(50));
     }
@@ -411,6 +534,7 @@ impl eframe::App for MonitorApp {
         if let Some(error) = &self.error {
             ui.colored_label(egui::Color32::RED, error);
         }
+        let mut scroll_offset = None;
         if let Some(model) = &mut self.model {
             ui.label(format!("Database: {}", model.database.display()));
             ui.strong(format!("Connection: {:?}", model.state));
@@ -450,25 +574,34 @@ impl eframe::App for MonitorApp {
                 model.rows.len()
             ));
             let mut selected = None;
-            egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .max_height((ui.available_height() - 190.0).max(120.0))
-                .show_rows(ui, 23.0, visible.len(), |ui, range| {
-                    for row in &visible[range] {
-                        let text = format!(
-                            "{}  {:8}  {:8} → {:9}  {:18}  {}",
-                            row.timestamp_ms,
-                            row.direction,
-                            row.source,
-                            row.destination,
-                            row.service,
-                            row.label.as_deref().unwrap_or("")
-                        );
-                        if ui.selectable_label(false, text).clicked() {
-                            selected = Some((*row).clone());
-                        }
+            let pin_to_top = self
+                .live_smoke
+                .as_ref()
+                .is_some_and(|smoke| smoke.pin_to_top);
+            let mut scroll = egui::ScrollArea::vertical()
+                .id_salt("captures")
+                .stick_to_bottom(!pin_to_top)
+                .max_height((ui.available_height() - 190.0).max(120.0));
+            if pin_to_top {
+                scroll = scroll.vertical_scroll_offset(0.0);
+            }
+            let output = scroll.show_rows(ui, 23.0, visible.len(), |ui, range| {
+                for row in &visible[range] {
+                    let text = format!(
+                        "{}  {:8}  {:8} → {:9}  {:18}  {}",
+                        row.timestamp_ms,
+                        row.direction,
+                        row.source,
+                        row.destination,
+                        row.service,
+                        row.label.as_deref().unwrap_or("")
+                    );
+                    if ui.selectable_label(false, text).clicked() {
+                        selected = Some((*row).clone());
                     }
-                });
+                }
+            });
+            scroll_offset = Some(output.state.offset.y);
             if let Some(row) = selected {
                 self.selected = Some(row);
             }
@@ -495,6 +628,102 @@ impl eframe::App for MonitorApp {
         for gateway in &self.gateways {
             ui.label(format!("Gateway: {} · {}", gateway.name, gateway.address));
         }
+        self.live_smoke_step(&ctx, scroll_offset);
         self.dialogs(&ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use devknx::storage::CaptureStore;
+    use std::num::NonZeroU32;
+
+    fn append_rows(model: &mut MonitorModel, start: i64, end: i64) {
+        for id in start..=end {
+            model.rows.push(DisplayCapture {
+                id: Some(id),
+                timestamp_ms: u64::try_from(id).unwrap(),
+                direction: "in".into(),
+                source: "1.1.1".into(),
+                destination: "1/1/1".into(),
+                service: "GroupValueWrite".into(),
+                label: None,
+                dpts: Vec::new(),
+                raw_cemi: "2900".into(),
+            });
+        }
+    }
+
+    #[test]
+    fn live_gate_rejects_missing_scroll_disconnect_and_reconnect_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("capture.sqlite");
+        drop(CaptureStore::open(&database, NonZeroU32::new(1_000).unwrap()).unwrap());
+        let mut model = MonitorModel::open(database).unwrap();
+        model.state = WireState::Connected {
+            endpoint: "tunnel://127.0.0.1:3671".into(),
+        };
+        append_rows(&mut model, 1, 100);
+        let result = Arc::new(AtomicBool::new(false));
+        let mut app = MonitorApp {
+            model: Some(model),
+            live_smoke: Some(LiveSmoke {
+                started: Instant::now(),
+                last_reported: Instant::now(),
+                phase: LiveSmokePhase::Stream { baseline_id: 0 },
+                pin_to_top: false,
+                result: Arc::clone(&result),
+            }),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        app.live_smoke_step(&ctx, Some(0.0));
+        assert!(matches!(
+            app.live_smoke.as_ref().unwrap().phase,
+            LiveSmokePhase::Stream { .. }
+        ));
+        app.live_smoke_step(&ctx, Some(200.0));
+        assert!(matches!(
+            app.live_smoke.as_ref().unwrap().phase,
+            LiveSmokePhase::Scroll { .. }
+        ));
+        append_rows(app.model.as_mut().unwrap(), 101, 150);
+        app.live_smoke_step(&ctx, Some(200.0));
+        assert!(matches!(
+            app.live_smoke.as_ref().unwrap().phase,
+            LiveSmokePhase::Scroll { .. }
+        ));
+        app.live_smoke_step(&ctx, Some(0.0));
+        assert!(matches!(
+            app.live_smoke.as_ref().unwrap().phase,
+            LiveSmokePhase::Disconnect { .. }
+        ));
+        app.model.as_mut().unwrap().state = WireState::WaitingRetry {
+            reason: "transport retry".into(),
+            delay_ms: 2_000,
+        };
+        app.live_smoke_step(&ctx, Some(0.0));
+        assert!(matches!(
+            app.live_smoke.as_ref().unwrap().phase,
+            LiveSmokePhase::Disconnect { .. }
+        ));
+        app.model.as_mut().unwrap().state = WireState::WaitingRetry {
+            reason: "capture owner unavailable".into(),
+            delay_ms: 2_000,
+        };
+        app.live_smoke_step(&ctx, Some(0.0));
+        assert!(matches!(
+            app.live_smoke.as_ref().unwrap().phase,
+            LiveSmokePhase::Reconnect { .. }
+        ));
+        app.model.as_mut().unwrap().state = WireState::Connected {
+            endpoint: "tunnel://127.0.0.1:3671".into(),
+        };
+        app.live_smoke_step(&ctx, Some(0.0));
+        assert!(!result.load(Ordering::Acquire));
+        append_rows(app.model.as_mut().unwrap(), 151, 200);
+        app.live_smoke_step(&ctx, Some(0.0));
+        assert!(result.load(Ordering::Acquire));
     }
 }

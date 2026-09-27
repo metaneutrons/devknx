@@ -225,6 +225,9 @@ enum Command {
         /// Run a bounded native window and menu smoke test, then exit.
         #[arg(long, hide = true)]
         smoke: bool,
+        /// Qualify live capture, scrolling and owner restart in a native window.
+        #[arg(long, hide = true, requires = "database", conflicts_with = "smoke")]
+        smoke_live: bool,
     },
     /// Open the interactive terminal monitor for an existing capture database.
     #[cfg(feature = "tui")]
@@ -444,11 +447,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         #[cfg(feature = "gui")]
-        Some(Command::Gui { database, smoke }) => gui::run(database, smoke)?,
+        Some(Command::Gui {
+            database,
+            smoke,
+            smoke_live,
+        }) => gui::run(database, smoke, smoke_live)?,
         #[cfg(feature = "tui")]
         Some(Command::Tui { database }) => tui::run(database)?,
         #[cfg(feature = "gui")]
-        None => gui::run(None, false)?,
+        None => gui::run(None, false, false)?,
         #[cfg(not(feature = "gui"))]
         None => {
             eprintln!("No command specified. Use --help for available commands.");

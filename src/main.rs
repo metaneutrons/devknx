@@ -6,6 +6,7 @@ use devknx::api::{self, ApiConfig};
 use devknx::capture::{CaptureEvent, RoutingLossEvent};
 use devknx::ets::{CsvEncoding, EtsCatalog, EtsFormat, parse_group_address};
 use devknx::ipc::{IpcClient, IpcMessage, IpcServer};
+use devknx::mcp;
 use devknx::operations::{OperationRequest, RawPayload, prepare};
 use devknx::service::{CaptureService, LiveRoutingLoss, ReconnectPolicy};
 use devknx::storage::CaptureStore;
@@ -89,6 +90,12 @@ enum Command {
         /// Permit DPT-validated typed writes through a non-loopback listener.
         #[arg(long)]
         allow_remote_writes: bool,
+    },
+    /// Serve structured MCP tools over standard input/output.
+    Mcp {
+        /// Existing database owned by `serve` for live operations.
+        #[arg(long)]
+        database: PathBuf,
     },
     /// Read the current state of an independent capture process.
     Status {
@@ -307,6 +314,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .await?;
         }
+        Some(Command::Mcp { database }) => mcp::run(database).await?,
         Some(Command::Status { database }) => run_ipc_client(&database, false).await?,
         Some(Command::Follow { database }) => run_ipc_client(&database, true).await?,
         Some(Command::History {

@@ -54,6 +54,7 @@ fn help_describes_available_commands() {
     assert!(stdout.contains("monitor"));
     assert!(stdout.contains("serve"));
     assert!(stdout.contains("api"));
+    assert!(stdout.contains("mcp"));
     assert!(stdout.contains("history"));
     assert!(stdout.contains("router-losses"));
     assert!(stdout.contains("export"));

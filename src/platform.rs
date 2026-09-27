@@ -45,6 +45,7 @@ mod macos {
     unsafe extern "C" {
         fn devknx_init_macos_app(version: *const std::ffi::c_char, icon: *const u8, len: usize);
         fn devknx_take_menu_action(action: u32) -> bool;
+        fn devknx_macos_menu_installed() -> bool;
     }
 
     pub fn init_app() {
@@ -62,6 +63,14 @@ mod macos {
         #[allow(unsafe_code)]
         unsafe {
             devknx_take_menu_action(action as u32)
+        }
+    }
+
+    pub fn menu_installed() -> bool {
+        // SAFETY: a main-thread query of objects owned by the running AppKit app.
+        #[allow(unsafe_code)]
+        unsafe {
+            devknx_macos_menu_installed()
         }
     }
 }
@@ -85,6 +94,16 @@ pub fn take(action: MenuAction) -> bool {
         let _ = action;
         false
     }
+}
+
+/// Check the actual running application menu after the window framework starts.
+#[must_use]
+#[allow(clippy::missing_const_for_fn)]
+pub fn menu_installed() -> bool {
+    #[cfg(target_os = "macos")]
+    return macos::menu_installed();
+    #[cfg(not(target_os = "macos"))]
+    true
 }
 
 #[cfg(test)]

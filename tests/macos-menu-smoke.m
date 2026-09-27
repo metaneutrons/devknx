@@ -8,6 +8,7 @@
 
 extern void devknx_init_macos_app(const char *version, const uint8_t *icon, size_t icon_len);
 extern bool devknx_take_menu_action(uint32_t action);
+extern bool devknx_macos_menu_installed(void);
 
 static int failures = 0;
 
@@ -37,6 +38,7 @@ static void check_action(NSString *menu_title, NSString *item_title,
 int main(void) {
     @autoreleasepool {
         devknx_init_macos_app("0.1.0", NULL, 0);
+        expect(devknx_macos_menu_installed(), "menu is installed in AppKit");
         expect([[NSApp mainMenu] numberOfItems] == 7, "seven native menus");
         for (NSString *title in @[@"devknx", @"File", @"Edit", @"View",
                                  @"Operation", @"Window", @"Help"]) {

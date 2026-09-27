@@ -27,3 +27,9 @@ Substantial work is tracked against [the initiative plan](docs/plans/devknx.md).
 Its acceptance criteria are authoritative; issues record implementation state.
 Do not include real ETS exports, bus captures, gateway credentials, or building
 metadata in an issue or a test fixture.
+
+When adding or removing a user-facing CLI or GUI operation, update the
+[capability registry](src/capabilities.rs), its source anchor, and any
+intentional cross-surface gap. The registry test rejects missing anchors and
+unrecorded or stale differences. It describes the full build; it cannot infer
+which controls conditional compilation excludes from a particular binary.

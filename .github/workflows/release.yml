@@ -133,6 +133,8 @@ jobs:
           set -euo pipefail
           key="$RUNNER_TEMP/api.p8"
           (umask 077; printf '%s' "$API_KEY_CONTENT" > "$key")
+          cleanup_key() { rm -P "$key" 2>/dev/null || rm -f "$key"; }
+          trap cleanup_key EXIT
           submission="$RUNNER_TEMP/submit.zip"
           ditto -c -k --keepParent dist/devknx.app "$submission"
           set +e
@@ -148,11 +150,18 @@ jobs:
             fi
             exit 1
           fi
-          rm -P "$key" 2>/dev/null || rm -f "$key"
           xcrun stapler staple dist/devknx.app
           xcrun stapler validate dist/devknx.app
           ditto -c -k --keepParent dist/devknx.app \
             "dist/devknx-$TAG-aarch64-apple-darwin.app.zip"
+      - name: Destroy the throwaway keychain before executing the app
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -n "${SIGNING_KEYCHAIN:-}" ]]; then
+            security delete-keychain "$SIGNING_KEYCHAIN" 2>/dev/null || true
+            test ! -f "$SIGNING_KEYCHAIN"
+          fi
       - name: Gatekeeper judges the distributed archive
         env:
           TAG: ${{ needs.metadata.outputs.tag }}
@@ -165,14 +174,6 @@ jobs:
           xcrun stapler validate "$app"
           spctl --assess --type execute -vv "$app"
           "$app/Contents/MacOS/devknx" --version
-      - name: Destroy the throwaway keychain
-        if: always()
-        run: |
-          set -euo pipefail
-          if [[ -n "${SIGNING_KEYCHAIN:-}" ]]; then
-            security delete-keychain "$SIGNING_KEYCHAIN" 2>/dev/null || true
-            test ! -f "$SIGNING_KEYCHAIN"
-          fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: notarized-app
@@ -716,7 +717,14 @@ jobs:
           else
             base=$(gh repo view "$tap" --json defaultBranchRef --jq .defaultBranchRef.name)
             branch="devknx-$VERSION"
-            git switch -c "$branch"
+            # An earlier run may have opened this branch and failed after its
+            # push. Resume it instead of losing the only retry path.
+            if gh api "repos/$tap/branches/$branch" >/dev/null 2>&1; then
+              git fetch origin "$branch"
+              git switch -c "$branch" FETCH_HEAD
+            else
+              git switch -c "$branch"
+            fi
             install -m 0644 ../candidate/devknx.rb Formula/devknx.rb
             install -m 0644 ../candidate/devknx-app.rb Casks/devknx-app.rb
             if [[ -x scripts/generate-readme.sh ]]; then
@@ -725,11 +733,17 @@ jobs:
             git config user.name 'devknx release automation'
             git config user.email 'devknx-release@users.noreply.github.com'
             git add Formula/devknx.rb Casks/devknx-app.rb README.md
-            git commit -m "devknx $VERSION"
-            git push --set-upstream origin "$branch"
-            pr=$(gh pr create --repo "$tap" --base "$base" --head "$branch" \
-              --title "devknx $VERSION" \
-              --body "Generated from verified devknx release assets.")
+            if ! git diff --cached --quiet; then
+              git commit -m "devknx $VERSION"
+              git push --set-upstream origin "$branch"
+            fi
+            pr=$(gh pr list --repo "$tap" --base "$base" --head "$branch" \
+              --state open --json url --jq '.[0].url // empty')
+            if [[ -z "$pr" ]]; then
+              pr=$(gh pr create --repo "$tap" --base "$base" --head "$branch" \
+                --title "devknx $VERSION" \
+                --body "Generated from verified devknx release assets.")
+            fi
             checks=0
             for _ in $(seq 1 30); do
               checks=$(gh pr checks "$pr" --repo "$tap" 2>/dev/null | grep -c . || true)

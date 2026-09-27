@@ -31,6 +31,8 @@ class PackageMetadataTests(unittest.TestCase):
                 hashlib.sha256(b"aarch64-apple-darwin").hexdigest(), formula
             )
             self.assertIn("depends_on arch: :arm64", formula)
+            self.assertIn('depends_on "wayland"', formula)
+            self.assertIn('depends_on "mesa"', formula)
             self.assertIn('shell_output("#{bin}/devknx --version")', formula)
             self.assertNotIn("x86_64-apple-darwin", formula)
             self.assertIn('cask "devknx-app"', (output / "devknx-app.rb").read_text())

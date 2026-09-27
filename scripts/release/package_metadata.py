@@ -77,6 +77,11 @@ class Devknx < Formula
   end
 
   on_linux do
+    depends_on "libx11"
+    depends_on "libxcb"
+    depends_on "libxkbcommon"
+    depends_on "mesa"
+    depends_on "wayland"
     if Hardware::CPU.arm?
       url "{base}/{names["aarch64-unknown-linux-gnu"]}"
       sha256 "{sha["aarch64-unknown-linux-gnu"]}"

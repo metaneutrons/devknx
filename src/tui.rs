@@ -126,13 +126,15 @@ impl App {
         if let Some(receiver) = &self.discovery_receiver {
             match receiver.try_recv() {
                 Ok(Ok(gateways)) => {
-                    let names = gateways
+                    let endpoints = gateways
                         .iter()
-                        .map(|gateway| gateway.name.as_str())
+                        .map(|gateway| format!("{} ({})", gateway.name, gateway.address))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    self.model
-                        .notice(format!("Discovered {} gateways: {names}", gateways.len()));
+                    self.model.notice(format!(
+                        "Discovered {} gateways: {endpoints}",
+                        gateways.len()
+                    ));
                     self.discovery_receiver = None;
                 }
                 Ok(Err(error)) => {

@@ -30,7 +30,7 @@ desktop button and an API call.
 | Capability | Current state |
 | --- | --- |
 | KNXnet/IP gateway discovery | CLI and native GUI shell available |
-| KNXnet/IP tunneling and routing capture | Experimental CLI stream; no persistence or automatic reconnect yet |
+| KNXnet/IP tunneling and routing capture | Experimental CLI stream with bounded reconnect and optional SQLite persistence |
 | Durable, searchable telegram history | Experimental SQLite history with ID cursor, retention cap, and CSV export; filters/search and the background daemon are pending |
 | ETS group-address CSV and XML import | Planned |
 | DPT-validated read, write preview, and write | Planned |
@@ -71,9 +71,11 @@ shell and discovery view.
 
 `monitor` prints one line per received cEMI frame, including a millisecond
 timestamp, endpoint, source and destination addresses, group-value service,
-and the exact raw frame in hexadecimal. Press Ctrl-C to close the connection.
-An unexpected connection close is an error; the current stream does not
-reconnect. Only receive-side frames are captured in this development build.
+and the exact raw frame in hexadecimal. Connection changes are printed to
+standard error. Failed connection attempts and unexpected closes are retried
+with a bounded 1–30 second delay; press Ctrl-C to stop. Only receive-side
+frames are captured in this development build. A slow live subscriber is
+reported as application-event lag, not as a count of lost KNX bus telegrams.
 The endpoints above are examples, not verified gateways; substitute your own
 network addresses. No live-bus qualification has been performed yet.
 
@@ -83,9 +85,11 @@ committed telegram receives a monotonic ID; the default retention limit is
 existing store using an exclusive `--after` ID and a bounded page size.
 `export` streams CSV up to the highest ID present when export begins. Both
 commands fail rather than create an empty database if the path is wrong.
-Existing databases with an unsupported schema are not rewritten. The CLI
-currently owns the connection and database only while `monitor` is running;
-the planned persistent local service and live event bus are not implemented.
+Existing databases with an unsupported schema are not rewritten. The CLI now
+runs an in-process connection owner and live event bus; capture continues if
+its terminal subscriber falls behind. The connection and database are still
+owned only while `monitor` is running. A standalone background daemon and
+cross-process subscription API remain planned.
 Capture files can reveal activity in a building. Newly created SQLite files
 are private to the current user on Unix; choose a protected directory and
 apply suitable access controls for existing files and on Windows.

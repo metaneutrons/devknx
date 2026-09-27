@@ -1,0 +1,612 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Fabian Schmieder
+
+//! Long-lived owner for one KNXnet/IP connection and its capture store.
+//!
+//! This is an in-process service core, not yet the standalone local daemon.
+//! Connection state is a watch value so late subscribers see the current state.
+//! Live frames are broadcast; a slow subscriber receives Tokio's structured
+//! `Lagged(count)` error. That count describes dropped *application events*,
+//! not lost KNX bus telegrams, which `knx-rs-ip` does not currently expose.
+
+use std::fmt;
+use std::future::Future;
+use std::num::NonZeroUsize;
+use std::time::Duration;
+
+use knx_rs_ip::{ConnectionSpec, KnxConnection, connect};
+use thiserror::Error;
+use tokio::sync::{broadcast, watch};
+
+use crate::capture::{CaptureEndpoint, CaptureEvent};
+use crate::storage::{CaptureStore, StorageError};
+
+/// Current lifecycle state of one configured connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConnectionState {
+    /// The service has not started.
+    Idle,
+    /// A connection attempt is running.
+    Connecting {
+        /// One-based attempt number.
+        attempt: u64,
+    },
+    /// Frames can be received from this endpoint.
+    Connected {
+        /// Connected KNXnet/IP endpoint.
+        endpoint: CaptureEndpoint,
+    },
+    /// A failed or closed connection will be retried after a delay.
+    WaitingRetry {
+        /// Cause from the transport, never a claim about bus packet loss.
+        reason: String,
+        /// Delay before the next attempt.
+        delay: Duration,
+    },
+    /// The caller stopped the service.
+    Stopped,
+    /// Persistence failed; capture stopped to avoid silently losing durable history.
+    StorageFailed {
+        /// Storage error text.
+        reason: String,
+    },
+}
+
+/// One live event, emitted only after its optional database commit succeeds.
+#[derive(Clone, Debug)]
+pub struct LiveCapture {
+    /// Monotonic database ID when persistence is enabled.
+    pub id: Option<i64>,
+    /// Exact raw-preserving capture event.
+    pub event: CaptureEvent,
+}
+
+/// Reconnection delay policy.
+#[derive(Clone, Copy, Debug)]
+pub struct ReconnectPolicy {
+    initial: Duration,
+    maximum: Duration,
+}
+
+impl ReconnectPolicy {
+    /// Build a bounded exponential-backoff policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either duration is zero or the maximum is smaller.
+    pub fn new(initial: Duration, maximum: Duration) -> Result<Self, ServiceError> {
+        if initial.is_zero() || maximum < initial {
+            return Err(ServiceError::InvalidBackoff);
+        }
+        Ok(Self { initial, maximum })
+    }
+}
+
+impl Default for ReconnectPolicy {
+    fn default() -> Self {
+        Self {
+            initial: Duration::from_secs(1),
+            maximum: Duration::from_secs(30),
+        }
+    }
+}
+
+/// Service configuration or persistence failure.
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    /// Backoff would be zero or unbounded in the wrong direction.
+    #[error("initial reconnect delay must be positive and at most the maximum")]
+    InvalidBackoff,
+    /// A capture could not be committed; the service stopped.
+    #[error("capture persistence failed: {0}")]
+    Storage(#[from] StorageError),
+}
+
+/// Owns one connection lifecycle, optional SQLite store, and event channels.
+pub struct CaptureService {
+    spec: ConnectionSpec,
+    endpoint: CaptureEndpoint,
+    store: Option<CaptureStore>,
+    policy: ReconnectPolicy,
+    state_tx: watch::Sender<ConnectionState>,
+    frames_tx: broadcast::Sender<LiveCapture>,
+}
+
+impl CaptureService {
+    /// Construct a service with a bounded live-event queue.
+    #[must_use]
+    pub fn new(
+        spec: ConnectionSpec,
+        store: Option<CaptureStore>,
+        policy: ReconnectPolicy,
+        event_capacity: NonZeroUsize,
+    ) -> Self {
+        let endpoint = CaptureEndpoint::from(spec.clone());
+        let (state_tx, _) = watch::channel(ConnectionState::Idle);
+        let (frames_tx, _) = broadcast::channel(event_capacity.get());
+        Self {
+            spec,
+            endpoint,
+            store,
+            policy,
+            state_tx,
+            frames_tx,
+        }
+    }
+
+    /// Subscribe to the current connection state and future changes.
+    #[must_use]
+    pub fn subscribe_state(&self) -> watch::Receiver<ConnectionState> {
+        self.state_tx.subscribe()
+    }
+
+    /// Subscribe to live frames. A lagged receiver gets an explicit count.
+    #[must_use]
+    pub fn subscribe_frames(&self) -> broadcast::Receiver<LiveCapture> {
+        self.frames_tx.subscribe()
+    }
+
+    /// Run until shutdown, retrying failed or closed connections.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if capture persistence fails. Connection failures are
+    /// state transitions and are retried, not returned as terminal errors.
+    pub async fn run_until<S>(&mut self, shutdown: S) -> Result<(), ServiceError>
+    where
+        S: Future<Output = ()>,
+    {
+        let spec = self.spec.clone();
+        self.run_with(move || connect(spec.clone()), shutdown).await
+    }
+
+    async fn run_with<C, F, Fut, E, S>(
+        &mut self,
+        mut connector: F,
+        shutdown: S,
+    ) -> Result<(), ServiceError>
+    where
+        C: KnxConnection,
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<C, E>>,
+        E: fmt::Display,
+        S: Future<Output = ()>,
+    {
+        let mut shutdown = Box::pin(shutdown);
+        let mut attempt = 0_u64;
+        let mut delay = self.policy.initial;
+        loop {
+            attempt = attempt.saturating_add(1);
+            self.state_tx
+                .send_replace(ConnectionState::Connecting { attempt });
+            let connection = tokio::select! {
+                biased;
+                () = &mut shutdown => {
+                    self.state_tx.send_replace(ConnectionState::Stopped);
+                    return Ok(());
+                }
+                result = connector() => result,
+            };
+            let reason = match connection {
+                Ok(mut connection) => {
+                    self.state_tx.send_replace(ConnectionState::Connected {
+                        endpoint: self.endpoint,
+                    });
+                    loop {
+                        let frame = tokio::select! {
+                            biased;
+                            () = &mut shutdown => {
+                                connection.close().await;
+                                self.state_tx.send_replace(ConnectionState::Stopped);
+                                return Ok(());
+                            }
+                            frame = connection.recv() => frame,
+                        };
+                        let Some(frame) = frame else {
+                            connection.close().await;
+                            break "connection closed".to_owned();
+                        };
+                        let event = CaptureEvent::received(self.endpoint, frame);
+                        let id = match self.store.as_mut() {
+                            Some(store) => match store.insert(&event) {
+                                Ok(id) => Some(id),
+                                Err(error) => {
+                                    connection.close().await;
+                                    self.state_tx.send_replace(ConnectionState::StorageFailed {
+                                        reason: error.to_string(),
+                                    });
+                                    return Err(error.into());
+                                }
+                            },
+                            None => None,
+                        };
+                        let _ = self.frames_tx.send(LiveCapture { id, event });
+                        delay = self.policy.initial;
+                    }
+                }
+                Err(error) => error.to_string(),
+            };
+            self.state_tx
+                .send_replace(ConnectionState::WaitingRetry { reason, delay });
+            tokio::select! {
+                biased;
+                () = &mut shutdown => {
+                    self.state_tx.send_replace(ConnectionState::Stopped);
+                    return Ok(());
+                }
+                () = tokio::time::sleep(delay) => {}
+            }
+            delay = delay.saturating_mul(2).min(self.policy.maximum);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::num::NonZeroU32;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use knx_rs_core::address::{DestinationAddress, GroupAddress, IndividualAddress};
+    use knx_rs_core::cemi::CemiFrame;
+    use knx_rs_core::message::MessageCode;
+    use knx_rs_core::types::Priority;
+    use knx_rs_ip::{DeviceServer, KnxFuture, Result as KnxResult};
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
+
+    use super::*;
+
+    struct FakeConnection {
+        frames: VecDeque<CemiFrame>,
+        close_when_empty: bool,
+        closed: Arc<AtomicUsize>,
+        received: Arc<AtomicUsize>,
+    }
+
+    impl KnxConnection for FakeConnection {
+        fn send(&self, _frame: CemiFrame) -> KnxFuture<'_, KnxResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn recv(&mut self) -> KnxFuture<'_, Option<CemiFrame>> {
+            Box::pin(async {
+                if let Some(frame) = self.frames.pop_front() {
+                    self.received.fetch_add(1, Ordering::SeqCst);
+                    Some(frame)
+                } else if self.close_when_empty {
+                    None
+                } else {
+                    std::future::pending().await
+                }
+            })
+        }
+
+        fn close(&mut self) -> KnxFuture<'_, ()> {
+            Box::pin(async {
+                self.closed.fetch_add(1, Ordering::SeqCst);
+            })
+        }
+    }
+
+    fn frame(value: u8) -> CemiFrame {
+        CemiFrame::new_l_data(
+            MessageCode::LDataInd,
+            IndividualAddress::from_raw(0x1101),
+            DestinationAddress::Group(GroupAddress::from_raw(0x0801)),
+            Priority::Low,
+            &[0x00, 0x80, value],
+        )
+    }
+
+    fn spec() -> ConnectionSpec {
+        ConnectionSpec::Tunnel("192.0.2.1:3671".parse().unwrap())
+    }
+
+    fn capacity(value: usize) -> NonZeroUsize {
+        NonZeroUsize::new(value).unwrap()
+    }
+
+    #[tokio::test]
+    async fn real_loopback_tunnel_commits_before_live_delivery() {
+        let server = DeviceServer::start_at("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let address = server.local_addr();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("loopback.sqlite");
+        let store = CaptureStore::open(&path, NonZeroU32::new(10).unwrap()).unwrap();
+        let mut service = CaptureService::new(
+            ConnectionSpec::Tunnel(address),
+            Some(store),
+            ReconnectPolicy::default(),
+            capacity(8),
+        );
+        let mut states = service.subscribe_state();
+        let mut frames = service.subscribe_frames();
+        let sent = frame(42);
+        let original = sent.as_bytes().to_vec();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let observer = async {
+            loop {
+                states.changed().await.unwrap();
+                if matches!(
+                    &*states.borrow_and_update(),
+                    ConnectionState::Connected { .. }
+                ) {
+                    break;
+                }
+            }
+            server.send_frame(sent).await.unwrap();
+            let live = frames.recv().await.unwrap();
+            assert_eq!(live.id, Some(1));
+            assert_eq!(live.event.frame().as_bytes(), original);
+            stop_tx.send(()).unwrap();
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                service.run_until(async {
+                    let _ = stop_rx.await;
+                }),
+                observer
+            )
+        })
+        .await
+        .expect("loopback frame arrives");
+        result.unwrap();
+        assert_eq!(*states.borrow(), ConnectionState::Stopped);
+        drop(service);
+        let history = CaptureStore::open_existing(&path).unwrap();
+        assert_eq!(
+            history.read_after(0, NonZeroU32::new(1).unwrap()).unwrap()[0]
+                .event
+                .frame()
+                .as_bytes(),
+            original
+        );
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn reconnects_after_failure_and_commits_before_broadcast() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("service.sqlite");
+        let store = CaptureStore::open(&path, NonZeroU32::new(10).unwrap()).unwrap();
+        let policy =
+            ReconnectPolicy::new(Duration::from_millis(10), Duration::from_millis(20)).unwrap();
+        let mut service = CaptureService::new(spec(), Some(store), policy, capacity(8));
+        let mut states = service.subscribe_state();
+        let mut frames = service.subscribe_frames();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicUsize::new(0));
+        let received = Arc::new(AtomicUsize::new(0));
+        let original = frame(7);
+        let raw = original.as_bytes().to_vec();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let connector = {
+            let attempts = Arc::clone(&attempts);
+            let closed = Arc::clone(&closed);
+            let received = Arc::clone(&received);
+            move || {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                let frame = original.clone();
+                let closed = Arc::clone(&closed);
+                let received = Arc::clone(&received);
+                async move {
+                    if attempt == 0 {
+                        Err("gateway unavailable")
+                    } else {
+                        Ok(FakeConnection {
+                            frames: VecDeque::from([frame]),
+                            close_when_empty: false,
+                            closed,
+                            received,
+                        })
+                    }
+                }
+            }
+        };
+        let observer = async {
+            loop {
+                states.changed().await.unwrap();
+                if let ConnectionState::WaitingRetry { reason, .. } = &*states.borrow() {
+                    assert_eq!(reason, "gateway unavailable");
+                    break;
+                }
+            }
+            let live = frames.recv().await.unwrap();
+            assert_eq!(live.id, Some(1));
+            assert_eq!(live.event.frame().as_bytes(), raw);
+            stop_tx.send(()).unwrap();
+        };
+        let (result, ()) = timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                service.run_with(connector, async {
+                    let _ = stop_rx.await;
+                }),
+                observer
+            )
+        })
+        .await
+        .unwrap();
+        result.unwrap();
+        assert_eq!(*states.borrow(), ConnectionState::Stopped);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(received.load(Ordering::SeqCst), 1);
+        assert_eq!(closed.load(Ordering::SeqCst), 1);
+        drop(service);
+        let history = CaptureStore::open_existing(&path).unwrap();
+        assert_eq!(
+            history.read_after(0, NonZeroU32::new(1).unwrap()).unwrap()[0]
+                .event
+                .frame()
+                .as_bytes(),
+            raw
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_connection_enters_retry_state() {
+        let policy =
+            ReconnectPolicy::new(Duration::from_millis(10), Duration::from_millis(40)).unwrap();
+        let mut service = CaptureService::new(spec(), None, policy, capacity(1));
+        let mut states = service.subscribe_state();
+        let closed = Arc::new(AtomicUsize::new(0));
+        let received = Arc::new(AtomicUsize::new(0));
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let connector = {
+            let closed = Arc::clone(&closed);
+            let received = Arc::clone(&received);
+            move || {
+                let closed = Arc::clone(&closed);
+                let received = Arc::clone(&received);
+                async move {
+                    Ok::<_, &'static str>(FakeConnection {
+                        frames: VecDeque::new(),
+                        close_when_empty: true,
+                        closed,
+                        received,
+                    })
+                }
+            }
+        };
+        let observer = async {
+            let mut retry_delays = Vec::new();
+            loop {
+                states.changed().await.unwrap();
+                if let ConnectionState::WaitingRetry { reason, delay } = &*states.borrow() {
+                    assert_eq!(reason, "connection closed");
+                    retry_delays.push(*delay);
+                    if retry_delays.len() == 2 {
+                        assert_eq!(
+                            retry_delays,
+                            [Duration::from_millis(10), Duration::from_millis(20)]
+                        );
+                        stop_tx.send(()).unwrap();
+                        break;
+                    }
+                }
+            }
+        };
+        let (result, ()) = timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                service.run_with(connector, async {
+                    let _ = stop_rx.await;
+                }),
+                observer
+            )
+        })
+        .await
+        .unwrap();
+        result.unwrap();
+        assert_eq!(closed.load(Ordering::SeqCst), 2);
+        assert_eq!(*states.borrow(), ConnectionState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn slow_subscriber_gets_explicit_application_lag_count() {
+        let mut service =
+            CaptureService::new(spec(), None, ReconnectPolicy::default(), capacity(1));
+        let mut frames = service.subscribe_frames();
+        let closed = Arc::new(AtomicUsize::new(0));
+        let received = Arc::new(AtomicUsize::new(0));
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let connector = {
+            let closed = Arc::clone(&closed);
+            let received = Arc::clone(&received);
+            move || {
+                let closed = Arc::clone(&closed);
+                let received = Arc::clone(&received);
+                async move {
+                    Ok::<_, &'static str>(FakeConnection {
+                        frames: VecDeque::from([frame(1), frame(2), frame(3)]),
+                        close_when_empty: false,
+                        closed,
+                        received,
+                    })
+                }
+            }
+        };
+        let observer = async {
+            while received.load(Ordering::SeqCst) < 3 {
+                tokio::task::yield_now().await;
+            }
+            assert!(matches!(
+                frames.recv().await,
+                Err(broadcast::error::RecvError::Lagged(2))
+            ));
+            assert_eq!(
+                frames.recv().await.unwrap().event.frame().payload(),
+                &[0, 0x80, 3]
+            );
+            stop_tx.send(()).unwrap();
+        };
+        let (result, ()) = timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                service.run_with(connector, async {
+                    let _ = stop_rx.await;
+                }),
+                observer
+            )
+        })
+        .await
+        .unwrap();
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn storage_failure_stops_instead_of_silently_dropping_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("readonly.sqlite");
+        drop(CaptureStore::open(&path, NonZeroU32::new(10).unwrap()).unwrap());
+        let readonly = CaptureStore::open_existing(&path).unwrap();
+        let mut service = CaptureService::new(
+            spec(),
+            Some(readonly),
+            ReconnectPolicy::default(),
+            capacity(1),
+        );
+        let states = service.subscribe_state();
+        let closed = Arc::new(AtomicUsize::new(0));
+        let received = Arc::new(AtomicUsize::new(0));
+        let connector = {
+            let closed = Arc::clone(&closed);
+            let received = Arc::clone(&received);
+            move || {
+                let closed = Arc::clone(&closed);
+                let received = Arc::clone(&received);
+                async move {
+                    Ok::<_, &'static str>(FakeConnection {
+                        frames: VecDeque::from([frame(1)]),
+                        close_when_empty: false,
+                        closed,
+                        received,
+                    })
+                }
+            }
+        };
+        let result = timeout(
+            Duration::from_secs(2),
+            service.run_with(connector, std::future::pending()),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result,
+            Err(ServiceError::Storage(StorageError::ReadOnly))
+        ));
+        assert!(matches!(
+            &*states.borrow(),
+            ConnectionState::StorageFailed { .. }
+        ));
+        assert_eq!(closed.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn rejects_invalid_backoff() {
+        assert!(ReconnectPolicy::new(Duration::ZERO, Duration::from_secs(1)).is_err());
+        assert!(ReconnectPolicy::new(Duration::from_secs(2), Duration::from_secs(1)).is_err());
+        assert!(ReconnectPolicy::new(Duration::from_secs(1), Duration::from_secs(2)).is_ok());
+    }
+}

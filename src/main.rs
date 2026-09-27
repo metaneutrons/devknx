@@ -2,15 +2,17 @@
 // Copyright (C) 2026 Fabian Schmieder
 
 use clap::{Parser, Subcommand};
-use devknx::capture::{CaptureEndpoint, CaptureEvent, CaptureExit, capture_until};
+use devknx::capture::CaptureEvent;
+use devknx::service::{CaptureService, ReconnectPolicy};
 use devknx::storage::CaptureStore;
-use knx_rs_ip::{connect, discovery, parse_url};
+use knx_rs_ip::{ConnectionSpec, discovery, parse_url};
 use std::fmt::Write as _;
 use std::io::{self, Write as _};
 use std::net::Ipv4Addr;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
+use tokio::sync::{broadcast, oneshot};
 
 #[cfg(feature = "gui")]
 mod gui;
@@ -78,40 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_events,
         }) => {
             let spec = parse_url(&endpoint)?;
-            let capture_endpoint = CaptureEndpoint::from(spec.clone());
-            let mut store = database
-                .as_deref()
-                .map(|path| CaptureStore::open(path, max_events))
-                .transpose()?;
-            let mut connection = connect(spec).await?;
-            let stdout = io::stdout();
-            let mut output = stdout.lock();
-            let exit = capture_until(
-                &mut connection,
-                capture_endpoint,
-                |event| {
-                    let id = store
-                        .as_mut()
-                        .map(|store| store.insert(&event))
-                        .transpose()
-                        .map_err(io::Error::other)?;
-                    let line = format_event(&event);
-                    match id {
-                        Some(id) => writeln!(output, "id={id} {line}")?,
-                        None => writeln!(output, "{line}")?,
-                    }
-                    output.flush()
-                },
-                tokio::signal::ctrl_c(),
-            )
-            .await?;
-            if exit == CaptureExit::Disconnected {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    format!("KNXnet/IP connection closed: {capture_endpoint}"),
-                )
-                .into());
-            }
+            run_monitor(spec, database, max_events).await?;
         }
         Some(Command::History {
             database,
@@ -142,6 +111,86 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+async fn run_monitor(
+    spec: ConnectionSpec,
+    database: Option<PathBuf>,
+    max_events: NonZeroU32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let has_database = database.is_some();
+    let store = database
+        .as_deref()
+        .map(|path| CaptureStore::open(path, max_events))
+        .transpose()?;
+    let queue_capacity = NonZeroUsize::new(1_024).expect("nonzero live queue capacity");
+    let service = CaptureService::new(spec, store, ReconnectPolicy::default(), queue_capacity);
+    let mut states = service.subscribe_state();
+    let mut frames = service.subscribe_frames();
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let mut stop_tx = Some(stop_tx);
+    let mut task = tokio::spawn(async move {
+        let mut service = service;
+        service
+            .run_until(async {
+                let _ = stop_rx.await;
+            })
+            .await
+    });
+    let signal = tokio::signal::ctrl_c();
+    tokio::pin!(signal);
+    let mut terminal_error: Option<io::Error> = None;
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut signal => {
+                if let Err(error) = result {
+                    terminal_error = Some(error);
+                }
+                break;
+            }
+            result = &mut task => return Ok(result??),
+            changed = states.changed() => {
+                if changed.is_ok() {
+                    eprintln!("connection_state={:?}", *states.borrow_and_update());
+                }
+            }
+            frame = frames.recv() => {
+                match frame {
+                    Ok(live) => {
+                        let event_line = format_event(&live.event);
+                        let result = {
+                            let stdout = io::stdout();
+                            let mut output = stdout.lock();
+                            match live.id {
+                                Some(id) => writeln!(output, "id={id} {event_line}"),
+                                None => writeln!(output, "{event_line}"),
+                            }.and_then(|()| output.flush())
+                        };
+                        if let Err(error) = result {
+                            terminal_error = Some(error);
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(count)) => {
+                        eprintln!("live_subscriber_lagged={count} (application events, not KNX bus telegrams)");
+                        if !has_database {
+                            eprintln!("No durable history is configured for missed live events");
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {}
+                }
+            }
+        }
+    }
+    if let Some(sender) = stop_tx.take() {
+        let _ = sender.send(());
+    }
+    task.await??;
+    if let Some(error) = terminal_error {
+        return Err(Box::new(error));
+    }
+    Ok(())
+}
+
 fn format_event(event: &CaptureEvent) -> String {
     let timestamp_ms = event
         .observed_at()
@@ -166,6 +215,7 @@ fn format_event(event: &CaptureEvent) -> String {
 
 #[cfg(test)]
 mod tests {
+    use devknx::capture::CaptureEndpoint;
     use knx_rs_core::address::{DestinationAddress, GroupAddress, IndividualAddress};
     use knx_rs_core::cemi::CemiFrame;
     use knx_rs_core::message::MessageCode;

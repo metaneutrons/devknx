@@ -5,4 +5,5 @@
 
 pub mod capabilities;
 pub mod capture;
+pub mod service;
 pub mod storage;

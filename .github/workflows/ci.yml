@@ -90,8 +90,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & ./scripts/check-windows-icon.ps1 -Executable target/debug/devknx.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & pwsh -NoProfile -File ./scripts/check-windows-icon.ps1 -Executable target/debug/devknx.exe -IconId 32767 > $null
-          if ($LASTEXITCODE -ne 23) { throw "The absent-icon counter-probe did not fail as expected" }
+          $probe = Start-Process -FilePath (Get-Command pwsh).Source `
+            -ArgumentList @('-NoProfile', '-File', './scripts/check-windows-icon.ps1',
+              '-Executable', 'target/debug/devknx.exe', '-IconId', '32767') `
+            -Wait -PassThru -NoNewWindow
+          if ($probe.ExitCode -ne 23) { throw "The absent-icon counter-probe did not fail as expected" }
       - run: cargo doc --workspace --no-deps --locked ${{ matrix.features }}
         env:
           RUSTDOCFLAGS: '-D warnings'

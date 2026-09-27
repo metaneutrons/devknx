@@ -3,6 +3,7 @@
 
 use clap::{Parser, Subcommand};
 use devknx::capture::CaptureEvent;
+use devknx::ipc::{IpcClient, IpcServer};
 use devknx::service::{CaptureService, ReconnectPolicy};
 use devknx::storage::CaptureStore;
 use knx_rs_ip::{ConnectionSpec, discovery, parse_url};
@@ -49,6 +50,18 @@ enum Command {
         /// Maximum rows retained in the database.
         #[arg(long, default_value_t = NonZeroU32::new(100_000).expect("nonzero"))]
         max_events: NonZeroU32,
+    },
+    /// Read the current state of an independent capture process.
+    Status {
+        /// Existing SQLite database owned by `serve`.
+        #[arg(long)]
+        database: PathBuf,
+    },
+    /// Stream state changes and committed captures from `serve` as JSON lines.
+    Follow {
+        /// Existing SQLite database owned by `serve`.
+        #[arg(long)]
+        database: PathBuf,
     },
     /// Read captured telegrams after a monotonic event ID.
     History {
@@ -110,6 +123,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let spec = parse_url(&endpoint)?;
             run_service(spec, database, max_events).await?;
         }
+        Some(Command::Status { database }) => run_ipc_client(&database, false).await?,
+        Some(Command::Follow { database }) => run_ipc_client(&database, true).await?,
         Some(Command::History {
             database,
             after,
@@ -157,6 +172,10 @@ async fn run_service(
         queue_capacity,
     );
     let mut states = service.subscribe_state();
+    let ipc_states = service.subscribe_state();
+    let ipc_frames = service.subscribe_frames();
+    let ipc = IpcServer::bind(&database)?;
+    let mut ipc_task = tokio::spawn(ipc.run(ipc_states, ipc_frames));
     let (stop_tx, stop_rx) = oneshot::channel();
     let mut task = tokio::spawn(async move {
         let mut service = service;
@@ -172,7 +191,18 @@ async fn run_service(
         tokio::select! {
             biased;
             result = &mut signal => break result.err(),
-            result = &mut task => return Ok(result??),
+            result = &mut task => {
+                ipc_task.abort();
+                return Ok(result??);
+            }
+            result = &mut ipc_task => {
+                task.abort();
+                return Err(match result {
+                    Ok(Err(error)) => Box::new(error) as Box<dyn std::error::Error>,
+                    Ok(Ok(())) => Box::new(io::Error::other("local IPC server stopped")),
+                    Err(error) => Box::new(error),
+                });
+            }
             changed = states.changed() => {
                 if changed.is_ok() {
                     eprintln!("connection_state={:?}", *states.borrow_and_update());
@@ -182,8 +212,26 @@ async fn run_service(
     };
     let _ = stop_tx.send(());
     task.await??;
+    ipc_task.abort();
     if let Some(error) = signal_error {
         return Err(Box::new(error));
+    }
+    Ok(())
+}
+
+async fn run_ipc_client(
+    database: &std::path::Path,
+    follow: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = IpcClient::connect(database, follow).await?;
+    while let Some(message) = client.next().await? {
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        writeln!(output, "{}", serde_json::to_string(&message)?)?;
+        output.flush()?;
+        if !follow {
+            break;
+        }
     }
     Ok(())
 }

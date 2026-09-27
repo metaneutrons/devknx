@@ -17,7 +17,7 @@
 </p>
 
 > [!IMPORTANT]
-> **Early development.** There is no stable release yet. The CLI can discover gateways, capture raw telegrams from a KNXnet/IP tunnel or router, and retain them in SQLite through a foreground capture process. The native GUI is still a discovery shell. There is no IPC-enabled background daemon, ETS import, or group-value sending. Do not use it to operate a live installation.
+> **Early development.** There is no stable release yet. The CLI can discover gateways, capture raw telegrams from a KNXnet/IP tunnel or router, and retain them in SQLite through a foreground capture process with local status and live-stream IPC. The native GUI is still a discovery shell. There is no automatic daemon startup, ETS import, or group-value sending. Do not use it to operate a live installation.
 
 ## What devknx is building
 
@@ -31,7 +31,7 @@ desktop button and an API call.
 | --- | --- |
 | KNXnet/IP gateway discovery | CLI and native GUI shell available |
 | KNXnet/IP tunneling and routing capture | Experimental CLI stream with bounded reconnect and optional SQLite persistence |
-| Independent capture process | Experimental foreground `serve` command; no IPC or automatic startup yet |
+| Independent capture process | Experimental foreground `serve` command with current-user `status` and `follow` IPC; no automatic startup yet |
 | Durable, searchable telegram history | Experimental SQLite history with ID cursor, retention cap, and CSV export; filters/search and the background daemon are pending |
 | ETS group-address CSV and XML import | Planned |
 | DPT-validated read, write preview, and write | Planned |
@@ -61,6 +61,8 @@ cargo run --locked -- monitor tunnel://192.0.2.1:3671
 cargo run --locked -- monitor router://224.0.23.12:3671
 cargo run --locked -- monitor tunnel://192.0.2.1:3671 --database captures.sqlite
 cargo run --locked -- serve tunnel://192.0.2.1:3671 --database captures.sqlite
+cargo run --locked -- status --database captures.sqlite
+cargo run --locked -- follow --database captures.sqlite
 cargo run --locked -- history --database captures.sqlite --after 0 --limit 100
 cargo run --locked -- export --database captures.sqlite > captures.csv
 cargo run --locked -- backup --database captures.sqlite --output captures-backup.sqlite
@@ -96,15 +98,24 @@ runs an in-process connection owner and live event bus; capture continues if
 its terminal subscriber falls behind. The connection and database are still
 owned only while `monitor` is running. `serve` runs the same capture owner in a
 separate foreground process; it can be kept alive by a service manager while
-`history` and `export` read the database from other processes. It does not
-detach, auto-start, or provide live IPC to other frontends. One writable owner
+`history`, `export`, and `backup` read the database from other processes.
+`status` and `follow` connect to the running owner over current-user local IPC;
+`follow` emits version-one JSON lines with connection states, committed captures,
+and explicit application-subscriber lag counts. The process does not detach or
+auto-start. One writable owner
 per database is enforced by a sidecar `.writer.lock` file, which is retained
 across restarts and must not be deleted while capture runs. On Unix, a writable
-capture directory must not be group- or world-writable. An IPC-enabled daemon
-and cross-process live subscription remain planned.
+capture directory must not be group- or world-writable. The Unix IPC socket
+lives under a private directory beside the database; the Windows named pipe
+uses a current-user access-control list. The GUI and other surfaces do not yet
+attach to this stream.
+The [local IPC protocol](docs/local-ipc.md) is documented for development
+clients; it is not yet a stable external API.
 
 Run `serve` under a service manager if capture must survive terminal closure;
-use another terminal for `history` or `export` while it runs.
+use another terminal for `status`, `follow`, `history`, `export`, or `backup`
+while it runs. `monitor` is still a standalone capture command and should not
+be run against the same gateway and database as `serve`.
 
 Capture files can reveal activity in a building. Newly created SQLite files
 are private to the current user on Unix; choose a protected directory and

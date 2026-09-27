@@ -24,6 +24,10 @@ pub enum Capability {
     CsvExport,
     /// Create a consistent, non-overwriting SQLite snapshot.
     DatabaseBackup,
+    /// Query the independent capture process's current state.
+    ServiceStatus,
+    /// Follow the independent process's live state and captures.
+    ServiceFollow,
 }
 
 /// All currently implemented user-facing operations.
@@ -34,6 +38,8 @@ pub const ALL: &[Capability] = &[
     Capability::HistoryRead,
     Capability::CsvExport,
     Capability::DatabaseBackup,
+    Capability::ServiceStatus,
+    Capability::ServiceFollow,
 ];
 
 /// An application surface that exposes capabilities.
@@ -79,6 +85,14 @@ pub const CLI: &[Declaration] = &[
     Declaration {
         capability: Capability::DatabaseBackup,
         source_anchor: "Some(Command::Backup {",
+    },
+    Declaration {
+        capability: Capability::ServiceStatus,
+        source_anchor: "Some(Command::Status {",
+    },
+    Declaration {
+        capability: Capability::ServiceFollow,
+        source_anchor: "Some(Command::Follow {",
     },
 ];
 
@@ -138,6 +152,20 @@ pub const GAPS: &[Gap] = &[
         present_on: Surface::Cli,
         missing_on: Surface::Gui,
         reason: "Database snapshots are available in the CLI; the GUI has no history controls yet.",
+        target_issue: "https://github.com/metaneutrons/devknx/issues/7",
+    },
+    Gap {
+        capability: Capability::ServiceStatus,
+        present_on: Surface::Cli,
+        missing_on: Surface::Gui,
+        reason: "The GUI has not yet attached to the independent capture process.",
+        target_issue: "https://github.com/metaneutrons/devknx/issues/7",
+    },
+    Gap {
+        capability: Capability::ServiceFollow,
+        present_on: Surface::Cli,
+        missing_on: Surface::Gui,
+        reason: "The GUI has not yet attached to the independent capture process.",
         target_issue: "https://github.com/metaneutrons/devknx/issues/7",
     },
 ];

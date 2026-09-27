@@ -20,6 +20,8 @@ pub fn run(database: Option<PathBuf>, smoke: bool) -> Result<(), Box<dyn std::er
         image::load_from_memory(include_bytes!("../resources/png/devknx-256.png"))?.to_rgba8();
     let (width, height) = icon.dimensions();
     let options = eframe::NativeOptions {
+        #[cfg(target_os = "windows")]
+        renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
             .with_app_id("devknx")
             .with_title("devknx")

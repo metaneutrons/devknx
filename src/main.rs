@@ -252,12 +252,12 @@ enum Command {
         #[arg(long, hide = true, requires = "database", conflicts_with = "smoke")]
         smoke_live: bool,
     },
-    /// Open the interactive terminal monitor for an existing capture database.
+    /// Open the interactive terminal monitor.
     #[cfg(feature = "tui")]
     Tui {
-        /// Existing capture database owned by `serve` while live.
+        /// Existing capture database; defaults to private per-user storage.
         #[arg(long)]
-        database: PathBuf,
+        database: Option<PathBuf>,
     },
 }
 
@@ -563,6 +563,10 @@ async fn run_service(
     database: PathBuf,
     max_events: NonZeroU32,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let configured_endpoint = match &spec {
+        ConnectionSpec::Tunnel(address) => format!("tunnel://{address}"),
+        ConnectionSpec::Router(address) => format!("router://{address}"),
+    };
     let store = CaptureStore::open(&database, max_events)?;
     let queue_capacity = NonZeroUsize::new(1_024).expect("nonzero live queue capacity");
     let service = CaptureService::new(
@@ -577,7 +581,10 @@ async fn run_service(
     let ipc_frames = service.subscribe_frames();
     let ipc_routing_losses = service.subscribe_routing_losses();
     let ipc_operations = service.operation_sender();
-    let ipc = IpcServer::bind(&database)?;
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
+    let ipc = IpcServer::bind(&database)?
+        .with_shutdown(shutdown_tx)
+        .with_configured_endpoint(configured_endpoint);
     let mut ipc_task =
         tokio::spawn(ipc.run(ipc_states, ipc_frames, ipc_routing_losses, ipc_operations));
     let (stop_tx, stop_rx) = oneshot::channel();
@@ -595,6 +602,7 @@ async fn run_service(
         tokio::select! {
             biased;
             result = &mut signal => break result.err(),
+            _ = shutdown_rx.recv() => break None,
             result = &mut task => {
                 ipc_task.abort();
                 return Ok(result??);

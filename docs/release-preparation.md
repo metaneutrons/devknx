@@ -9,7 +9,9 @@ Release Please uses the single-crate Rust strategy and a 0.0.0 bootstrap
 manifest to propose 0.1.0 as the first version. The source crate remains at
 0.1.0 until that proposal is merged. Release Please synchronizes
 `Cargo.toml`, `Cargo.lock`, the manifest, and `CHANGELOG.md`. The proposal
-must remain unmerged until the release is separately authorized. Only its
+must remain unmerged until the release is separately authorized. The
+Release-Please PR is reviewed and merged manually; auto-merge must remain off.
+Only its
 merge creates the immutable tag and draft GitHub release, then dispatches
 the hardened pipeline against that exact tag.
 

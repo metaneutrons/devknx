@@ -83,7 +83,8 @@ mod gui_live {
                     && matches!(
                         timeout(Duration::from_secs(1), client.next()).await,
                         Ok(Ok(Some(IpcMessage::State {
-                            value: WireState::Connected { .. }
+                            value: WireState::Connected { .. },
+                            ..
                         })))
                     )
                 {

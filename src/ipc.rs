@@ -53,13 +53,18 @@ pub enum IpcError {
     MessageTooLarge,
 }
 
-/// Development-version-two local protocol record. A lag count is application fan-out loss,
+/// Development-version-three local protocol record. A lag count is application fan-out loss,
 /// not a KNX bus packet-loss measurement.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum IpcMessage {
     /// Connection lifecycle state.
-    State { value: WireState },
+    State {
+        value: WireState,
+        /// Endpoint configured for this owner, including during reconnect.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        configured_endpoint: Option<String>,
+    },
     /// One committed or ephemeral capture event.
     Capture {
         /// SQLite event ID when capture is persistent.
@@ -287,6 +292,8 @@ fn pipe_name(database: &Path) -> io::Result<String> {
 /// One authenticated local listener owned by the capture process.
 pub struct IpcServer {
     listener: Listener,
+    shutdown: Option<mpsc::Sender<()>>,
+    configured_endpoint: Option<String>,
     #[cfg(unix)]
     _owner_lease: File,
 }
@@ -368,9 +375,25 @@ impl IpcServer {
         };
         Ok(Self {
             listener,
+            shutdown: None,
+            configured_endpoint: None,
             #[cfg(unix)]
             _owner_lease: owner_lease,
         })
+    }
+
+    /// Allow current-user clients to request a graceful capture shutdown.
+    #[must_use]
+    pub fn with_shutdown(mut self, shutdown: mpsc::Sender<()>) -> Self {
+        self.shutdown = Some(shutdown);
+        self
+    }
+
+    /// Identify the owner's target even while it is connecting or retrying.
+    #[must_use]
+    pub fn with_configured_endpoint(mut self, endpoint: String) -> Self {
+        self.configured_endpoint = Some(endpoint);
+        self
     }
 
     /// Serve concurrent status and live-subscription clients.
@@ -396,9 +419,20 @@ impl IpcServer {
             let frames = frames.resubscribe();
             let routing_losses = routing_losses.resubscribe();
             let operations = operations.clone();
+            let shutdown = self.shutdown.clone();
+            let configured_endpoint = self.configured_endpoint.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                let _ = handle_client(stream, state, frames, routing_losses, operations).await;
+                let _ = handle_client(
+                    stream,
+                    state,
+                    frames,
+                    routing_losses,
+                    operations,
+                    shutdown,
+                    configured_endpoint,
+                )
+                .await;
             });
         }
     }
@@ -410,8 +444,32 @@ async fn handle_client(
     mut frames: broadcast::Receiver<LiveCapture>,
     mut routing_losses: broadcast::Receiver<LiveRoutingLoss>,
     operations: mpsc::Sender<OperationEnvelope>,
+    shutdown: Option<mpsc::Sender<()>>,
+    configured_endpoint: Option<String>,
 ) -> Result<(), IpcError> {
     let command = read_line(&mut stream, 16).await?;
+    if command == b"STOP" {
+        if let Some(shutdown) = shutdown {
+            write_message(
+                &mut stream,
+                &IpcMessage::State {
+                    value: WireState::Stopped,
+                    configured_endpoint: configured_endpoint.clone(),
+                },
+            )
+            .await?;
+            let _ = shutdown.send(()).await;
+        } else {
+            write_message(
+                &mut stream,
+                &IpcMessage::OperationError {
+                    reason: "capture owner does not support remote shutdown".to_owned(),
+                },
+            )
+            .await?;
+        }
+        return Ok(());
+    }
     if command == b"OPERATE" {
         let request = read_line(&mut stream, MAX_MESSAGE_SIZE).await?;
         let request: OperationRequest = serde_json::from_slice(&request)?;
@@ -445,6 +503,7 @@ async fn handle_client(
     }
     let initial = IpcMessage::State {
         value: WireState::from(&*state.borrow_and_update()),
+        configured_endpoint: configured_endpoint.clone(),
     };
     write_message(&mut stream, &initial).await?;
     if command == b"STATUS" {
@@ -458,6 +517,7 @@ async fn handle_client(
                 }
                 let message = IpcMessage::State {
                     value: WireState::from(&*state.borrow_and_update()),
+                    configured_endpoint: configured_endpoint.clone(),
                 };
                 write_message(&mut stream, &message).await?;
             }
@@ -659,6 +719,46 @@ struct OriginatedOperation {
 }
 
 impl IpcClient {
+    /// Request a graceful stop from the current-user capture owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no owner is available or shutdown is unsupported.
+    pub async fn stop(database: &Path) -> Result<(), IpcError> {
+        #[cfg(unix)]
+        let mut stream = {
+            let path = socket_path(database, false)?;
+            Stream::connect(path.as_os_str().to_fs_name::<GenericFilePath>()?).await?
+        };
+        #[cfg(windows)]
+        let mut stream = {
+            let name = pipe_name(database)?;
+            Stream::connect(name.to_ns_name::<GenericNamespaced>()?).await?
+        };
+        stream.write_all(b"STOP\n").await?;
+        let mut client = Self {
+            reader: BufReader::new(stream),
+        };
+        let message = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "IPC shutdown timed out"))??
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "capture owner closed without a shutdown response",
+                )
+            })?;
+        match message {
+            IpcMessage::State {
+                value: WireState::Stopped,
+                ..
+            } => Ok(()),
+            IpcMessage::OperationError { reason } => Err(IpcError::Io(io::Error::other(reason))),
+            _ => Err(IpcError::Io(io::Error::other(
+                "unexpected shutdown response",
+            ))),
+        }
+    }
     /// Request one current state or subscribe to future records.
     ///
     /// # Errors
@@ -795,6 +895,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_identifies_the_configured_endpoint_before_connecting() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("captures.sqlite");
+        drop(CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap());
+        let (state_tx, state_rx) = watch::channel(ConnectionState::Idle);
+        let (frames_tx, frames_rx) = broadcast::channel(8);
+        let (losses_tx, losses_rx) = broadcast::channel(8);
+        let (operations_tx, _operations_rx) = mpsc::channel(8);
+        let endpoint = "tunnel://192.0.2.8:3671";
+        let server = IpcServer::bind(&database)
+            .unwrap()
+            .with_configured_endpoint(endpoint.into());
+        let task = tokio::spawn(server.run(state_rx, frames_rx, losses_rx, operations_tx));
+        let mut client = IpcClient::connect(&database, false).await.unwrap();
+        assert_eq!(
+            client.next().await.unwrap(),
+            Some(IpcMessage::State {
+                value: WireState::Idle,
+                configured_endpoint: Some(endpoint.into()),
+            })
+        );
+        task.abort();
+        let _ = task.await;
+        drop((state_tx, frames_tx, losses_tx));
+    }
+
+    #[tokio::test]
     async fn local_ipc_has_only_one_active_listener() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("captures.sqlite");
@@ -803,6 +930,43 @@ mod tests {
         assert!(IpcServer::bind(&database).is_err());
         drop(first);
         assert!(IpcServer::bind(&database).is_ok());
+    }
+
+    #[tokio::test]
+    async fn shutdown_requires_an_opted_in_owner_and_acknowledges_before_stop() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("captures.sqlite");
+        drop(CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap());
+        let (state_tx, state_rx) = watch::channel(ConnectionState::Idle);
+        let (frames_tx, frames_rx) = broadcast::channel(8);
+        let (losses_tx, losses_rx) = broadcast::channel(8);
+        let (operations_tx, _operations_rx) = mpsc::channel(8);
+        let server = IpcServer::bind(&database).unwrap();
+        let task = tokio::spawn(server.run(state_rx, frames_rx, losses_rx, operations_tx));
+        assert!(IpcClient::stop(&database).await.is_err());
+        task.abort();
+        let _ = task.await;
+        drop((state_tx, frames_tx, losses_tx));
+
+        let (state_tx, state_rx) = watch::channel(ConnectionState::Idle);
+        let (frames_tx, frames_rx) = broadcast::channel(8);
+        let (losses_tx, losses_rx) = broadcast::channel(8);
+        let (operations_tx, _operations_rx) = mpsc::channel(8);
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
+        let server = IpcServer::bind(&database)
+            .unwrap()
+            .with_shutdown(shutdown_tx);
+        let task = tokio::spawn(server.run(state_rx, frames_rx, losses_rx, operations_tx));
+        IpcClient::stop(&database).await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), shutdown_rx.recv())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        task.abort();
+        let _ = task.await;
+        drop((state_tx, frames_tx, losses_tx));
     }
 
     #[cfg(unix)]

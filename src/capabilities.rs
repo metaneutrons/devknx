@@ -151,6 +151,10 @@ pub const TUI: &[Declaration] = &[
         source_anchor: "follower.receiver.try_iter()",
     },
     Declaration {
+        capability: Capability::CaptureService,
+        source_anchor: "interface::connect_owner",
+    },
+    Declaration {
         capability: Capability::HistoryRead,
         source_anchor: "model.reload_history()",
     },
@@ -195,6 +199,10 @@ pub const GUI: &[Declaration] = &[
         source_anchor: "follower.receiver.try_iter()",
     },
     Declaration {
+        capability: Capability::CaptureService,
+        source_anchor: "interface::connect_owner",
+    },
+    Declaration {
         capability: Capability::HistoryRead,
         source_anchor: "model.reload_history()",
     },
@@ -208,7 +216,7 @@ pub const GUI: &[Declaration] = &[
     },
     Declaration {
         capability: Capability::ServiceFollow,
-        source_anchor: "Follower::start(database)",
+        source_anchor: "Follower::start(database.clone())",
     },
     Declaration {
         capability: Capability::EtsLookup,
@@ -266,18 +274,6 @@ pub const GAPS: &[Gap] = &[
         missing_on: Surface::Gui,
         reason: "REST listener configuration is an explicit CLI service operation",
         target_issue: M5,
-    },
-    Gap {
-        capability: Capability::CaptureService,
-        missing_on: Surface::Tui,
-        reason: "TUI attaches to the service; it does not own it",
-        target_issue: M4,
-    },
-    Gap {
-        capability: Capability::CaptureService,
-        missing_on: Surface::Gui,
-        reason: "GUI attaches to the service; it does not own it",
-        target_issue: M4,
     },
     Gap {
         capability: Capability::DatabaseBackup,
@@ -350,6 +346,7 @@ mod tests {
     const TUI_SOURCE: &str = include_str!("tui.rs");
     const GUI_SOURCE: &str = include_str!("gui.rs");
 
+    #[expect(clippy::too_many_lines, reason = "one source-anchored registry audit")]
     fn audit(sources: [&str; 3], gaps: &[Gap]) -> Result<(), String> {
         let known: HashSet<_> = ALL.iter().copied().collect();
         if known.len() != ALL.len() {
@@ -420,9 +417,12 @@ mod tests {
             }
         }
         for needle in [
-            "Open database…",
+            "Open Capture",
             "Discover gateways",
-            "Export CSV…",
+            "Settings…",
+            "Connect",
+            "Disconnect",
+            "Export…",
             "Read…",
             "Write…",
             "capture-filter",
@@ -440,6 +440,8 @@ mod tests {
             "'e'",
             "'h'",
             "'d'",
+            "'c'",
+            "'s'",
             "KeyCode::Down",
             "KeyCode::Up",
             "raw cEMI",

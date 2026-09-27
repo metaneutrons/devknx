@@ -16,7 +16,7 @@ use crossterm::terminal::{
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
-use crate::interface::{self, Follower, MonitorModel};
+use crate::interface::{self, ConnectionSettings, Follower, MonitorModel};
 
 struct TerminalGuard;
 
@@ -58,6 +58,7 @@ enum Mode {
     WriteValue,
     ConfirmWrite,
     Export,
+    ConnectionEndpoint,
 }
 
 struct App {
@@ -65,6 +66,8 @@ struct App {
     follower: Follower,
     action_receiver: Option<Receiver<Result<devknx::ipc::IpcMessage, String>>>,
     discovery_receiver: Option<Receiver<Result<Vec<knx_rs_ip::discovery::GatewayInfo>, String>>>,
+    connection_receiver: Option<Receiver<Result<String, String>>>,
+    settings: ConnectionSettings,
     mode: Mode,
     input: String,
     write_address: String,
@@ -77,13 +80,22 @@ struct App {
 
 impl App {
     fn new(database: PathBuf) -> Result<Self, String> {
-        let model = MonitorModel::open(database.clone())?;
+        let mut model = MonitorModel::open(database.clone())?;
+        let settings = match interface::load_settings(&database) {
+            Ok(settings) => settings,
+            Err(error) => {
+                model.notice(format!("Connection settings could not be loaded: {error}"));
+                ConnectionSettings::default()
+            }
+        };
         let selected = model.rows.len().saturating_sub(1);
         Ok(Self {
             model,
             follower: Follower::start(database),
             action_receiver: None,
             discovery_receiver: None,
+            connection_receiver: None,
+            settings,
             mode: Mode::Normal,
             input: String::new(),
             write_address: String::new(),
@@ -149,6 +161,24 @@ impl App {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
+        if let Some(receiver) = &self.connection_receiver {
+            match receiver.try_recv() {
+                Ok(Ok(notice)) => {
+                    self.model.notice(notice);
+                    self.connection_receiver = None;
+                }
+                Ok(Err(error)) => {
+                    self.model.notice(error);
+                    self.connection_receiver = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.model
+                        .notice("Connection worker stopped unexpectedly".into());
+                    self.connection_receiver = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
     }
 
     fn visible_count(&self) -> usize {
@@ -169,6 +199,42 @@ impl App {
         self.action_receiver = Some(receiver);
         std::thread::spawn(move || {
             let _ = sender.send(interface::operate(&database, &request));
+        });
+    }
+
+    fn start_connection(&mut self) {
+        if self.connection_receiver.is_some() {
+            return;
+        }
+        let endpoint = match self.settings.endpoint() {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                self.model.notice(error);
+                return;
+            }
+        };
+        if let Err(error) = interface::save_settings(&self.model.database, &self.settings) {
+            self.model
+                .notice(format!("Could not save connection settings: {error}"));
+            return;
+        }
+        let database = self.model.database.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.connection_receiver = Some(receiver);
+        std::thread::spawn(move || {
+            let _ = sender.send(interface::connect_owner(&database, &endpoint));
+        });
+    }
+
+    fn stop_connection(&mut self) {
+        if self.connection_receiver.is_some() {
+            return;
+        }
+        let database = self.model.database.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.connection_receiver = Some(receiver);
+        std::thread::spawn(move || {
+            let _ = sender.send(interface::disconnect_owner(&database));
         });
     }
 
@@ -215,6 +281,23 @@ impl App {
             Mode::Export => {
                 match interface::export_csv(&self.model.database, &PathBuf::from(input.trim())) {
                     Ok(count) => self.model.notice(format!("Exported {count} captures")),
+                    Err(error) => self.model.notice(error),
+                }
+                self.mode = Mode::Normal;
+            }
+            Mode::ConnectionEndpoint => {
+                match ConnectionSettings::from_endpoint(&input) {
+                    Ok(settings) => {
+                        self.settings = settings;
+                        match interface::save_settings(&self.model.database, &self.settings) {
+                            Ok(()) => self
+                                .model
+                                .notice("Connection settings saved. Press c to connect.".into()),
+                            Err(error) => self
+                                .model
+                                .notice(format!("Could not save connection settings: {error}")),
+                        }
+                    }
                     Err(error) => self.model.notice(error),
                 }
                 self.mode = Mode::Normal;
@@ -266,6 +349,23 @@ impl App {
         }
         match key.code {
             KeyCode::Char('q') => return true,
+            KeyCode::Char('c') => {
+                if self.model.owner_available {
+                    self.stop_connection();
+                } else if self.settings.address.is_empty() {
+                    self.mode = Mode::ConnectionEndpoint;
+                    self.input = "tunnel://".into();
+                } else {
+                    self.start_connection();
+                }
+            }
+            KeyCode::Char('s') => {
+                self.mode = Mode::ConnectionEndpoint;
+                self.input = self
+                    .settings
+                    .endpoint()
+                    .unwrap_or_else(|_| "tunnel://".into());
+            }
             KeyCode::Char('/') => {
                 self.mode = Mode::Filter;
                 self.input = self.model.filter.clone();
@@ -335,7 +435,19 @@ impl App {
         terminal.draw(|frame| {
             let areas = Layout::vertical([Constraint::Length(3), Constraint::Min(5), Constraint::Length(3), Constraint::Length(3)])
                 .split(frame.area());
-            let title = format!(" devknx · {:?} · {} ", self.model.state, self.model.database.display());
+            let status = if self.model.owner_available {
+                match &self.model.state {
+                    devknx::ipc::WireState::Idle => "Starting".into(),
+                    devknx::ipc::WireState::Connecting { .. } => "Connecting".into(),
+                    devknx::ipc::WireState::Connected { endpoint } => format!("Connected · {endpoint}"),
+                    devknx::ipc::WireState::WaitingRetry { reason, .. } => format!("Retrying · {reason}"),
+                    devknx::ipc::WireState::Stopped => "Disconnected".into(),
+                    devknx::ipc::WireState::StorageFailed { reason } => format!("Storage error · {reason}"),
+                }
+            } else {
+                "Disconnected".to_owned()
+            };
+            let title = format!(" KNXnet/IP · {status} ");
             frame.render_widget(Paragraph::new(title).block(Block::default().borders(Borders::ALL)), areas[0]);
 
             let visible: Vec<_> = self.model.rows.iter().filter(|row| row.matches(&self.model.filter)).collect();
@@ -344,9 +456,9 @@ impl App {
             let start = selected.saturating_sub(capacity.saturating_sub(1));
             let end = (start + capacity).min(visible.len());
             let items: Vec<ListItem> = visible[start..end].iter().enumerate().map(|(index, row)| {
-                let text = format!("{} {:8} {:8} → {:9} {:16} {}",
-                    row.timestamp_ms, row.direction, row.source, row.destination,
-                    row.service, row.label.as_deref().unwrap_or(""));
+                let text = format!("{} {:8} {:8} {:9} {:15} {:10} {}",
+                    interface::format_time(row.timestamp_ms), row.direction, row.source, row.destination,
+                    row.service, row.value.as_deref().unwrap_or("—"), row.label.as_deref().unwrap_or(""));
                 let style = if start + index == selected { Style::default().fg(Color::Black).bg(Color::Cyan) }
                     else { Style::default() };
                 ListItem::new(text).style(style)
@@ -356,11 +468,12 @@ impl App {
                 visible.len(), self.model.rows.len(), self.model.filter)).borders(Borders::ALL)), areas[1]);
             let detail = visible.get(selected).map_or_else(
                 || "No capture selected".to_owned(),
-                |row| format!("{} · {} · DPT [{}] · raw cEMI {}", row.destination,
-                    row.label.as_deref().unwrap_or("no ETS label"), row.dpts.join(", "), row.raw_cemi));
+                |row| format!("{} · {} · DPT [{}] · value {} · raw cEMI {}", row.destination,
+                    row.label.as_deref().unwrap_or("no ETS label"), row.dpts.join(", "),
+                    row.value.as_deref().unwrap_or("unknown"), row.raw_cemi));
             frame.render_widget(Paragraph::new(detail).block(Block::default().title(" Details ").borders(Borders::ALL)), areas[2]);
             let prompt = match self.mode {
-                Mode::Normal => "q quit · / filter · r read · w write · e export · h reload · PgUp older · d discover · j/k scroll".to_owned(),
+                Mode::Normal => "c connect/stop · s endpoint · d discover · / filter · r read · w write · e export · h reload · q quit".to_owned(),
                 Mode::Filter => format!("Filter: {}", self.input),
                 Mode::Read => format!("Read group address: {}", self.input),
                 Mode::WriteAddress => format!("Write group address: {}", self.input),
@@ -368,6 +481,7 @@ impl App {
                 Mode::WriteValue => format!("Typed value: {}", self.input),
                 Mode::ConfirmWrite => format!("{} · y transmit / n or Esc cancel", self.preview),
                 Mode::Export => format!("New CSV file path: {}", self.input),
+                Mode::ConnectionEndpoint => format!("KNXnet/IP endpoint (tunnel://IP:3671 or router://MULTICAST:3671): {}", self.input),
             };
             let notice = self.model.notices.last().map_or("", String::as_str);
             frame.render_widget(Paragraph::new(format!("{prompt}\n{notice}"))
@@ -377,7 +491,14 @@ impl App {
     }
 }
 
-pub fn run(database: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(database: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let database = if let Some(database) = database {
+        database
+    } else {
+        let database = interface::default_database().map_err(io::Error::other)?;
+        interface::ensure_database(&database).map_err(io::Error::other)?;
+        database
+    };
     let mut app = App::new(database).map_err(io::Error::other)?;
     install_panic_hook();
     let _guard = TerminalGuard::enter()?;
@@ -424,6 +545,47 @@ mod tests {
     }
 
     #[test]
+    fn malformed_connection_settings_do_not_hide_capture_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("capture.sqlite");
+        drop(CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap());
+        std::fs::write(directory.path().join("connection.json"), b"not JSON").unwrap();
+        let app = App::new(database).unwrap();
+        assert!(
+            app.model
+                .notices
+                .last()
+                .unwrap()
+                .contains("could not be loaded")
+        );
+        assert_eq!(app.settings, ConnectionSettings::default());
+    }
+
+    #[test]
+    fn endpoint_submission_saves_without_starting_a_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("capture.sqlite");
+        drop(CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap());
+        let mut app = App::new(database.clone()).unwrap();
+        app.mode = Mode::ConnectionEndpoint;
+        app.input = "tunnel://192.0.2.8:3671".into();
+        app.submit();
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.connection_receiver.is_none());
+        assert_eq!(
+            interface::load_settings(&database).unwrap(),
+            ConnectionSettings::from_endpoint("tunnel://192.0.2.8:3671").unwrap()
+        );
+        assert!(
+            app.model
+                .notices
+                .last()
+                .unwrap()
+                .contains("Press c to connect")
+        );
+    }
+
+    #[test]
     fn sustained_rows_scroll_filter_and_resize() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("capture.sqlite");
@@ -439,6 +601,7 @@ mod tests {
                 service: "GroupValueWrite".into(),
                 label: (id == 2_500).then(|| "kitchen light".into()),
                 dpts: vec!["DPT 1.001".into()],
+                value: None,
                 raw_cemi: "29 00".into(),
             });
         }

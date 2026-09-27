@@ -844,6 +844,7 @@ dependencies = [
  "async-stream",
  "axum",
  "cc",
+ "chrono",
  "clap",
  "crossterm",
  "csv",

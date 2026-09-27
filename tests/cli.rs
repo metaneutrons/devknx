@@ -173,7 +173,8 @@ async fn loopback_operations_match_preview_audit_raw_and_observe_read_response_o
                 && matches!(
                     client.next().await.unwrap(),
                     Some(IpcMessage::State {
-                        value: WireState::Connected { .. }
+                        value: WireState::Connected { .. },
+                        ..
                     })
                 )
             {
@@ -385,6 +386,63 @@ fn serve_rejects_a_second_capture_writer() {
 }
 
 #[tokio::test]
+async fn interactive_shutdown_stops_the_owner_and_releases_the_writer() {
+    struct CaptureChild(Child);
+    impl Drop for CaptureChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("interactive.sqlite");
+    let server = DeviceServer::start_at("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let endpoint = format!("tunnel://{}", server.local_addr());
+    assert!(IpcClient::stop(&database).await.is_err());
+    let child = Command::new(env!("CARGO_BIN_EXE_devknx"))
+        .args(["serve", &endpoint, "--database", database.to_str().unwrap()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut child = CaptureChild(child);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(mut client) = IpcClient::connect(&database, false).await
+                && matches!(client.next().await, Ok(Some(IpcMessage::State { .. })))
+            {
+                break;
+            }
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "capture owner exited before IPC startup"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    IpcClient::stop(&database).await.unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(status.success());
+    assert!(CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).is_ok());
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn serve_recovers_committed_history_after_process_termination() {
     struct CaptureChild(Child);
 
@@ -461,6 +519,10 @@ async fn serve_recovers_committed_history_after_process_termination() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "single end-to-end capture owner and IPC flow"
+)]
 async fn independent_capture_process_streams_committed_frames_over_local_ipc() {
     use std::fmt::Write as _;
 
@@ -520,6 +582,7 @@ async fn independent_capture_process_streams_committed_frames_over_local_ipc() {
             match client.next().await.expect("read local status") {
                 Some(IpcMessage::State {
                     value: WireState::Connected { .. },
+                    ..
                 }) => break,
                 Some(_) => {}
                 None => panic!("local IPC closed before connection"),
@@ -729,6 +792,7 @@ async fn router_report_flows_through_service_ipc_and_history() {
             match client.next().await.unwrap() {
                 Some(IpcMessage::State {
                     value: WireState::Connected { .. },
+                    ..
                 }) => break,
                 Some(_) => {}
                 None => panic!("service closed before router connection"),

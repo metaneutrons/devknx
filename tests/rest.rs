@@ -80,7 +80,8 @@ async fn owner_ready(owner: &mut ChildGuard, database: &Path) {
                 && matches!(
                     client.next().await.unwrap(),
                     Some(IpcMessage::State {
-                        value: WireState::Connected { .. }
+                        value: WireState::Connected { .. },
+                        ..
                     })
                 )
             {

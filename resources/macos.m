@@ -17,6 +17,8 @@ enum {
     ACTION_FILTER = 1 << 3,
     ACTION_READ = 1 << 4,
     ACTION_WRITE = 1 << 5,
+    ACTION_TOGGLE_CONNECTION = 1 << 6,
+    ACTION_CONNECTION_SETTINGS = 1 << 7,
 };
 
 // The winit view is not an AppKit text view. Deliver standard edit-menu
@@ -63,6 +65,8 @@ static void forward_edit_action(id target, unsigned short key_code,
 - (void)focusFilter:(id)sender;
 - (void)readGroup:(id)sender;
 - (void)writeGroup:(id)sender;
+- (void)toggleConnection:(id)sender;
+- (void)connectionSettings:(id)sender;
 @end
 
 @implementation DevknxMenuHandler
@@ -87,6 +91,8 @@ static void forward_edit_action(id target, unsigned short key_code,
 - (void)focusFilter:(id)sender { (void)sender; pending_actions |= ACTION_FILTER; }
 - (void)readGroup:(id)sender { (void)sender; pending_actions |= ACTION_READ; }
 - (void)writeGroup:(id)sender { (void)sender; pending_actions |= ACTION_WRITE; }
+- (void)toggleConnection:(id)sender { (void)sender; pending_actions |= ACTION_TOGGLE_CONNECTION; }
+- (void)connectionSettings:(id)sender { (void)sender; pending_actions |= ACTION_CONNECTION_SETTINGS; }
 @end
 
 static DevknxMenuHandler *menu_handler = nil;
@@ -142,6 +148,7 @@ void devknx_init_macos_app(const char *version, const uint8_t *icon, size_t icon
         [app setMainMenu:main];
         NSMenu *application = add_menu(main, @"devknx");
         add_item(application, @"About devknx", @selector(showAbout:), @"", menu_handler, 0);
+        add_item(application, @"Settings…", @selector(connectionSettings:), @",", menu_handler, NSEventModifierFlagCommand);
         [application addItem:[NSMenuItem separatorItem]];
         NSMenu *services = [[NSMenu alloc] initWithTitle:@"Services"];
         NSMenuItem *services_item = [[NSMenuItem alloc] initWithTitle:@"Services" action:nil keyEquivalent:@""];
@@ -157,7 +164,7 @@ void devknx_init_macos_app(const char *version, const uint8_t *icon, size_t icon
         add_item(application, @"Quit devknx", @selector(terminate:), @"q", nil, NSEventModifierFlagCommand);
 
         NSMenu *file = add_menu(main, @"File");
-        add_item(file, @"Open Capture Database…", @selector(openDatabase:), @"o", menu_handler, NSEventModifierFlagCommand);
+        add_item(file, @"Open Capture…", @selector(openDatabase:), @"o", menu_handler, NSEventModifierFlagCommand);
         add_item(file, @"Export CSV…", @selector(exportCsv:), @"e", menu_handler, NSEventModifierFlagCommand);
         [file addItem:[NSMenuItem separatorItem]];
         add_item(file, @"Close Window", @selector(performClose:), @"w", nil, NSEventModifierFlagCommand);
@@ -178,6 +185,8 @@ void devknx_init_macos_app(const char *version, const uint8_t *icon, size_t icon
                  NSEventModifierFlagCommand | NSEventModifierFlagControl);
 
         NSMenu *operation = add_menu(main, @"Operation");
+        add_item(operation, @"Connect or Disconnect", @selector(toggleConnection:), @"k", menu_handler, NSEventModifierFlagCommand);
+        [operation addItem:[NSMenuItem separatorItem]];
         add_item(operation, @"Read Group Value…", @selector(readGroup:), @"r", menu_handler, NSEventModifierFlagCommand);
         add_item(operation, @"Prepare Group Write…", @selector(writeGroup:), @"p", menu_handler, NSEventModifierFlagCommand);
 

@@ -4,8 +4,14 @@
 `devknx status --database PATH` requests one current connection state.
 `devknx follow --database PATH` receives that state and subsequent state,
 capture, router-loss, and application-subscriber-lag records as newline-delimited JSON.
+The GUI and TUI can launch that same owner on explicit Connect and leave it
+running after the window or terminal interface closes.
 
 The client sends `STATUS\n` or `FOLLOW\n` for status or the live stream.
+`STOP\n` asks an opted-in current-user owner to shut down gracefully and
+receives a `stopped` state acknowledgement before shutdown begins. An owner
+without shutdown support returns an operation error. This command is not
+exposed by REST or MCP.
 For one group operation it sends `OPERATE\n` followed by one bounded JSON line
 containing a tagged `read`, `typed_write`, or `raw_write` intent. Pre-encoded
 frames are not accepted: the connection owner resolves ETS metadata, validates
@@ -24,7 +30,10 @@ A connection interruption while waiting is reported as an error rather than
 The server closes unknown commands. Each JSON record has a `type` discriminator:
 `state`, `capture`, `routing_lost_message`, or `lagged`. A `state` record has a `value.state`
 discriminator (`idle`, `connecting`, `connected`, `waiting_retry`, `stopped`,
-`storage_failed`). Capture records carry the monotonic SQLite `id`, receive
+`storage_failed`). The optional `configured_endpoint` on a state record
+identifies the owner's target even while it is connecting or retrying; GUI and
+TUI check it before attaching or claiming that a new owner started. Capture
+records carry the monotonic SQLite `id`, receive
 timestamp, endpoint, direction, parsed addresses and group-value service, and
 exact `raw_cemi` hexadecimal bytes. A `routing_lost_message` record carries a
 separate SQLite `id` (or `null` for ephemeral monitoring), timestamp, multicast
@@ -48,8 +57,10 @@ Windows, the endpoint is a named pipe with a DACL granting access only to the
 current process user SID. The pipe requires first-instance creation and rejects
 remote clients. This is local transport protection, not remote authentication.
 
-There is no automatic startup, replay request, or version negotiation in this
-development protocol. Durable replay is read from SQLite
+There is no IPC-level automatic startup, replay request, or version negotiation
+in this development protocol. The interactive surfaces start the same
+executable's `serve` command outside IPC after an explicit user request.
+Durable replay is read from SQLite
 with `history`, `router-losses`, or `export`; frontends must not interpret a transient stream as
 complete history. A stable wire contract will be specified before the REST,
 MCP, GUI, and TUI adapters rely on it.

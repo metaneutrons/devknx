@@ -17,7 +17,7 @@
 </p>
 
 > [!IMPORTANT]
-> **Early development.** There is no stable release yet. CLI, TUI and GUI can inspect capture history and live traffic; interactive surfaces attach to a separately started `serve` process. There is no automatic daemon startup. Group writes can affect a live installation; qualify them on an isolated test network first.
+> **Early development.** There is no stable release yet. The GUI and TUI can start and stop the shared capture service on demand; they do not connect to a gateway until you request it. Group writes can affect a live installation; qualify them on an isolated test network first.
 
 ## What devknx is building
 
@@ -31,11 +31,11 @@ desktop button and an API call.
 | --- | --- |
 | KNXnet/IP gateway discovery | CLI, TUI, and native GUI available |
 | KNXnet/IP tunneling and routing capture | Experimental CLI stream with bounded reconnect and optional SQLite persistence |
-| Independent capture process | Experimental foreground `serve` command with current-user `status` and `follow` IPC; no automatic startup yet |
+| Independent capture process | Experimental `serve` owner with current-user IPC; GUI and TUI can launch it on demand or attach to an existing owner |
 | Durable telegram history | Experimental SQLite history with ID cursor and retention cap; interactive views filter the loaded window and export the full retained history |
 | ETS group-address CSV and XML import | Experimental CLI import; TUI and GUI display active ETS labels and DPT declarations |
 | DPT-validated read, write preview, and write | Experimental CLI/TUI/GUI operations through the single capture owner; loopback-qualified, not yet hardware-qualified |
-| Terminal UI and native desktop UI | Experimental; automated window, menu, sustained-capture, scrolling, and owner-restart qualification passes on the supported GUI platforms; visual review is deferred |
+| Terminal UI and native desktop UI | Experimental; the connection workflow and toolbar have been revised after visual feedback and require renewed visual qualification |
 | Local REST and MCP interfaces | Experimental versioned REST API and structured MCP stdio tools; both use the single capture owner for DPT-validated operations |
 
 ETS group-address metadata is stored in separate revisions without changing
@@ -82,11 +82,16 @@ cargo run --locked -- gui --database captures.sqlite
 ```
 
 Gateway discovery sends KNXnet/IP multicast on the local network. Network
-equipment and host firewall rules can affect the result. The GUI can also be
-opened without a database to discover gateways and choose a capture database.
-The TUI requires an existing database. Start `serve` separately for live
-capture and group operations; both interfaces can inspect history while the
-owner is offline.
+equipment and host firewall rules can affect the result. For normal interactive
+use, run `cargo run --locked -- gui` or `cargo run --locked -- tui` without a
+database argument. Both create private per-user capture storage automatically.
+In the GUI, enter a numeric gateway IP address or use Gateways… and choose
+Connect; Settings… selects tunneling or multicast routing and the UDP port.
+Discovery is optional for a manually entered tunnel address. In the TUI,
+press `s` to enter `tunnel://IP:3671` or `router://MULTICAST:3671`, then `c`
+to connect or disconnect. A running capture service remains active when an
+interactive window closes; use Disconnect or `c` to stop it. The optional
+`--database` selects a different existing capture for inspection or service use.
 
 The REST API is a separate opt-in process, bound to `127.0.0.1:8765` by
 default. It reads the same database and sends operations through the same
@@ -95,11 +100,14 @@ SSE resume, authentication and remote-write policy.
 The MCP adapter is a separate local stdio process; see the [MCP guide](docs/mcp.md)
 for tool names, structured results, bounded search and write semantics.
 
-The GUI shows a bounded live/history view, a text filter, ETS names and DPTs,
-raw cEMI details, read and prepared typed-write dialogs, and non-overwriting
-CSV export. Its macOS app has native application, File, Edit, View, Operation,
-Window and Help menus. The TUI offers `/` filter, `r` read, `w` prepared typed
-write, `e` export, `h` reload, `PgUp` older history, `d` discovery,
+The GUI shows a bounded live/history view with readable local timestamps,
+ETS names and unambiguous DPT-decoded values, a text filter, raw cEMI details,
+read and prepared typed-write dialogs, and non-overwriting CSV export. Its
+separate toolbar exposes connection and capture actions; capture storage is
+explained under Settings rather than presented as the KNX connection. Its macOS
+app has native application, File, Edit, View, Operation, Window and Help menus.
+The TUI offers `c` connect/disconnect, `s` endpoint settings, `/` filter,
+`r` read, `w` prepared typed write, `e` export, `h` reload, `PgUp` older history, `d` discovery,
 `j`/`k` scroll and `q` quit.
 In both interfaces, a typed write is previewed before a separate send action.
 Expert raw sending, ETS import, backup and durable audit inspection remain CLI
@@ -150,8 +158,11 @@ separate foreground process; it can be kept alive by a service manager while
 `history`, `export`, and `backup` read the database from other processes.
 `status`, `follow`, `read`, and `write` connect to the running owner over current-user local IPC;
 `follow` emits development-version-three JSON lines with connection states, committed captures,
-router reports, and explicit per-stream application-subscriber lag counts. The process does not detach or
-auto-start. One writable owner
+router reports, and explicit per-stream application-subscriber lag counts. The
+foreground `serve` command remains available for service managers; GUI and TUI
+can launch the same owner as a background child after explicit Connect. The owner
+continues after the interactive surface exits, and a current-user IPC `STOP`
+request shuts it down gracefully. One writable owner
 per database is enforced by a sidecar `.writer.lock` file, which is retained
 across restarts and must not be deleted while capture runs. On Unix, a writable
 capture directory must not be group- or world-writable. The Unix IPC socket

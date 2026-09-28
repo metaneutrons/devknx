@@ -708,8 +708,13 @@ async fn write_message(stream: &mut Stream, message: &IpcMessage) -> Result<(), 
 }
 
 /// One status request or live stream from the capture owner.
+#[cfg(unix)]
+type ClientStream = Stream;
+#[cfg(windows)]
+type ClientStream = tokio::net::windows::named_pipe::NamedPipeClient;
+
 pub struct IpcClient {
-    reader: BufReader<Stream>,
+    reader: BufReader<ClientStream>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -733,7 +738,7 @@ impl IpcClient {
         #[cfg(windows)]
         let mut stream = {
             let name = pipe_name(database)?;
-            Stream::connect(name.to_ns_name::<GenericNamespaced>()?).await?
+            crate::windows_pipe::connect(&name).await?
         };
         stream.write_all(b"STOP\n").await?;
         let mut client = Self {
@@ -773,7 +778,7 @@ impl IpcClient {
         #[cfg(windows)]
         let mut stream = {
             let name = pipe_name(database)?;
-            Stream::connect(name.to_ns_name::<GenericNamespaced>()?).await?
+            crate::windows_pipe::connect(&name).await?
         };
         stream
             .write_all(if follow { b"FOLLOW\n" } else { b"STATUS\n" })
@@ -815,7 +820,7 @@ impl IpcClient {
         #[cfg(windows)]
         let mut stream = {
             let name = pipe_name(database)?;
-            Stream::connect(name.to_ns_name::<GenericNamespaced>()?).await?
+            crate::windows_pipe::connect(&name).await?
         };
         let mut body = serde_json::to_vec(&OriginatedOperation {
             origin,

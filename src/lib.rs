@@ -15,3 +15,5 @@ pub mod operations;
 pub mod paths;
 pub mod service;
 pub mod storage;
+#[cfg(windows)]
+mod windows_pipe;

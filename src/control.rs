@@ -25,7 +25,7 @@ use interprocess::local_socket::{
     tokio::{Listener, Stream, prelude::*},
 };
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
 use crate::paths;
@@ -307,11 +307,11 @@ async fn connect_default() -> io::Result<Stream> {
 }
 
 #[cfg(windows)]
-async fn connect_default() -> io::Result<Stream> {
-    Stream::connect(pipe_name()?.to_ns_name::<GenericNamespaced>()?).await
+async fn connect_default() -> io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    crate::windows_pipe::connect(&pipe_name()?).await
 }
 
-async fn read_frame(stream: &mut Stream) -> io::Result<Vec<u8>> {
+async fn read_frame<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<Vec<u8>> {
     tokio::time::timeout(IO_TIMEOUT, async {
         let mut bytes = Vec::new();
         loop {
@@ -326,7 +326,10 @@ async fn read_frame(stream: &mut Stream) -> io::Result<Vec<u8>> {
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control request timed out"))?
 }
 
-async fn write_frame(stream: &mut Stream, response: &ControlResponse) -> io::Result<()> {
+async fn write_frame<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    response: &ControlResponse,
+) -> io::Result<()> {
     let encoded = encode_frame(response)?;
     tokio::time::timeout(IO_TIMEOUT, stream.write_all(&encoded))
         .await

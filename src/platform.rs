@@ -23,6 +23,8 @@ pub enum MenuAction {
     ToggleConnection = 64,
     /// Show gateway and storage settings.
     ConnectionSettings = 128,
+    /// Toggle semantic color in the capture view.
+    ToggleColor = 256,
 }
 
 impl MenuAction {
@@ -37,6 +39,7 @@ impl MenuAction {
         Self::Write,
         Self::ToggleConnection,
         Self::ConnectionSettings,
+        Self::ToggleColor,
     ];
 }
 
@@ -52,6 +55,7 @@ mod macos {
         fn devknx_init_macos_app(version: *const std::ffi::c_char, icon: *const u8, len: usize);
         fn devknx_take_menu_action(action: u32) -> bool;
         fn devknx_macos_menu_installed() -> bool;
+        fn devknx_update_color_menu_state(enabled: bool, locked: bool);
     }
 
     pub fn init_app() {
@@ -77,6 +81,14 @@ mod macos {
         #[allow(unsafe_code)]
         unsafe {
             devknx_macos_menu_installed()
+        }
+    }
+
+    pub fn update_color_menu_state(enabled: bool, locked: bool) {
+        // SAFETY: a main-thread scalar call into the compiled AppKit bridge.
+        #[allow(unsafe_code)]
+        unsafe {
+            devknx_update_color_menu_state(enabled, locked);
         }
     }
 }
@@ -112,6 +124,15 @@ pub fn menu_installed() -> bool {
     true
 }
 
+/// Keep the native View menu checkmark and enabled state in sync with the GUI.
+#[allow(clippy::missing_const_for_fn)]
+pub fn update_color_menu_state(enabled: bool, locked: bool) {
+    #[cfg(target_os = "macos")]
+    macos::update_color_menu_state(enabled, locked);
+    #[cfg(not(target_os = "macos"))]
+    let _ = (enabled, locked);
+}
+
 #[cfg(test)]
 mod tests {
     use super::MenuAction;
@@ -129,6 +150,7 @@ mod tests {
             (MenuAction::Write, "writeGroup:"),
             (MenuAction::ToggleConnection, "toggleConnection:"),
             (MenuAction::ConnectionSettings, "connectionSettings:"),
+            (MenuAction::ToggleColor, "toggleColor:"),
         ] {
             assert!(MenuAction::ALL.contains(&action));
             assert!(native.contains(&format!("@selector({selector})")));

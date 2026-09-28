@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Fabian Schmieder
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use devknx::api::{self, ApiConfig};
 use devknx::capture::{CaptureEvent, RoutingLossEvent};
 use devknx::ets::{CsvEncoding, EtsCatalog, EtsFormat, parse_group_address};
 use devknx::ipc::{IpcClient, IpcMessage, IpcServer};
 use devknx::mcp;
 use devknx::operations::{OperationRequest, RawPayload, prepare};
+use devknx::paths;
 use devknx::service::{CaptureService, LiveRoutingLoss, ReconnectPolicy};
 use devknx::storage::CaptureStore;
 use knx_rs_ip::{ConnectionSpec, discovery, parse_url};
@@ -50,15 +51,37 @@ impl From<EtsInputFormat> for EtsFormat {
     }
 }
 
+#[derive(Args)]
+#[group(id = "capture_selector", required = true, multiple = false)]
+struct CaptureSelector {
+    /// Select the capture associated with this KNXnet/IP endpoint.
+    #[arg(long, value_name = "URL")]
+    endpoint: Option<String>,
+    /// Select this SQLite capture database.
+    #[arg(long, value_name = "PATH")]
+    database: Option<PathBuf>,
+}
+
+#[derive(Args)]
+#[group(id = "optional_capture_selector", multiple = false)]
+struct OptionalCaptureSelector {
+    /// Select metadata from the capture associated with this endpoint.
+    #[arg(long, value_name = "URL")]
+    endpoint: Option<String>,
+    /// Select metadata from this SQLite capture database.
+    #[arg(long, value_name = "PATH")]
+    database: Option<PathBuf>,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Discover KNXnet/IP gateways on the local network.
     Discover,
-    /// Print received KNXnet/IP telegrams until interrupted.
+    /// Capture received KNXnet/IP telegrams to the endpoint's private database until interrupted.
     Monitor {
         /// Endpoint URL, for example `tunnel://192.0.2.1:3671` or `router://224.0.23.12:3671`.
         endpoint: String,
-        /// Persist received frames to this SQLite database.
+        /// SQLite database for received frames; defaults to the endpoint's private capture.
         #[arg(long)]
         database: Option<PathBuf>,
         /// Maximum rows retained in the database.
@@ -69,9 +92,9 @@ enum Command {
     Serve {
         /// KNXnet/IP tunnel or router endpoint URL.
         endpoint: String,
-        /// SQLite database owned by this capture process.
+        /// SQLite database owned by this capture process; defaults to the endpoint's private capture.
         #[arg(long)]
-        database: PathBuf,
+        database: Option<PathBuf>,
         /// Maximum rows retained in the database.
         #[arg(long, default_value_t = NonZeroU32::new(100_000).expect("nonzero"))]
         max_events: NonZeroU32,
@@ -79,8 +102,8 @@ enum Command {
     /// Serve the versioned REST API (off unless explicitly started).
     Api {
         /// Existing database owned by `serve` for live operations.
-        #[arg(long)]
-        database: PathBuf,
+        #[command(flatten)]
+        selector: CaptureSelector,
         /// Listener address; non-loopback requires a bearer token.
         #[arg(long, default_value = "127.0.0.1:8765")]
         bind: SocketAddr,
@@ -94,26 +117,26 @@ enum Command {
     /// Serve structured MCP tools over standard input/output.
     Mcp {
         /// Existing database owned by `serve` for live operations.
-        #[arg(long)]
-        database: PathBuf,
+        #[command(flatten)]
+        selector: CaptureSelector,
     },
     /// Read the current state of an independent capture process.
     Status {
         /// Existing SQLite database owned by `serve`.
-        #[arg(long)]
-        database: PathBuf,
+        #[command(flatten)]
+        selector: CaptureSelector,
     },
     /// Stream state changes and committed captures from `serve` as JSON lines.
     Follow {
         /// Existing SQLite database owned by `serve`.
-        #[arg(long)]
-        database: PathBuf,
+        #[command(flatten)]
+        selector: CaptureSelector,
     },
     /// Read captured telegrams after a monotonic event ID.
     History {
         /// Existing SQLite capture database.
-        #[arg(long)]
-        database: PathBuf,
+        #[command(flatten)]
+        selector: CaptureSelector,
         /// Exclusive cursor; zero reads from the beginning.
         #[arg(long, default_value_t = 0)]
         after: i64,
@@ -127,8 +150,8 @@ enum Command {
     /// Read durable router-reported routing losses after a separate event ID.
     RouterLosses {
         /// Existing SQLite capture database.
-        #[arg(long)]
-        database: PathBuf,
+        #[command(flatten)]
+        selector: CaptureSelector,
         /// Exclusive router-loss cursor; zero reads from the beginning.
         #[arg(long, default_value_t = 0)]
         after: i64,
@@ -139,8 +162,8 @@ enum Command {
     /// Export captured telegrams as CSV to standard output.
     Export {
         /// Existing SQLite capture database.
-        #[arg(long)]
-        database: PathBuf,
+        #[command(flatten)]
+        selector: CaptureSelector,
         /// Exclusive cursor; zero exports from the beginning.
         #[arg(long, default_value_t = 0)]
         after: i64,
@@ -148,8 +171,8 @@ enum Command {
     /// Save a consistent, non-overwriting SQLite capture snapshot.
     Backup {
         /// Existing SQLite capture database.
-        #[arg(long)]
-        database: PathBuf,
+        #[command(flatten)]
+        selector: CaptureSelector,
         /// New snapshot file; an existing file is never replaced.
         #[arg(long)]
         output: PathBuf,
@@ -159,8 +182,8 @@ enum Command {
         /// Existing ETS CSV 3/1 or GA Export 01 XML file.
         file: PathBuf,
         /// Capture database to enrich, or a new database to create.
-        #[arg(long)]
-        database: PathBuf,
+        #[command(flatten)]
+        selector: CaptureSelector,
         /// Export format; explicit to avoid guessing from a filename.
         #[arg(long, value_enum)]
         format: EtsInputFormat,
@@ -171,16 +194,15 @@ enum Command {
     /// Read active ETS metadata for one group address.
     EtsLookup {
         /// Existing capture database.
-        #[arg(long)]
-        database: PathBuf,
+        #[command(flatten)]
+        selector: CaptureSelector,
         /// Three-level, two-level, decimal, or ETS hexadecimal group address.
         address: String,
     },
     /// Preview exact DPT-encoded cEMI bytes without sending.
     WritePreview {
-        /// Existing capture database for ETS DPT declarations.
-        #[arg(long)]
-        database: Option<PathBuf>,
+        #[command(flatten)]
+        selector: OptionalCaptureSelector,
         /// Explicit DPT, required when ETS is absent or ambiguous.
         #[arg(long)]
         dpt: Option<String>,
@@ -192,8 +214,8 @@ enum Command {
     /// Transmit a DPT-validated group value through the active `serve` owner.
     Write {
         /// Database owned by the active capture process.
-        #[arg(long)]
-        database: PathBuf,
+        #[command(flatten)]
+        selector: CaptureSelector,
         /// Explicit DPT, required when ETS is absent or ambiguous.
         #[arg(long)]
         dpt: Option<String>,
@@ -205,8 +227,8 @@ enum Command {
     /// Send an explicit raw group value; expert use only, audited separately.
     WriteRaw {
         /// Database owned by the active capture process.
-        #[arg(long)]
-        database: PathBuf,
+        #[command(flatten)]
+        selector: CaptureSelector,
         /// Inline APCI value, 0–63; exclusive with `--bytes`.
         #[arg(long, conflicts_with = "bytes")]
         inline: Option<u8>,
@@ -219,8 +241,8 @@ enum Command {
     /// Send a group read and report a matching response or no response.
     Read {
         /// Database owned by the active capture process.
-        #[arg(long)]
-        database: PathBuf,
+        #[command(flatten)]
+        selector: CaptureSelector,
         /// Response deadline in milliseconds (1–30000).
         #[arg(long, default_value_t = 2_000)]
         timeout_ms: u32,
@@ -230,8 +252,8 @@ enum Command {
     /// Read durable operation attempts, including raw/typed distinction.
     Audit {
         /// Existing capture database.
-        #[arg(long)]
-        database: PathBuf,
+        #[command(flatten)]
+        selector: CaptureSelector,
         /// Exclusive audit cursor.
         #[arg(long, default_value_t = 0)]
         after: i64,
@@ -255,9 +277,8 @@ enum Command {
     /// Open the interactive terminal monitor.
     #[cfg(feature = "tui")]
     Tui {
-        /// Existing capture database; defaults to private per-user storage.
-        #[arg(long)]
-        database: Option<PathBuf>,
+        #[command(flatten)]
+        selector: CaptureSelector,
     },
 }
 
@@ -280,6 +301,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_events,
         }) => {
             let spec = parse_url(&endpoint)?;
+            let database = resolve_endpoint_database(database, &endpoint)?;
             run_monitor(spec, database, max_events).await?;
         }
         Some(Command::Serve {
@@ -288,14 +310,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_events,
         }) => {
             let spec = parse_url(&endpoint)?;
+            let database = resolve_endpoint_database(database, &endpoint)?;
             run_service(spec, database, max_events).await?;
         }
         Some(Command::Api {
-            database,
+            selector,
             bind,
             token_env,
             allow_remote_writes,
         }) => {
+            let database = resolve_capture_selector(selector)?;
             let token = token_env
                 .map(|name| {
                     std::env::var(name).map_err(|_| {
@@ -314,15 +338,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .await?;
         }
-        Some(Command::Mcp { database }) => mcp::run(database).await?,
-        Some(Command::Status { database }) => run_ipc_client(&database, false).await?,
-        Some(Command::Follow { database }) => run_ipc_client(&database, true).await?,
+        Some(Command::Mcp { selector }) => mcp::run(resolve_capture_selector(selector)?).await?,
+        Some(Command::Status { selector }) => {
+            run_ipc_client(&resolve_capture_selector(selector)?, false).await?;
+        }
+        Some(Command::Follow { selector }) => {
+            run_ipc_client(&resolve_capture_selector(selector)?, true).await?;
+        }
         Some(Command::History {
-            database,
+            selector,
             after,
             limit,
             filter,
         }) => {
+            let database = resolve_capture_selector(selector)?;
             let store = CaptureStore::open_existing(&database)?;
             let stdout = io::stdout();
             let mut output = stdout.lock();
@@ -343,10 +372,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Some(Command::RouterLosses {
-            database,
+            selector,
             after,
             limit,
         }) => {
+            let database = resolve_capture_selector(selector)?;
             let store = CaptureStore::open_existing(&database)?;
             let stdout = io::stdout();
             let mut output = stdout.lock();
@@ -358,22 +388,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 writeln!(output, "{}", serde_json::to_string(&message)?)?;
             }
         }
-        Some(Command::Export { database, after }) => {
+        Some(Command::Export { selector, after }) => {
+            let database = resolve_capture_selector(selector)?;
             let store = CaptureStore::open_existing(&database)?;
             let stdout = io::stdout();
             let mut output = stdout.lock();
             store.export_csv(&mut output, after)?;
         }
-        Some(Command::Backup { database, output }) => {
+        Some(Command::Backup { selector, output }) => {
+            let database = resolve_capture_selector(selector)?;
             let store = CaptureStore::open_existing(&database)?;
             store.backup_to(&output)?;
         }
         Some(Command::EtsImport {
             file,
-            database,
+            selector,
             format,
             latin1,
         }) => {
+            let database = resolve_capture_selector(selector)?;
             let encoding = if latin1 {
                 CsvEncoding::Latin1
             } else {
@@ -385,7 +418,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let revision = store.import_ets(&catalog)?;
             println!("revision={revision} groups={groups}");
         }
-        Some(Command::EtsLookup { database, address }) => {
+        Some(Command::EtsLookup { selector, address }) => {
+            let database = resolve_capture_selector(selector)?;
             let store = CaptureStore::open_existing(&database)?;
             let address = parse_group_address(&address)?;
             let result = serde_json::json!({
@@ -396,12 +430,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string(&result)?);
         }
         Some(Command::WritePreview {
-            database,
+            selector,
             dpt,
             address,
             value,
         }) => {
             let address_raw = parse_group_address(&address)?.raw();
+            let database = resolve_optional_capture_selector(selector)?;
             let group = match database {
                 Some(database) => CaptureStore::open_existing(&database)?
                     .ets_group(knx_rs_core::address::GroupAddress::from_raw(address_raw))?,
@@ -424,11 +459,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string(&result)?);
         }
         Some(Command::Write {
-            database,
+            selector,
             dpt,
             address,
             value,
         }) => {
+            let database = resolve_capture_selector(selector)?;
             let address_raw = parse_group_address(&address)?.raw();
             execute_remote_operation(
                 &database,
@@ -441,11 +477,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         }
         Some(Command::WriteRaw {
-            database,
+            selector,
             inline,
             bytes,
             address,
         }) => {
+            let database = resolve_capture_selector(selector)?;
             let address_raw = parse_group_address(&address)?.raw();
             let payload = match (inline, bytes) {
                 (Some(value), None) => RawPayload::Inline(value),
@@ -468,10 +505,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         }
         Some(Command::Read {
-            database,
+            selector,
             timeout_ms,
             address,
         }) => {
+            let database = resolve_capture_selector(selector)?;
             let address_raw = parse_group_address(&address)?.raw();
             execute_remote_operation(
                 &database,
@@ -483,10 +521,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         }
         Some(Command::Audit {
-            database,
+            selector,
             after,
             limit,
         }) => {
+            let database = resolve_capture_selector(selector)?;
             let store = CaptureStore::open_existing(&database)?;
             let stdout = io::stdout();
             let mut output = stdout.lock();
@@ -501,7 +540,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             smoke_live,
         }) => gui::run(database, smoke, smoke_live)?,
         #[cfg(feature = "tui")]
-        Some(Command::Tui { database }) => tui::run(database)?,
+        Some(Command::Tui { selector }) => {
+            let fixed_database = selector.database.is_some();
+            let endpoint = selector.endpoint.clone();
+            let database = resolve_capture_selector(selector)?;
+            tui::run(database, fixed_database, endpoint.as_deref())?;
+        }
         #[cfg(feature = "gui")]
         None => gui::run(None, false, false)?,
         #[cfg(not(feature = "gui"))]
@@ -657,18 +701,53 @@ async fn run_ipc_client(
     Ok(())
 }
 
+fn resolve_endpoint_database(database: Option<PathBuf>, endpoint: &str) -> io::Result<PathBuf> {
+    database.map_or_else(|| endpoint_database(endpoint), Ok)
+}
+
+fn resolve_capture_selector(selector: CaptureSelector) -> io::Result<PathBuf> {
+    match (selector.endpoint, selector.database) {
+        (Some(endpoint), None) => endpoint_database(&endpoint),
+        (None, Some(database)) => Ok(database),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "select exactly one of --endpoint or --database",
+        )),
+    }
+}
+
+fn resolve_optional_capture_selector(
+    selector: OptionalCaptureSelector,
+) -> io::Result<Option<PathBuf>> {
+    match (selector.endpoint, selector.database) {
+        (Some(endpoint), None) => endpoint_database(&endpoint).map(Some),
+        (None, Some(database)) => Ok(Some(database)),
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "select at most one of --endpoint or --database",
+        )),
+    }
+}
+
+fn endpoint_database(endpoint: &str) -> io::Result<PathBuf> {
+    paths::database_for_endpoint(endpoint)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+}
+
 async fn run_monitor(
     spec: ConnectionSpec,
-    database: Option<PathBuf>,
+    database: PathBuf,
     max_events: NonZeroU32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let has_database = database.is_some();
-    let store = database
-        .as_deref()
-        .map(|path| CaptureStore::open(path, max_events))
-        .transpose()?;
+    let store = CaptureStore::open(&database, max_events)?;
     let queue_capacity = NonZeroUsize::new(1_024).expect("nonzero live queue capacity");
-    let service = CaptureService::new(spec, store, ReconnectPolicy::default(), queue_capacity);
+    let service = CaptureService::new(
+        spec,
+        Some(store),
+        ReconnectPolicy::default(),
+        queue_capacity,
+    );
     let mut states = service.subscribe_state();
     let mut frames = service.subscribe_frames();
     let mut routing_losses = service.subscribe_routing_losses();
@@ -719,9 +798,6 @@ async fn run_monitor(
                     }
                     Err(broadcast::error::RecvError::Lagged(count)) => {
                         eprintln!("live_subscriber_lagged={count} (application events, not KNX bus telegrams)");
-                        if !has_database {
-                            eprintln!("No durable history is configured for missed live events");
-                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => {}
                 }

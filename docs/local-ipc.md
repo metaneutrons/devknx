@@ -1,9 +1,12 @@
 # Local capture protocol (development version 3)
 
 `devknx serve` owns the configured KNXnet/IP connection and SQLite writer.
-`devknx status --database PATH` requests one current connection state.
-`devknx follow --database PATH` receives that state and subsequent state,
+`devknx status --endpoint URL` requests one current connection state.
+`devknx follow --endpoint URL` receives that state and subsequent state,
 capture, router-loss, and application-subscriber-lag records as newline-delimited JSON.
+The selector can instead be `--database PATH` when the owner uses a custom
+capture path. CLI commands do not infer the target from the GUI's last-used
+connection.
 The GUI and TUI can launch that same owner on explicit Connect and leave it
 running after the window or terminal interface closes.
 

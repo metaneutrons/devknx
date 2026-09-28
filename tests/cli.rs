@@ -3,6 +3,7 @@
 
 use std::io::Read as _;
 use std::num::NonZeroU32;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -24,6 +25,24 @@ fn devknx(args: &[&str]) -> std::process::Output {
         .args(args)
         .output()
         .expect("run devknx")
+}
+
+fn devknx_with_data_dir(args: &[&str], data_dir: &Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_devknx"))
+        .args(args)
+        .env("HOME", data_dir)
+        .env("XDG_DATA_HOME", data_dir)
+        .env("LOCALAPPDATA", data_dir)
+        .output()
+        .expect("run devknx with isolated data directory")
+}
+
+fn devknx_application_data_dir(data_dir: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    let base = data_dir.join("Library/Application Support");
+    #[cfg(not(target_os = "macos"))]
+    let base = data_dir.to_path_buf();
+    base.join("devknx")
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -74,6 +93,172 @@ fn help_describes_available_commands() {
     assert!(stdout.contains("tui"));
     #[cfg(not(feature = "tui"))]
     assert!(!stdout.contains("tui"));
+}
+
+#[test]
+fn database_selector_requires_exactly_one_source() {
+    let missing = devknx(&["history"]);
+    assert!(!missing.status.success());
+
+    let both = devknx(&[
+        "history",
+        "--endpoint",
+        "tunnel://192.0.2.1:3671",
+        "--database",
+        "captures.sqlite",
+    ]);
+    assert!(!both.status.success());
+}
+
+#[test]
+fn endpoint_selected_read_does_not_create_a_missing_database() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let endpoint = "tunnel://192.0.2.1:3671";
+    let output = devknx_with_data_dir(&["history", "--endpoint", endpoint], directory.path());
+    assert!(!output.status.success());
+    assert!(
+        !devknx_application_data_dir(directory.path()).exists(),
+        "read-only endpoint selection must not create capture storage"
+    );
+}
+
+#[test]
+fn write_preview_can_use_endpoint_selected_ets_metadata() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let xml = directory.path().join("group-addresses.xml");
+    std::fs::write(
+        &xml,
+        "<GroupAddress-Export xmlns=\"http://knx.org/xml/ga-export/01\"><GroupRange Name=\"Lighting\"><GroupAddress Name=\"Hall\" Address=\"1/2/3\" DPTs=\"DPST-1-1\" /></GroupRange></GroupAddress-Export>",
+    )
+    .unwrap();
+    let endpoint = "tunnel://192.0.2.1:3671";
+    let imported = devknx_with_data_dir(
+        &[
+            "ets-import",
+            xml.to_str().unwrap(),
+            "--endpoint",
+            endpoint,
+            "--format",
+            "xml",
+        ],
+        directory.path(),
+    );
+    assert!(imported.status.success(), "{:?}", imported.stderr);
+
+    let preview = devknx_with_data_dir(
+        &["write-preview", "--endpoint", endpoint, "1/2/3", "true"],
+        directory.path(),
+    );
+    assert!(preview.status.success(), "{:?}", preview.stderr);
+    let result: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(result["dpt"], "1.001");
+}
+
+#[test]
+fn relative_database_override_creates_storage_in_the_working_directory() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let xml = directory.path().join("groups.xml");
+    std::fs::write(
+        &xml,
+        "<GroupAddress-Export xmlns=\"http://knx.org/xml/ga-export/01\"><GroupRange Name=\"Lighting\"><GroupAddress Name=\"Hall\" Address=\"1/2/3\" DPTs=\"DPST-1-1\" /></GroupRange></GroupAddress-Export>",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_devknx"))
+        .current_dir(directory.path())
+        .args([
+            "ets-import",
+            "groups.xml",
+            "--database",
+            "capture.sqlite",
+            "--format",
+            "xml",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert!(directory.path().join("capture.sqlite").exists());
+    assert!(
+        !directory
+            .path()
+            .join("capture.sqlite.connection.json")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn serve_and_monitor_use_the_endpoint_default_database() {
+    struct CaptureChild(Child);
+    impl Drop for CaptureChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let server = DeviceServer::start_at("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let endpoint = format!("tunnel://{}", server.local_addr());
+    let child = Command::new(env!("CARGO_BIN_EXE_devknx"))
+        .args(["serve", &endpoint])
+        .env("HOME", directory.path())
+        .env("XDG_DATA_HOME", directory.path())
+        .env("LOCALAPPDATA", directory.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start default-path capture process");
+    let mut child = CaptureChild(child);
+
+    let status = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                panic!("capture process exited before IPC became available: {status}");
+            }
+            let status =
+                devknx_with_data_dir(&["status", "--endpoint", &endpoint], directory.path());
+            if status.status.success() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("endpoint selector reaches default-path owner");
+    let status: IpcMessage = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(matches!(status, IpcMessage::State { .. }));
+
+    let history = devknx_with_data_dir(&["history", "--endpoint", &endpoint], directory.path());
+    assert!(history.status.success(), "{:?}", history.stderr);
+
+    let monitor = Command::new(env!("CARGO_BIN_EXE_devknx"))
+        .args(["monitor", &endpoint])
+        .env("HOME", directory.path())
+        .env("XDG_DATA_HOME", directory.path())
+        .env("LOCALAPPDATA", directory.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start second default-path capture process");
+    let mut monitor = CaptureChild(monitor);
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(status) = monitor.0.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("monitor attempts to open the endpoint default database");
+    assert!(
+        !result.success(),
+        "second writer unexpectedly opened the capture"
+    );
+
+    drop(child);
+    server.stop().await;
 }
 
 #[test]

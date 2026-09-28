@@ -1,12 +1,14 @@
 # REST API (experimental)
 
-`devknx api` is opt-in and reads an existing capture database. It never opens
-a second writer. Start `devknx serve ... --database captures.sqlite` separately
-for live status and group operations; history and ETS lookup work when the
-capture owner is offline.
+`devknx api` is opt-in and reads the selected capture database. It never opens
+a second writer. Start `devknx serve tunnel://192.0.2.1:3671` separately for
+live status and group operations; history and ETS lookup work when the capture
+owner is offline. `--endpoint` selects that connection's default private
+capture. Use `--database PATH` on both commands when the owner uses a custom
+database path.
 
 ```sh
-devknx api --database captures.sqlite
+devknx api --endpoint tunnel://192.0.2.1:3671
 curl http://127.0.0.1:8765/v1/health
 curl 'http://127.0.0.1:8765/v1/captures?after=0&limit=100'
 curl -N -H 'Last-Event-ID: 42' http://127.0.0.1:8765/v1/events

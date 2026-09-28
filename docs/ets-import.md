@@ -9,6 +9,10 @@ devknx ets-import group-addresses.xml --database captures.sqlite --format xml
 devknx ets-lookup --database captures.sqlite 1/2/3
 ```
 
+Use `--endpoint tunnel://IP:3671` instead of `--database PATH` to select the
+default capture for a connection. Both selectors refer to one capture store;
+they cannot be combined in one command.
+
 The format is explicit. CSV is decoded as UTF-8 (an optional BOM is accepted).
 For a legacy ISO-8859-1 CSV file, append `--latin1`; this flag is invalid for
 XML. GA Export 01 XML must be UTF-8. The standard ETS CSV 3/1 export has four

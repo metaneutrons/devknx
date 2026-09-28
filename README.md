@@ -30,7 +30,7 @@ desktop button and an API call.
 | Capability | Current state |
 | --- | --- |
 | KNXnet/IP gateway discovery | CLI, TUI, and native GUI available |
-| KNXnet/IP tunneling and routing capture | Experimental CLI stream with bounded reconnect and optional SQLite persistence |
+| KNXnet/IP tunneling and routing capture | Experimental CLI stream with bounded reconnect and endpoint-specific SQLite persistence |
 | Independent capture process | Experimental `serve` owner with current-user IPC; GUI and TUI can launch it on demand or attach to an existing owner |
 | Durable telegram history | Experimental SQLite history with ID cursor and retention cap; interactive views filter the loaded window and export the full retained history |
 | ETS group-address CSV and XML import | Experimental CLI import; TUI and GUI display active ETS labels and DPT declarations |
@@ -60,42 +60,50 @@ cd devknx
 cargo run --locked -- discover
 cargo run --locked -- monitor tunnel://192.0.2.1:3671
 cargo run --locked -- monitor router://224.0.23.12:3671
-cargo run --locked -- monitor tunnel://192.0.2.1:3671 --database captures.sqlite
-cargo run --locked -- serve tunnel://192.0.2.1:3671 --database captures.sqlite
-cargo run --locked -- api --database captures.sqlite
-cargo run --locked -- mcp --database captures.sqlite
-cargo run --locked -- status --database captures.sqlite
-cargo run --locked -- follow --database captures.sqlite
-cargo run --locked -- history --database captures.sqlite --after 0 --limit 100
-cargo run --locked -- router-losses --database captures.sqlite --after 0 --limit 100
-cargo run --locked -- export --database captures.sqlite > captures.csv
-cargo run --locked -- backup --database captures.sqlite --output captures-backup.sqlite
-cargo run --locked -- ets-import group-addresses.xml --database captures.sqlite --format xml
-cargo run --locked -- ets-lookup --database captures.sqlite 1/2/3
-cargo run --locked -- write-preview --database captures.sqlite 1/2/3 true
-cargo run --locked -- read --database captures.sqlite 1/2/3
-cargo run --locked -- write --database captures.sqlite 1/2/3 true
-cargo run --locked -- write-raw --database captures.sqlite --inline 1 1/2/3
-cargo run --locked -- audit --database captures.sqlite
-cargo run --locked -- tui --database captures.sqlite
-cargo run --locked -- gui --database captures.sqlite
+cargo run --locked -- gui
+cargo run --locked -- tui --endpoint tunnel://192.0.2.1:3671
 ```
 
 Gateway discovery sends KNXnet/IP multicast on the local network. Network
 equipment and host firewall rules can affect the result. For normal interactive
-use, run `cargo run --locked -- gui` or `cargo run --locked -- tui` without a
-database argument. Both create private per-user capture storage automatically.
+use, launch the GUI and select a connection, or start the TUI with an explicit
+`--endpoint`. Neither creates an unassigned global capture database.
 In the GUI, choose Tunneling or Routing on the start screen, enter the
 unicast gateway IP or multicast group and UDP port, then select Connect.
 Settings… uses the same connection form. Gateway discovery is optional for a
 manually entered tunnel address. In the TUI,
-press `s` to enter `tunnel://IP:3671` or `router://MULTICAST:3671`, then `c`
-to connect or disconnect. A running capture service remains active when an
-interactive window closes; use Disconnect or `c` to stop it. The optional
-`--database` selects a different existing capture for inspection or service use.
+press `s` to change the endpoint, then `c` to connect or disconnect. A running
+capture service remains active when an interactive window closes; use
+Disconnect or `c` to stop it. An explicit `--database` fixes the capture path
+instead of deriving it from the endpoint.
 The GUI opens its own capture history automatically. Use **Open…** (or
 **File > Open Capture…** on macOS) to choose another saved SQLite capture in
-the system file dialog; **Live capture** returns to the active history.
+the system file dialog; **Live capture** returns to the active history. A
+pre-connection `captures.sqlite` is offered as a previous capture, not
+automatically attributed to a gateway.
+
+For headless use, `serve` owns a connection in the foreground. Run it under a
+service manager if capture must outlive the terminal. Other commands select
+the same endpoint-derived database with `--endpoint`, or an explicit path with
+`--database`:
+
+```sh
+devknx serve tunnel://192.0.2.1:3671
+devknx status --endpoint tunnel://192.0.2.1:3671
+devknx history --endpoint tunnel://192.0.2.1:3671 --after 0 --limit 100
+devknx follow --endpoint tunnel://192.0.2.1:3671
+devknx api --endpoint tunnel://192.0.2.1:3671
+devknx mcp --endpoint tunnel://192.0.2.1:3671
+devknx ets-import group-addresses.xml --endpoint tunnel://192.0.2.1:3671 --format xml
+devknx write-preview --endpoint tunnel://192.0.2.1:3671 1/2/3 true
+devknx read --endpoint tunnel://192.0.2.1:3671 1/2/3
+devknx write --endpoint tunnel://192.0.2.1:3671 1/2/3 true
+```
+
+These lines are alternatives, not one script: `serve`, `follow`, `api`, and
+`mcp` stay running until stopped. `read` and `write` require a running owner;
+`write-preview` does not transmit. Commands without a positional endpoint do
+not use a remembered connection: pass `--endpoint` or `--database` explicitly.
 
 The REST API is a separate opt-in process, bound to `127.0.0.1:8765` by
 default. It reads the same database and sends operations through the same
@@ -141,7 +149,10 @@ responses. No real router loss report has been observed in the qualification
 window; parser and integration tests exercise the diagnostic path. See the
 [M2 evidence and limits](https://github.com/metaneutrons/devknx/issues/5).
 
-The optional `--database` creates a versioned SQLite capture store. Each
+`monitor`, `serve`, GUI Connect, and TUI Connect create a versioned SQLite
+capture store for the selected endpoint. By default, its private per-user path
+encodes the canonical mode, IP address, and port; `--database` overrides it.
+Each
 committed telegram receives a monotonic ID; the default retention limit is
 100,000 frames and can be changed with `--max-events`. `history` reads an
 existing store using an exclusive `--after` ID and a bounded page size.

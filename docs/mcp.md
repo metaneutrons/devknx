@@ -1,9 +1,10 @@
 # MCP stdio server (experimental)
 
-Start the local MCP server with an existing capture database:
+Start the local MCP server for a KNXnet/IP endpoint's existing capture. An
+explicit `--database PATH` also works when the owner uses a custom path:
 
 ```sh
-devknx mcp --database /absolute/path/to/captures.sqlite
+devknx mcp --endpoint tunnel://192.0.2.1:3671
 ```
 
 Configure that command in the MCP client. Standard output is reserved for

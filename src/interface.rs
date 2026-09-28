@@ -15,6 +15,7 @@ use std::time::Duration;
 use devknx::ets::parse_group_address;
 use devknx::ipc::{IpcClient, IpcMessage, WireState};
 use devknx::operations::{OperationRequest, prepare};
+use devknx::paths;
 use devknx::service::LiveCapture;
 use devknx::storage::CaptureStore;
 use knx_rs_ip::discovery::{self, GatewayInfo};
@@ -301,7 +302,7 @@ impl MonitorModel {
     }
 }
 
-/// Connection profile shared by the interactive surfaces. No credential is stored.
+/// Connection settings shared by the interactive surfaces. No credential is stored.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConnectionSettings {
     pub mode: ConnectionMode,
@@ -381,44 +382,15 @@ impl ConnectionSettings {
     }
 }
 
-pub fn default_database() -> Result<PathBuf, String> {
-    #[cfg(target_os = "macos")]
-    let base = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join("Library/Application Support"));
-    #[cfg(target_os = "windows")]
-    let base = std::env::var_os("LOCALAPPDATA")
-        .or_else(|| std::env::var_os("APPDATA"))
-        .map(PathBuf::from);
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".local/share"))
-        });
-    let base = base.ok_or("Cannot find the current user's application data directory")?;
-    Ok(base.join("devknx").join("captures.sqlite"))
-}
-
 pub fn ensure_database(database: &Path) -> Result<(), String> {
     if database.exists() {
         return Ok(());
     }
     let parent = database
         .parent()
-        .ok_or("Capture path has no parent directory")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true).mode(0o700);
-        builder.create(parent).map_err(|error| error.to_string())?;
-    }
-    #[cfg(not(unix))]
-    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    ensure_private_directory(parent)?;
     drop(
         CaptureStore::open(database, NonZeroU32::new(100_000).expect("nonzero"))
             .map_err(|error| error.to_string())?,
@@ -427,7 +399,26 @@ pub fn ensure_database(database: &Path) -> Result<(), String> {
 }
 
 pub fn load_settings(database: &Path) -> Result<ConnectionSettings, String> {
-    let path = database.with_file_name("connection.json");
+    let path = paths::connection_settings_file(database);
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| error.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if paths::legacy_database().ok().as_deref() == Some(database) {
+                load_recent_settings()
+            } else {
+                Ok(ConnectionSettings::default())
+            }
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+pub fn save_settings(database: &Path, settings: &ConnectionSettings) -> Result<(), String> {
+    write_settings(&paths::connection_settings_file(database), settings)
+}
+
+pub fn load_recent_settings() -> Result<ConnectionSettings, String> {
+    let path = paths::recent_connection_file()?;
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| error.to_string()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -437,14 +428,32 @@ pub fn load_settings(database: &Path) -> Result<ConnectionSettings, String> {
     }
 }
 
-pub fn save_settings(database: &Path, settings: &ConnectionSettings) -> Result<(), String> {
-    let path = database.with_file_name("connection.json");
+pub fn save_recent_settings(settings: &ConnectionSettings) -> Result<(), String> {
+    write_settings(&paths::recent_connection_file()?, settings)
+}
+
+fn write_settings(path: &Path, settings: &ConnectionSettings) -> Result<(), String> {
     let parent = path
         .parent()
-        .ok_or("Settings path has no parent directory")?;
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    ensure_private_directory(parent)?;
     let mut file = tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
     serde_json::to_writer_pretty(&mut file, settings).map_err(|error| error.to_string())?;
-    file.persist(&path).map_err(|error| error.to_string())?;
+    file.persist(path).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn ensure_private_directory(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(path).map_err(|error| error.to_string())?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(path).map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -519,7 +528,18 @@ fn verify_owner_endpoint(
         _ => None,
     });
     match active {
-        Some(endpoint) if endpoint == requested_endpoint => Ok(()),
+        Some(endpoint)
+            if endpoint == requested_endpoint
+                || matches!(
+                    (
+                        paths::canonical_endpoint(endpoint),
+                        paths::canonical_endpoint(requested_endpoint)
+                    ),
+                    (Ok(active), Ok(requested)) if active == requested
+                ) =>
+        {
+            Ok(())
+        }
         Some(endpoint) => Err(format!(
             "Capture is already configured for {endpoint}. Disconnect it before switching gateways."
         )),
@@ -747,7 +767,7 @@ mod tests {
     }
 
     #[test]
-    fn connection_profiles_validate_mode_and_address_without_network_access() {
+    fn connection_settings_validate_mode_and_address_without_network_access() {
         let start = ConnectionSettings::default();
         assert_eq!(start.mode, ConnectionMode::Tunnel);
         assert_eq!(start.port, 3671);
@@ -781,6 +801,14 @@ mod tests {
             delay_ms: 2_000,
         };
         assert!(verify_owner_endpoint(&retry, Some(requested), requested).is_ok());
+        assert!(
+            verify_owner_endpoint(
+                &retry,
+                Some("tunnel://[2001:0db8:0:0:0:0:0:1]:3671"),
+                "tunnel://[2001:db8::1]:3671",
+            )
+            .is_ok()
+        );
         assert!(verify_owner_endpoint(&retry, Some(other), requested).is_err());
         assert!(verify_owner_endpoint(&retry, None, requested).is_err());
         assert!(verify_owner_endpoint(&WireState::Idle, Some(other), requested).is_err());
@@ -828,6 +856,21 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn connection_settings_are_scoped_to_each_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.sqlite");
+        let second = directory.path().join("second.sqlite");
+        let first_settings = ConnectionSettings::from_endpoint("tunnel://192.0.2.8:3671").unwrap();
+        let second_settings =
+            ConnectionSettings::from_endpoint("router://224.0.23.12:3671").unwrap();
+        save_settings(&first, &first_settings).unwrap();
+        save_settings(&second, &second_settings).unwrap();
+        assert_eq!(load_settings(&first).unwrap(), first_settings);
+        assert_eq!(load_settings(&second).unwrap(), second_settings);
+        assert!(!directory.path().join("connection.json").exists());
     }
 
     #[test]

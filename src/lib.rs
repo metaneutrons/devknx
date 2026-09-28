@@ -10,5 +10,6 @@ pub mod ets;
 pub mod ipc;
 pub mod mcp;
 pub mod operations;
+pub mod paths;
 pub mod service;
 pub mod storage;

@@ -1,4 +1,4 @@
-# Initiative plan: devknx (v4)
+# Initiative plan: devknx (v5)
 
 Epic: [devknx initiative](https://github.com/metaneutrons/devknx/issues/3)
 Decision state: product scope agreed with Fabian in September 2026
@@ -35,6 +35,19 @@ occur only at their acceptance stages.
 - One local daemon owns each configured KNX connection and the capture store.
   A typed operation model is the only place where device actions are defined.
   CLI, TUI, GUI, REST, and MCP are adapters to that model.
+- The default capture database is deterministically derived from the canonical
+  KNXnet/IP mode, address, and port. `--database` overrides this selection.
+  CLI commands without a positional endpoint require either `--endpoint` or
+  `--database`; they never infer a write target from the GUI's last-used
+  connection. The GUI may remember that connection for its own startup. The
+  TUI requires an explicit selector at startup and may switch endpoint-derived
+  stores when the user changes its connection settings.
+- `serve` is the explicit foreground/headless capture owner for service
+  managers. GUI and TUI start the same owner after an explicit Connect.
+  REST and MCP are separate, opt-in adapters to the selected capture; a
+  future automatic CLI daemon lifecycle requires its own design and tests.
+  The pre-connection `captures.sqlite` may mix gateways and remains available
+  for offline inspection; it is not silently assigned to one endpoint.
 - A capture stores the raw cEMI frame as well as parsed source, destination,
   service, payload, connection, direction, and timestamp. The raw event is not
   rewritten when ETS metadata changes. Enrichment is versioned separately.

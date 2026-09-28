@@ -241,6 +241,14 @@ impl CaptureStore {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
         {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                let mut builder = std::fs::DirBuilder::new();
+                builder.recursive(true).mode(0o700);
+                builder.create(parent)?;
+            }
+            #[cfg(not(unix))]
             std::fs::create_dir_all(parent)?;
         }
         let database_path = normalized_sqlite_path(path)?;

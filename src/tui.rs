@@ -17,6 +17,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 use crate::interface::{self, ConnectionSettings, Follower, MonitorModel};
+use devknx::paths;
 
 struct TerminalGuard;
 
@@ -64,6 +65,7 @@ enum Mode {
 struct App {
     model: MonitorModel,
     follower: Follower,
+    fixed_database: bool,
     action_receiver: Option<Receiver<Result<devknx::ipc::IpcMessage, String>>>,
     discovery_receiver: Option<Receiver<Result<Vec<knx_rs_ip::discovery::GatewayInfo>, String>>>,
     connection_receiver: Option<Receiver<Result<String, String>>>,
@@ -79,19 +81,28 @@ struct App {
 }
 
 impl App {
-    fn new(database: PathBuf) -> Result<Self, String> {
+    fn new(
+        database: PathBuf,
+        fixed_database: bool,
+        selected_endpoint: Option<&str>,
+    ) -> Result<Self, String> {
         let mut model = MonitorModel::open(database.clone())?;
-        let settings = match interface::load_settings(&database) {
-            Ok(settings) => settings,
-            Err(error) => {
-                model.notice(format!("Connection settings could not be loaded: {error}"));
-                ConnectionSettings::default()
+        let settings = if let Some(endpoint) = selected_endpoint {
+            ConnectionSettings::from_endpoint(endpoint)?
+        } else {
+            match interface::load_settings(&database) {
+                Ok(settings) => settings,
+                Err(error) => {
+                    model.notice(format!("Connection settings could not be loaded: {error}"));
+                    ConnectionSettings::default()
+                }
             }
         };
         let selected = model.rows.len().saturating_sub(1);
         Ok(Self {
             model,
             follower: Follower::start(database),
+            fixed_database,
             action_receiver: None,
             discovery_receiver: None,
             connection_receiver: None,
@@ -213,9 +224,25 @@ impl App {
                 return;
             }
         };
-        if let Err(error) = interface::save_settings(&self.model.database, &self.settings) {
+        let database = if self.fixed_database {
+            Ok(self.model.database.clone())
+        } else {
+            paths::database_for_endpoint(&endpoint)
+        };
+        let database = match database {
+            Ok(database) => database,
+            Err(error) => {
+                self.model.notice(error);
+                return;
+            }
+        };
+        if let Err(error) = self.select_endpoint_database(
+            self.settings.clone(),
+            database,
+            interface::save_recent_settings,
+        ) {
             self.model
-                .notice(format!("Could not save connection settings: {error}"));
+                .notice(format!("Could not prepare connection storage: {error}"));
             return;
         }
         let database = self.model.database.clone();
@@ -224,6 +251,71 @@ impl App {
         std::thread::spawn(move || {
             let _ = sender.send(interface::connect_owner(&database, &endpoint));
         });
+    }
+
+    fn select_endpoint_database(
+        &mut self,
+        settings: ConnectionSettings,
+        database: PathBuf,
+        save_recent: impl FnOnce(&ConnectionSettings) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if self.model.owner_available && self.settings != settings {
+            return Err("Disconnect before changing connection settings".into());
+        }
+        let changing_database = self.model.database != database;
+        if changing_database && self.connection_receiver.is_some() {
+            return Err("Wait for the current connection operation to finish".into());
+        }
+        if changing_database && self.action_receiver.is_some() {
+            return Err(
+                "Wait for the current operation to finish before changing capture storage".into(),
+            );
+        }
+
+        interface::ensure_database(&database)?;
+        let replacement_model = if changing_database {
+            Some(MonitorModel::open(database.clone())?)
+        } else {
+            None
+        };
+        interface::save_settings(&database, &settings)?;
+        let recent_error = if self.fixed_database {
+            None
+        } else {
+            save_recent(&settings).err()
+        };
+
+        if let Some(model) = replacement_model {
+            self.follower = Follower::start(database);
+            self.model = model;
+            self.selected = self.model.rows.len().saturating_sub(1);
+            self.follow_tail = true;
+        }
+        self.settings = settings;
+        self.model
+            .notice("Connection settings saved. Press c to connect.".into());
+        if let Some(error) = recent_error {
+            self.model.notice(format!(
+                "Endpoint settings were saved, but recent connection settings could not be updated: {error}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn submit_endpoint_with(
+        &mut self,
+        input: &str,
+        resolve_database: impl FnOnce(&str) -> Result<PathBuf, String>,
+        save_recent: impl FnOnce(&ConnectionSettings) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let settings = ConnectionSettings::from_endpoint(input)?;
+        let endpoint = settings.endpoint()?;
+        let database = if self.fixed_database {
+            self.model.database.clone()
+        } else {
+            resolve_database(&endpoint)?
+        };
+        self.select_endpoint_database(settings, database, save_recent)
     }
 
     fn stop_connection(&mut self) {
@@ -286,19 +378,13 @@ impl App {
                 self.mode = Mode::Normal;
             }
             Mode::ConnectionEndpoint => {
-                match ConnectionSettings::from_endpoint(&input) {
-                    Ok(settings) => {
-                        self.settings = settings;
-                        match interface::save_settings(&self.model.database, &self.settings) {
-                            Ok(()) => self
-                                .model
-                                .notice("Connection settings saved. Press c to connect.".into()),
-                            Err(error) => self
-                                .model
-                                .notice(format!("Could not save connection settings: {error}")),
-                        }
-                    }
-                    Err(error) => self.model.notice(error),
+                if let Err(error) = self.submit_endpoint_with(
+                    &input,
+                    paths::database_for_endpoint,
+                    interface::save_recent_settings,
+                ) {
+                    self.model
+                        .notice(format!("Could not save connection settings: {error}"));
                 }
                 self.mode = Mode::Normal;
             }
@@ -491,15 +577,14 @@ impl App {
     }
 }
 
-pub fn run(database: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
-    let database = if let Some(database) = database {
-        database
-    } else {
-        let database = interface::default_database().map_err(io::Error::other)?;
-        interface::ensure_database(&database).map_err(io::Error::other)?;
-        database
-    };
-    let mut app = App::new(database).map_err(io::Error::other)?;
+pub fn run(
+    database: PathBuf,
+    fixed_database: bool,
+    selected_endpoint: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    interface::ensure_database(&database).map_err(io::Error::other)?;
+    let mut app =
+        App::new(database, fixed_database, selected_endpoint).map_err(io::Error::other)?;
     install_panic_hook();
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -528,7 +613,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("capture.sqlite");
         drop(CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap());
-        let mut app = App::new(database).unwrap();
+        let mut app = App::new(database, true, None).unwrap();
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         app.draw(&mut terminal).unwrap();
         terminal.resize(Rect::new(0, 0, 40, 12)).unwrap();
@@ -549,8 +634,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("capture.sqlite");
         drop(CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap());
-        std::fs::write(directory.path().join("connection.json"), b"not JSON").unwrap();
-        let app = App::new(database).unwrap();
+        std::fs::write(paths::connection_settings_file(&database), b"not JSON").unwrap();
+        let app = App::new(database, true, None).unwrap();
         assert!(
             app.model
                 .notices
@@ -566,7 +651,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("capture.sqlite");
         drop(CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap());
-        let mut app = App::new(database.clone()).unwrap();
+        let mut app = App::new(database.clone(), true, None).unwrap();
         app.mode = Mode::ConnectionEndpoint;
         app.input = "tunnel://192.0.2.8:3671".into();
         app.submit();
@@ -576,6 +661,7 @@ mod tests {
             interface::load_settings(&database).unwrap(),
             ConnectionSettings::from_endpoint("tunnel://192.0.2.8:3671").unwrap()
         );
+        assert_eq!(app.model.database, database);
         assert!(
             app.model
                 .notices
@@ -586,11 +672,75 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_selector_populates_connection_before_first_connect() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("endpoint.sqlite");
+        drop(CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap());
+        let endpoint = "tunnel://192.0.2.8:3671";
+        let app = App::new(database, false, Some(endpoint)).unwrap();
+        assert_eq!(app.settings.endpoint().unwrap(), endpoint);
+        assert!(app.connection_receiver.is_none());
+    }
+
+    #[test]
+    fn automatic_endpoint_submission_switches_storage_without_connecting() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_database = directory.path().join("source.sqlite");
+        let target_database = directory.path().join("endpoint.sqlite");
+        drop(CaptureStore::open(&source_database, NonZeroU32::new(10).unwrap()).unwrap());
+        let mut app = App::new(source_database, false, None).unwrap();
+        app.model.rows.push(interface::DisplayCapture {
+            id: Some(1),
+            timestamp_ms: 1,
+            direction: "in".into(),
+            source: "1.1.1".into(),
+            destination: "1/1/1".into(),
+            service: "GroupValueWrite".into(),
+            label: None,
+            dpts: Vec::new(),
+            value: None,
+            raw_cemi: "29 00".into(),
+        });
+        app.selected = 1;
+        app.follow_tail = false;
+        let recent_saved = std::cell::Cell::new(false);
+        let endpoint = "tunnel://192.0.2.9:3671";
+
+        app.submit_endpoint_with(
+            endpoint,
+            |resolved_endpoint| {
+                assert_eq!(resolved_endpoint, endpoint);
+                Ok(target_database.clone())
+            },
+            |_| {
+                recent_saved.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(app.model.database, target_database);
+        assert!(app.model.rows.is_empty());
+        assert_eq!(app.selected, 0);
+        assert!(app.follow_tail);
+        assert_eq!(
+            app.settings,
+            ConnectionSettings::from_endpoint(endpoint).unwrap()
+        );
+        assert_eq!(
+            interface::load_settings(&target_database).unwrap(),
+            app.settings
+        );
+        assert!(recent_saved.get());
+        assert!(app.connection_receiver.is_none());
+    }
+
+    #[test]
     fn sustained_rows_scroll_filter_and_resize() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("capture.sqlite");
         drop(CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap());
-        let mut app = App::new(database).unwrap();
+        let mut app = App::new(database, true, None).unwrap();
         for id in 0..5_000 {
             app.model.rows.push(interface::DisplayCapture {
                 id: Some(id),

@@ -8,6 +8,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use devknx::ipc::WireState;
+use devknx::paths;
 use eframe::egui;
 use knx_rs_ip::discovery::GatewayInfo;
 
@@ -151,6 +152,7 @@ struct LiveSmoke {
 )]
 struct MonitorApp {
     primary_database: Option<PathBuf>,
+    database_override: Option<PathBuf>,
     offline_capture: bool,
     model: Option<MonitorModel>,
     follower: Option<Follower>,
@@ -202,29 +204,32 @@ impl MonitorApp {
             }),
             ..Self::default()
         };
-        let database = database.or_else(|| {
-            if app.smoke.is_some() {
-                None
-            } else {
-                match interface::default_database() {
-                    Ok(path) => {
-                        if let Err(error) = interface::ensure_database(&path) {
-                            app.error = Some(format!("Cannot initialize capture storage: {error}"));
-                            None
-                        } else {
-                            Some(path)
-                        }
-                    }
-                    Err(error) => {
-                        app.error = Some(error);
-                        None
+        if let Some(database) = database {
+            app.database_override = Some(database.clone());
+            app.primary_database = Some(database.clone());
+            match interface::ensure_database(&database) {
+                Ok(()) => app.attach(&database, false),
+                Err(error) => app.error = Some(error),
+            }
+        } else if app.smoke.is_none() {
+            match interface::load_recent_settings() {
+                Ok(settings) => {
+                    app.settings = settings.clone();
+                    app.settings_draft = settings.clone();
+                    if let Ok(endpoint) = app.settings.endpoint()
+                        && let Ok(database) = paths::database_for_endpoint(&endpoint)
+                        && database.exists()
+                    {
+                        app.primary_database = Some(database.clone());
+                        app.attach(&database, false);
+                        app.settings = settings.clone();
+                        app.settings_draft = settings;
                     }
                 }
+                Err(error) => {
+                    app.error = Some(format!("Connection settings could not be loaded: {error}"));
+                }
             }
-        });
-        if let Some(database) = database {
-            app.primary_database = Some(database.clone());
-            app.attach(&database, false);
         }
         if let (Some(smoke), Some(model)) = (&mut app.live_smoke, &app.model) {
             smoke.phase = LiveSmokePhase::Stream {
@@ -271,11 +276,12 @@ impl MonitorApp {
         let mut dialog = rfd::FileDialog::new()
             .set_title("Open KNX Capture")
             .add_filter("SQLite capture", &["sqlite", "sqlite3", "db"]);
-        if let Some(parent) = self
+        let directory = self
             .primary_database
             .as_ref()
-            .and_then(|path| path.parent())
-        {
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .or_else(|| paths::data_dir().ok().map(|path| path.join("captures")));
+        if let Some(parent) = directory {
             dialog = dialog.set_directory(parent);
         }
         if let Some(database) = dialog.pick_file() {
@@ -297,10 +303,6 @@ impl MonitorApp {
             self.error = Some("Return to Live Capture before connecting to a gateway".into());
             return;
         }
-        let Some(model) = &self.model else {
-            self.error = Some("Capture storage is not available".into());
-            return;
-        };
         if self.connection_receiver.is_some() {
             return;
         }
@@ -311,17 +313,72 @@ impl MonitorApp {
                 return;
             }
         };
-        if let Err(error) = interface::save_settings(&model.database, &self.settings) {
-            self.error = Some(format!("Could not save connection settings: {error}"));
-            return;
-        }
-        let database = model.database.clone();
+        let settings = self.settings.clone();
+        let database = match self.select_connection(&settings, &endpoint) {
+            Ok(database) => database,
+            Err(error) => {
+                self.error = Some(error);
+                return;
+            }
+        };
         let (sender, receiver) = mpsc::channel();
         self.connection_receiver = Some(receiver);
         self.error = None;
         std::thread::spawn(move || {
             let _ = sender.send(interface::connect_owner(&database, &endpoint));
         });
+    }
+
+    fn select_connection(
+        &mut self,
+        settings: &ConnectionSettings,
+        endpoint: &str,
+    ) -> Result<PathBuf, String> {
+        if self.offline_capture {
+            return Err("Return to Live Capture before changing connection settings".into());
+        }
+        let database = match &self.database_override {
+            Some(path) => path.clone(),
+            None => paths::database_for_endpoint(endpoint)?,
+        };
+        if self.connection_receiver.is_some() {
+            return Err("Wait for the current connection operation to finish".into());
+        }
+        if self.action_receiver.is_some() {
+            return Err(
+                "Wait for the current operation to finish before changing connection settings"
+                    .into(),
+            );
+        }
+        if self
+            .model
+            .as_ref()
+            .is_some_and(|model| model.owner_available && settings != &self.settings)
+        {
+            return Err("Disconnect before changing connection settings".into());
+        }
+        let replacement = if self.primary_database.as_deref() != Some(database.as_path())
+            || self.model.is_none()
+        {
+            interface::ensure_database(&database)?;
+            Some(MonitorModel::open(database.clone())?)
+        } else {
+            None
+        };
+        interface::save_settings(&database, settings)?;
+        if self.database_override.is_none() {
+            interface::save_recent_settings(settings)?;
+        }
+        if let Some(model) = replacement {
+            self.follower = Some(Follower::start(database.clone()));
+            self.model = Some(model);
+            self.primary_database = Some(database.clone());
+            self.offline_capture = false;
+            self.selected = None;
+        }
+        self.settings = settings.clone();
+        self.settings_draft = settings.clone();
+        Ok(database)
     }
 
     fn disconnect(&mut self) {
@@ -594,21 +651,19 @@ impl MonitorApp {
                 .show(ctx, |ui| {
                     discover = render_connection_form(ui, &mut self.settings_draft, "settings");
                     ui.separator();
-                    if self.primary_database.is_some() {
-                        ui.label("Capture storage");
-                        ui.small("History is saved automatically in this app's data folder.");
-                        ui.small("Use Open… to choose another capture in the system file dialog.");
-                    }
+                    ui.label("Capture storage");
+                    ui.small("History is saved automatically for this connection.");
+                    ui.small("Use Open… to choose another capture in the system file dialog.");
                     ui.separator();
                     ui.horizontal(|ui| {
                         save = ui.button("Save settings").clicked();
                         connect = ui
                             .add_enabled(
                                 !self.offline_capture
-                                    && self
+                                    && !self
                                         .model
                                         .as_ref()
-                                        .is_some_and(|model| !model.owner_available)
+                                        .is_some_and(|model| model.owner_available)
                                     && self.connection_receiver.is_none(),
                                 egui::Button::new("Save and connect"),
                             )
@@ -620,24 +675,19 @@ impl MonitorApp {
                 self.discover();
             }
             if save || connect {
-                let validation = if connect || !self.settings_draft.address.is_empty() {
-                    self.settings_draft.endpoint().map(|_| ())
-                } else {
-                    Ok(())
-                };
-                match validation {
-                    Ok(()) => {
-                        self.settings = self.settings_draft.clone();
-                        if let Some(database) = &self.primary_database {
-                            if let Err(error) = interface::save_settings(database, &self.settings) {
-                                self.error =
-                                    Some(format!("Could not save connection settings: {error}"));
-                            } else {
+                match self.settings_draft.endpoint() {
+                    Ok(endpoint) => {
+                        match self.select_connection(&self.settings_draft.clone(), &endpoint) {
+                            Ok(_) => {
                                 self.error = None;
                                 self.show_settings = false;
                                 if connect {
                                     self.connect();
                                 }
+                            }
+                            Err(error) => {
+                                self.error =
+                                    Some(format!("Could not save connection settings: {error}"));
                             }
                         }
                     }
@@ -810,9 +860,9 @@ impl MonitorApp {
     fn connection_status(&self) -> (egui::Color32, &'static str, String) {
         let Some(model) = &self.model else {
             return (
-                egui::Color32::RED,
-                "Storage unavailable",
-                "Use Open… to choose an existing capture file".into(),
+                egui::Color32::GRAY,
+                "Disconnected",
+                "Choose a KNXnet/IP connection to begin capture".into(),
             );
         };
         if self.offline_capture {
@@ -867,14 +917,18 @@ impl MonitorApp {
                 .as_ref()
                 .is_some_and(|model| model.owner_available);
             if self.offline_capture {
-                if ui.button("Live capture").clicked()
-                    && let Some(database) = &self.primary_database
-                {
-                    self.attach(&database.clone(), false);
+                if ui.button("Live capture").clicked() {
+                    if let Some(database) = self.primary_database.clone() {
+                        self.attach(&database, false);
+                    } else {
+                        self.model = None;
+                        self.follower = None;
+                        self.offline_capture = false;
+                    }
                 }
             } else if ui
                 .add_enabled(
-                    self.model.is_some() && self.connection_receiver.is_none(),
+                    self.connection_receiver.is_none(),
                     egui::Button::new(if owner_available {
                         "Disconnect"
                     } else {
@@ -969,7 +1023,7 @@ impl MonitorApp {
                             ui.add_space(8.0);
                             connect = ui
                                 .add_enabled(
-                                    self.model.is_some() && self.connection_receiver.is_none(),
+                                    self.connection_receiver.is_none(),
                                     egui::Button::new("Connect"),
                                 )
                                 .clicked();
@@ -981,6 +1035,13 @@ impl MonitorApp {
             }
             if connect {
                 self.connect();
+            }
+            if let Ok(previous) = paths::legacy_database()
+                && previous.exists()
+                && self.primary_database.as_deref() != Some(previous.as_path())
+                && ui.button("Open previous capture…").clicked()
+            {
+                self.attach(&previous, true);
             }
         });
     }
@@ -1170,7 +1231,7 @@ impl eframe::App for MonitorApp {
                 && self
                     .model
                     .as_ref()
-                    .is_some_and(|model| model.rows.is_empty() && !model.owner_available)
+                    .is_none_or(|model| model.rows.is_empty() && !model.owner_available)
             {
                 self.render_empty(ui);
             } else if self.model.is_some() {
@@ -1238,6 +1299,31 @@ mod tests {
         assert!(!app.offline_capture);
         app.attach(&database, true);
         assert!(!app.offline_capture);
+    }
+
+    #[test]
+    fn explicit_database_override_stays_fixed_when_connection_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("manual.sqlite");
+        drop(CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap());
+        let mut app = MonitorApp::new(Some(database.clone()), None, false);
+        let settings = ConnectionSettings::from_endpoint("tunnel://192.0.2.8:3671").unwrap();
+        assert_eq!(
+            app.select_connection(&settings, &settings.endpoint().unwrap())
+                .unwrap(),
+            database
+        );
+        assert_eq!(app.primary_database.as_deref(), Some(database.as_path()));
+        assert_eq!(interface::load_settings(&database).unwrap(), settings);
+
+        app.model.as_mut().unwrap().owner_available = true;
+        let other = ConnectionSettings::from_endpoint("tunnel://192.0.2.9:3671").unwrap();
+        assert!(
+            app.select_connection(&other, &other.endpoint().unwrap())
+                .unwrap_err()
+                .contains("Disconnect")
+        );
+        assert_eq!(interface::load_settings(&database).unwrap(), settings);
     }
 
     #[test]

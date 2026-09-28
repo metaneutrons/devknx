@@ -259,6 +259,25 @@ async fn daemon_manages_two_isolated_sessions_and_rest_lifecycle() {
     stream.read_to_end(&mut response).await.unwrap();
     assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"));
 
+    assert_eq!(cli.json(&["rest", "--disable"])["status"]["enabled"], false);
+    assert_eq!(cli.json(&["rest", "--status"])["status"]["enabled"], false);
+    assert_eq!(
+        cli.json(&["sessions"])["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "disabling REST stopped a KNX session"
+    );
+    cli.json(&[
+        "rest",
+        "--enable",
+        "--endpoint",
+        &second,
+        "--bind",
+        "127.0.0.1:0",
+    ]);
+
     cli.json(&["disconnect", &first]);
     assert_eq!(cli.json(&["daemon", "--status"])["running"], true);
     assert_eq!(

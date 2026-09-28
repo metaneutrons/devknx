@@ -23,6 +23,7 @@ use std::time::Duration;
 use std::time::UNIX_EPOCH;
 use tokio::sync::{broadcast, oneshot};
 
+mod color;
 #[cfg(feature = "gui")]
 mod gui;
 #[cfg(any(feature = "gui", feature = "tui"))]
@@ -35,6 +36,12 @@ mod tui;
 #[derive(Parser)]
 #[command(name = "devknx", version, about = "Discover and monitor KNXnet/IP")]
 struct Cli {
+    /// Colour human-readable output (auto enables it on a terminal).
+    #[arg(long, global = true, value_enum, conflicts_with = "no_color")]
+    color: Option<color::ColorMode>,
+    /// Disable colours in terminal and GUI capture text.
+    #[arg(long, global = true)]
+    no_color: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -329,7 +336,13 @@ enum Command {
     reason = "top-level CLI dispatch names each application command explicitly"
 )]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    color::set_cli_mode(if cli.no_color {
+        color::ColorMode::Never
+    } else {
+        cli.color.unwrap_or_default()
+    });
+    match cli.command {
         Some(Command::Discover) => {
             let gateways = discovery::discover(Ipv4Addr::UNSPECIFIED).await?;
             for gateway in gateways {
@@ -508,7 +521,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .as_ref()
                     .is_none_or(|query| line.to_lowercase().contains(&query.to_lowercase()))
                 {
-                    writeln!(output, "id={} {line}", capture.id)?;
+                    let text = format!("id={} {line}", capture.id);
+                    writeln!(
+                        output,
+                        "{}",
+                        color::capture_line(
+                            &text,
+                            capture.event.direction().as_str(),
+                            color::terminal_enabled()
+                        )
+                    )?;
                 }
             }
         }
@@ -960,9 +982,10 @@ async fn run_monitor_client(database: &std::path::Path) -> Result<(), Box<dyn st
                     id, observed_at_ms, endpoint, direction, source,
                     destination, service, raw_cemi,
                 }) => {
-                    println!(
+                    let text = format!(
                         "id={id:?} timestamp_ms={observed_at_ms} endpoint={endpoint} direction={direction} source={source} destination={destination} service={service} cemi={raw_cemi}"
                     );
+                    println!("{}", color::capture_line(&text, &direction, color::terminal_enabled()));
                     io::stdout().flush()?;
                 }
                 Some(message) => eprintln!("{}", serde_json::to_string(&message)?),
@@ -1021,6 +1044,32 @@ mod tests {
     use knx_rs_core::types::Priority;
 
     use super::*;
+
+    #[test]
+    fn global_color_options_parse_and_conflict() {
+        let cli = Cli::try_parse_from([
+            "devknx",
+            "history",
+            "--database",
+            "capture.sqlite",
+            "--no-color",
+        ])
+        .unwrap();
+        assert!(cli.no_color);
+        let cli = Cli::try_parse_from([
+            "devknx",
+            "--color",
+            "always",
+            "history",
+            "--database",
+            "capture.sqlite",
+        ])
+        .unwrap();
+        assert_eq!(cli.color, Some(color::ColorMode::Always));
+        assert!(
+            Cli::try_parse_from(["devknx", "--color", "never", "--no-color", "discover"]).is_err()
+        );
+    }
 
     #[test]
     fn monitor_line_includes_context_and_exact_cemi() {

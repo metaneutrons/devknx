@@ -28,6 +28,7 @@ pub enum Capability {
     RawWrite,
     GroupRead,
     OperationAudit,
+    ColorDisplay,
 }
 
 /// All tracked application operations.
@@ -53,6 +54,7 @@ pub const ALL: &[Capability] = &[
     Capability::RawWrite,
     Capability::GroupRead,
     Capability::OperationAudit,
+    Capability::ColorDisplay,
 ];
 
 /// Human-facing adapter.
@@ -72,6 +74,10 @@ pub struct Declaration {
 
 /// Command dispatch anchors in `src/main.rs`.
 pub const CLI: &[Declaration] = &[
+    Declaration {
+        capability: Capability::ColorDisplay,
+        source_anchor: "color: Option<color::ColorMode>",
+    },
     Declaration {
         capability: Capability::GatewayDiscovery,
         source_anchor: "Some(Command::Discover) =>",
@@ -161,6 +167,10 @@ pub const CLI: &[Declaration] = &[
 /// Terminal control anchors in `src/tui.rs`.
 pub const TUI: &[Declaration] = &[
     Declaration {
+        capability: Capability::ColorDisplay,
+        source_anchor: "KeyCode::F(8)",
+    },
+    Declaration {
         capability: Capability::GatewayDiscovery,
         source_anchor: "KeyCode::Char('d') =>",
     },
@@ -220,6 +230,10 @@ pub const TUI: &[Declaration] = &[
 
 /// Desktop control anchors in `src/gui.rs`.
 pub const GUI: &[Declaration] = &[
+    Declaration {
+        capability: Capability::ColorDisplay,
+        source_anchor: "Checkbox::new(&mut self.color_enabled, \"Color\")",
+    },
     Declaration {
         capability: Capability::GatewayDiscovery,
         source_anchor: "ui.button(\"Discover gateways…\")",

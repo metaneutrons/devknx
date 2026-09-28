@@ -133,7 +133,16 @@ explained under Settings rather than presented as the KNX connection. Its macOS
 app has native application, File, Edit, View, Operation, Window and Help menus.
 The TUI offers `c` connect/disconnect, `s` endpoint settings, `a` REST loopback control, `/` filter,
 `r` read, `w` prepared typed write, `e` export, `h` reload, `PgUp` older history, `d` discovery,
-`j`/`k` scroll and `q` quit.
+`j`/`k` scroll, `F8` toggle capture colors and `q` quit.
+The GUI has a Color checkbox in its toolbar. Both interactive views remember
+that display preference independently of the selected capture database.
+Human-readable CLI output uses `--color auto|always|never` or `--no-color`;
+`auto` is on for terminals and off for pipes. `NO_COLOR` disables automatic
+coloring; explicit `--color always` overrides it. A command-line color override
+locks the interactive switch for that process. Sent telegrams use one restrained
+accent, router losses are red and local subscriber lag is amber. The textual
+labels remain present without color. JSON lines, CSV, SQLite, REST and MCP
+payloads are never colorized.
 In both interfaces, a typed write is previewed before a separate send action.
 Expert raw sending, ETS import, backup and durable audit inspection remain CLI
 commands. The [capability registry](src/capabilities.rs) records these explicit

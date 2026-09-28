@@ -323,7 +323,9 @@ async fn authorize(
         let authorized = headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
+            .and_then(|value| value.split_once(' '))
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
+            .map(|(_, credentials)| credentials.trim_start_matches(' '))
             .is_some_and(|provided| {
                 provided.len() == token.len()
                     && bool::from(provided.as_bytes().ct_eq(token.as_bytes()))
@@ -1225,7 +1227,7 @@ mod tests {
             .method(Method::GET)
             .uri("/v1/openapi.json")
             .header(header::HOST, "127.0.0.1:8765")
-            .header(header::AUTHORIZATION, format!("Bearer {}", "s".repeat(32)))
+            .header(header::AUTHORIZATION, format!("bEaReR  {}", "s".repeat(32)))
             .body(Body::empty())
             .unwrap();
         let response = secured_app.oneshot(response).await.unwrap();

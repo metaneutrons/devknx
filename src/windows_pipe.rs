@@ -20,7 +20,11 @@ const RETRY_INTERVAL: Duration = Duration::from_millis(25);
 ///
 /// A missing pipe returns immediately so an on-demand daemon can be spawned.
 /// A pipe with all instances busy is retried for at most five seconds.
-pub(crate) async fn connect(name: &str) -> io::Result<NamedPipeClient> {
+///
+/// # Errors
+///
+/// Returns a Windows pipe-open error when the listener is unavailable or busy.
+pub async fn connect(name: &str) -> io::Result<NamedPipeClient> {
     let path = format!(r"\\.\pipe\{name}");
     let deadline = Instant::now() + BUSY_TIMEOUT;
     loop {

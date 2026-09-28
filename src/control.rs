@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
+#[cfg(unix)]
 use crate::paths;
 
 const MAX_MESSAGE_SIZE: usize = 16 * 1024;

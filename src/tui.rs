@@ -6,7 +6,7 @@
 use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::ExecutableCommand as _;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -17,6 +17,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 use crate::interface::{self, ConnectionSettings, Follower, MonitorModel};
+use devknx::control::RestStatus;
 use devknx::paths;
 
 struct TerminalGuard;
@@ -58,6 +59,7 @@ enum Mode {
     WriteDpt,
     WriteValue,
     ConfirmWrite,
+    ConfirmRest,
     Export,
     ConnectionEndpoint,
 }
@@ -69,6 +71,10 @@ struct App {
     action_receiver: Option<Receiver<Result<devknx::ipc::IpcMessage, String>>>,
     discovery_receiver: Option<Receiver<Result<Vec<knx_rs_ip::discovery::GatewayInfo>, String>>>,
     connection_receiver: Option<Receiver<Result<String, String>>>,
+    rest_receiver: Option<Receiver<Result<RestStatus, String>>>,
+    rest_status: Option<RestStatus>,
+    last_rest_refresh: Instant,
+    rest_action_pending: bool,
     settings: ConnectionSettings,
     mode: Mode,
     input: String,
@@ -106,6 +112,12 @@ impl App {
             action_receiver: None,
             discovery_receiver: None,
             connection_receiver: None,
+            rest_receiver: None,
+            rest_status: None,
+            last_rest_refresh: Instant::now()
+                .checked_sub(Duration::from_secs(5))
+                .unwrap_or_else(Instant::now),
+            rest_action_pending: false,
             settings,
             mode: Mode::Normal,
             input: String::new(),
@@ -119,6 +131,7 @@ impl App {
     }
 
     fn poll(&mut self) {
+        self.poll_rest();
         for result in self.follower.receiver.try_iter().take(500) {
             match result {
                 Ok(message) => self.model.ingest(message),
@@ -146,6 +159,59 @@ impl App {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
+        self.poll_discovery_and_connection();
+    }
+
+    fn poll_rest(&mut self) {
+        if self.rest_receiver.is_none()
+            && self.last_rest_refresh.elapsed() >= Duration::from_secs(5)
+        {
+            let (sender, receiver) = mpsc::channel();
+            self.rest_receiver = Some(receiver);
+            self.rest_action_pending = false;
+            self.last_rest_refresh = Instant::now();
+            std::thread::spawn(move || {
+                let _ = sender.send(interface::rest_status());
+            });
+        }
+        if let Some(receiver) = &self.rest_receiver {
+            match receiver.try_recv() {
+                Ok(Ok(status)) => {
+                    if self.rest_action_pending {
+                        self.model.notice(if status.enabled {
+                            format!(
+                                "REST enabled at http://{}/v1 for {}",
+                                status.bind.map_or_else(
+                                    || "unknown address".into(),
+                                    |bind| bind.to_string()
+                                ),
+                                status.endpoint.as_deref().unwrap_or("unknown endpoint")
+                            )
+                        } else {
+                            "REST disabled".into()
+                        });
+                    }
+                    self.rest_status = Some(status);
+                    self.rest_receiver = None;
+                    self.rest_action_pending = false;
+                }
+                Ok(Err(error)) => {
+                    self.model.notice(format!("REST control failed: {error}"));
+                    self.rest_receiver = None;
+                    self.rest_action_pending = false;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.model
+                        .notice("REST control worker stopped unexpectedly".into());
+                    self.rest_receiver = None;
+                    self.rest_action_pending = false;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+    }
+
+    fn poll_discovery_and_connection(&mut self) {
         if let Some(receiver) = &self.discovery_receiver {
             match receiver.try_recv() {
                 Ok(Ok(gateways)) => {
@@ -253,6 +319,38 @@ impl App {
         });
     }
 
+    fn toggle_rest(&mut self) {
+        if self.rest_receiver.is_some() {
+            self.model
+                .notice("REST control is already in progress".into());
+            return;
+        }
+        let endpoint = match self.settings.endpoint() {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                self.model.notice(error);
+                return;
+            }
+        };
+        let (sender, receiver) = mpsc::channel();
+        self.rest_receiver = Some(receiver);
+        self.rest_action_pending = true;
+        std::thread::spawn(move || {
+            let result = interface::rest_status().and_then(|status| {
+                if status.enabled {
+                    if status.endpoint.as_deref() == Some(endpoint.as_str()) {
+                        interface::rest_disable()
+                    } else {
+                        Err("REST belongs to another KNX session; use the CLI to inspect it".into())
+                    }
+                } else {
+                    interface::rest_enable(&endpoint, "127.0.0.1:8765", None, false)
+                }
+            });
+            let _ = sender.send(result);
+        });
+    }
+
     fn select_endpoint_database(
         &mut self,
         settings: ConnectionSettings,
@@ -318,7 +416,7 @@ impl App {
         self.select_endpoint_database(settings, database, save_recent)
     }
 
-    fn stop_connection(&mut self) {
+    fn disconnect_connection(&mut self) {
         if self.connection_receiver.is_some() {
             return;
         }
@@ -388,7 +486,7 @@ impl App {
                 }
                 self.mode = Mode::Normal;
             }
-            Mode::Normal | Mode::ConfirmWrite => {}
+            Mode::Normal | Mode::ConfirmWrite | Mode::ConfirmRest => {}
         }
     }
 
@@ -420,6 +518,13 @@ impl App {
             self.preview.clear();
             return false;
         }
+        if self.mode == Mode::ConfirmRest {
+            if key.code == KeyCode::Char('y') {
+                self.toggle_rest();
+            }
+            self.mode = Mode::Normal;
+            return false;
+        }
         if self.mode != Mode::Normal {
             match key.code {
                 KeyCode::Enter => self.submit(),
@@ -437,7 +542,7 @@ impl App {
             KeyCode::Char('q') => return true,
             KeyCode::Char('c') => {
                 if self.model.owner_available {
-                    self.stop_connection();
+                    self.disconnect_connection();
                 } else if self.settings.address.is_empty() {
                     self.mode = Mode::ConnectionEndpoint;
                     self.input = "tunnel://".into();
@@ -451,6 +556,9 @@ impl App {
                     .settings
                     .endpoint()
                     .unwrap_or_else(|_| "tunnel://".into());
+            }
+            KeyCode::Char('a') => {
+                self.mode = Mode::ConfirmRest;
             }
             KeyCode::Char('/') => {
                 self.mode = Mode::Filter;
@@ -533,7 +641,14 @@ impl App {
             } else {
                 "Disconnected".to_owned()
             };
-            let title = format!(" KNXnet/IP · {status} ");
+            let selected_endpoint = self.settings.endpoint().ok();
+            let rest = match &self.rest_status {
+                Some(rest) if rest.enabled && rest.endpoint.as_ref() == selected_endpoint.as_ref() => "on",
+                Some(rest) if rest.enabled => "other session",
+                Some(_) => "off",
+                None => "unknown",
+            };
+            let title = format!(" KNXnet/IP · {status} · REST {rest} ");
             frame.render_widget(Paragraph::new(title).block(Block::default().borders(Borders::ALL)), areas[0]);
 
             let visible: Vec<_> = self.model.rows.iter().filter(|row| row.matches(&self.model.filter)).collect();
@@ -559,13 +674,14 @@ impl App {
                     row.value.as_deref().unwrap_or("unknown"), row.raw_cemi));
             frame.render_widget(Paragraph::new(detail).block(Block::default().title(" Details ").borders(Borders::ALL)), areas[2]);
             let prompt = match self.mode {
-                Mode::Normal => "c connect/stop · s endpoint · d discover · / filter · r read · w write · e export · h reload · q quit".to_owned(),
+                Mode::Normal => "c connect/disconnect · s endpoint · a REST · d discover · / filter · r read · w write · e export · h reload · q quit".to_owned(),
                 Mode::Filter => format!("Filter: {}", self.input),
                 Mode::Read => format!("Read group address: {}", self.input),
                 Mode::WriteAddress => format!("Write group address: {}", self.input),
                 Mode::WriteDpt => format!("DPT (blank = ETS): {}", self.input),
                 Mode::WriteValue => format!("Typed value: {}", self.input),
                 Mode::ConfirmWrite => format!("{} · y transmit / n or Esc cancel", self.preview),
+                Mode::ConfirmRest => "Toggle REST for this KNX session (enable uses loopback)? y confirm / n or Esc cancel".to_owned(),
                 Mode::Export => format!("New CSV file path: {}", self.input),
                 Mode::ConnectionEndpoint => format!("KNXnet/IP endpoint (tunnel://IP:3671 or router://MULTICAST:3671): {}", self.input),
             };

@@ -19,10 +19,10 @@ evidence.
 ## Passive tunnel capture
 
 Use a new private database path and replace the example endpoint with the
-operator-approved gateway. Start `serve` in one terminal:
+operator-approved gateway. Start one managed session:
 
 ```sh
-devknx serve tunnel://192.0.2.1:3671 --database ./m2-tunnel.sqlite
+devknx connect tunnel://192.0.2.1:3671 --database ./m2-tunnel.sqlite
 ```
 
 In another terminal, run `devknx status --database ./m2-tunnel.sqlite` and
@@ -35,7 +35,7 @@ against independently known traffic. Record separately whether read, response,
 and write telegrams were actually seen. Do not infer a missing service from a
 quiet capture or manufacture a frame and call it physical-bus evidence.
 
-Stop the process, restart it against the same database and gateway, and observe
+Disconnect the session, reconnect it against the same database and gateway, and observe
 another naturally occurring telegram. Confirm that the old capture remains,
 the new ID is higher, and `devknx export --database ./m2-tunnel.sqlite` and
 `devknx backup --database ./m2-tunnel.sqlite --output ./m2-tunnel-backup.sqlite`
@@ -48,7 +48,7 @@ destination must not already exist.
 Repeat with a separate database and the approved physical multicast group:
 
 ```sh
-devknx serve router://224.0.23.12:3671 --database ./m2-router.sqlite
+devknx connect router://224.0.23.12:3671 --database ./m2-router.sqlite
 ```
 
 The endpoint must receive routing indications from a real KNXnet/IP router

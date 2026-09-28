@@ -71,8 +71,13 @@ fn help_describes_available_commands() {
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 help");
     assert!(stdout.contains("discover"));
     assert!(stdout.contains("monitor"));
-    assert!(stdout.contains("serve"));
-    assert!(stdout.contains("api"));
+    assert!(stdout.contains("daemon"));
+    assert!(stdout.contains("connect"));
+    assert!(stdout.contains("disconnect"));
+    assert!(stdout.contains("sessions"));
+    assert!(stdout.contains("rest"));
+    assert!(!stdout.contains("  serve"));
+    assert!(!stdout.contains("  api"));
     assert!(stdout.contains("mcp"));
     assert!(stdout.contains("history"));
     assert!(stdout.contains("router-losses"));
@@ -567,7 +572,8 @@ fn serve_rejects_a_second_capture_writer() {
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 error");
     assert!(stderr.contains("WriterBusy"), "{stderr}");
     drop(writer);
-    assert!(CaptureStore::open(&path, NonZeroU32::new(10).expect("nonzero")).is_ok());
+    CaptureStore::open(&path, NonZeroU32::new(10).expect("nonzero"))
+        .expect("capture writer lock must be released after the first writer is dropped");
 }
 
 #[tokio::test]
@@ -641,12 +647,12 @@ async fn serve_recovers_committed_history_after_process_termination() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let path = directory.path().join("service.sqlite");
     let database = path.to_str().expect("UTF-8 test path");
+    let server = DeviceServer::start_at("127.0.0.1:0".parse().expect("loopback address"))
+        .await
+        .expect("start KNX tunnel server");
+    let endpoint = format!("tunnel://{}", server.local_addr());
 
     for value in [41_u8, 42_u8] {
-        let server = DeviceServer::start_at("127.0.0.1:0".parse().expect("loopback address"))
-            .await
-            .expect("start KNX tunnel server");
-        let endpoint = format!("tunnel://{}", server.local_addr());
         let child = Command::new(env!("CARGO_BIN_EXE_devknx"))
             .args(["serve", &endpoint, "--database", database])
             .stdout(Stdio::null())
@@ -689,8 +695,8 @@ async fn serve_recovers_committed_history_after_process_termination() {
         assert!(found.is_ok(), "capture process timed out on value {value}");
         child.0.kill().expect("terminate capture process");
         child.0.wait().expect("reap capture process");
-        server.stop().await;
     }
+    server.stop().await;
 
     let history = CaptureStore::open_existing(&path).expect("reopen after second termination");
     let values: Vec<u8> = history

@@ -28,7 +28,7 @@ DPTs per group, malformed addresses, duplicate canonical 16-bit addresses,
 invalid DPT tokens, unsupported XML namespaces, and XML DTDs fail. No rows
 from a rejected import are made active. A successful import creates a new
 metadata revision; the previous revision and raw capture bytes remain intact.
-`backup` includes both capture history and ETS revisions. Stop `serve` before
+`backup` includes both capture history and ETS revisions. Disconnect the selected session before
 importing because the capture process exclusively owns the database writer.
 
 Multiple declared DPTs are not silently reduced to the first one. A typed

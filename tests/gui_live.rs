@@ -204,27 +204,21 @@ mod gui_live {
         )
         .await;
 
-        server.stop().await;
-        let restarted_server =
-            DeviceServer::start_at("127.0.0.1:0".parse().expect("loopback address"))
-                .await
-                .expect("restart loopback KNX tunnel server");
-        let restarted_endpoint = format!("tunnel://{}", restarted_server.local_addr());
         let mut restarted_owner = ChildGuard::start(
-            &["serve", &restarted_endpoint, "--database", database_arg],
+            &["serve", &endpoint, "--database", database_arg],
             Stdio::null(),
         );
-        wait_for_connected_owner(&mut restarted_owner, &database, &restarted_server, 0x43).await;
+        wait_for_connected_owner(&mut restarted_owner, &database, &server, 0x43).await;
         wait_for_stage(
             &mut stage_receiver,
             &mut gui,
-            &restarted_server,
+            &server,
             "GUI live smoke: recovered",
             0x43,
         )
         .await;
 
-        let gui_status = wait_for_gui_exit(&mut gui, &restarted_server).await;
+        let gui_status = wait_for_gui_exit(&mut gui, &server).await;
         assert!(gui_status.success(), "GUI live smoke failed: {gui_status}");
         stage_reader.join().expect("join GUI stage reader");
         assert!(
@@ -272,6 +266,6 @@ mod gui_live {
             "capture IDs must continue increasing after owner restart"
         );
 
-        restarted_server.stop().await;
+        server.stop().await;
     }
 }

@@ -1,11 +1,11 @@
-# Initiative plan: devknx (v5)
+# Initiative plan: devknx (v6)
 
 Epic: [devknx initiative](https://github.com/metaneutrons/devknx/issues/3)
 Decision state: product scope agreed with Fabian in September 2026
 
 ## Outcome and boundaries
 
-Build a Rust KNX monitor with one persistent capture service and consistent CLI,
+Build a Rust KNX monitor with persistent capture services and consistent CLI,
 TUI, native GUI, REST, and MCP interfaces. ETS group address exports enrich
 captured telegrams. Group writes use an explicit, validated datapoint type
 (DPT). The macOS application and its icon are product deliverables from the
@@ -32,9 +32,11 @@ occur only at their acceptance stages.
 
 - `devknx` is an original GPL-3.0-only Rust application using published
   `knx-rs-core` and `knx-rs-ip` releases. It is not published to crates.io.
-- One local daemon owns each configured KNX connection and the capture store.
-  A typed operation model is the only place where device actions are defined.
-  CLI, TUI, GUI, REST, and MCP are adapters to that model.
+- One per-user local daemon can run without a KNX connection. It manages
+  independently connected KNX sessions, each with its own capture service,
+  database writer and local operation endpoint. A typed operation model is
+  the only place where device actions are defined. CLI, TUI, GUI, REST, and
+  MCP are adapters to that model.
 - The default capture database is deterministically derived from the canonical
   KNXnet/IP mode, address, and port. `--database` overrides this selection.
   CLI commands without a positional endpoint require either `--endpoint` or
@@ -42,12 +44,21 @@ occur only at their acceptance stages.
   connection. The GUI may remember that connection for its own startup. The
   TUI requires an explicit selector at startup and may switch endpoint-derived
   stores when the user changes its connection settings.
-- `serve` is the explicit foreground/headless capture owner for service
-  managers. GUI and TUI start the same owner after an explicit Connect.
-  REST and MCP are separate, opt-in adapters to the selected capture; a
-  future automatic CLI daemon lifecycle requires its own design and tests.
-  The pre-connection `captures.sqlite` may mix gateways and remains available
-  for offline inspection; it is not silently assigned to one endpoint.
+- `daemon` runs the connection-independent owner in the foreground for service
+  managers; `daemon --status` and `daemon --stop` never start it. Explicit
+  Connect in GUI/TUI and `connect` in CLI start the daemon on demand, then add
+  one selected session. Endpoint-selected live CLI operations may start the
+  daemon and connect that endpoint, but offline history, preview, status and
+  export never connect to KNX. A database-only selector can use an already
+  running owner but cannot infer which endpoint to connect. Disconnecting one
+  session leaves the daemon and other sessions running. `monitor` is a client
+  of the managed session, not a competing SQLite writer.
+- REST is disabled by default and is enabled, inspected, or disabled through
+  the daemon control plane. One listener is scoped to one explicitly selected
+  connected session; no implicit cross-session aggregation or target switching
+  is allowed. MCP remains an opt-in stdio adapter to a selected capture. The
+  pre-connection `captures.sqlite` may mix gateways and remains available for
+  offline inspection; it is not silently assigned to one endpoint.
 - A capture stores the raw cEMI frame as well as parsed source, destination,
   service, payload, connection, direction, and timestamp. The raw event is not
   rewritten when ETS metadata changes. Enrichment is versioned separately.
@@ -170,10 +181,39 @@ Dependencies: M2, M3
 - M5-A3: Tests prove that write restrictions and DPT validation cannot be
   bypassed through another frontend.
 
+### M7: Connection-independent daemon and explicit session lifecycle
+
+Tracking: [M7 issue](https://github.com/metaneutrons/devknx/issues/40)
+Dependencies: M2 through M5; prerequisite to M6 publication
+
+- M7-A1: A single current-user daemon starts without contacting a KNX endpoint.
+  An explicit Connect adds an endpoint-scoped capture service and database
+  writer; Disconnect stops only that service, releases its writer lease, and
+  cannot replay queued operations on a later reconnect. At least two
+  independent endpoints can be active. A database override cannot be shared
+  by different active endpoints or silently merge their histories.
+- M7-A2: GUI, TUI, and CLI share one session lifecycle. Endpoint-selected live
+  CLI operations can auto-start the daemon and connect the selected endpoint;
+  database-only requests never infer an endpoint. Offline commands and daemon
+  status do not create a connection. Monitoring detaches without stopping the
+  daemon. Current-user control IPC is authenticated by OS permissions and
+  rejects duplicate owners and malformed or oversized requests.
+- M7-A3: REST has explicit enable, disable, and status controls. It is off by
+  default, bound to one chosen active session, reports the actual listening
+  address only after successful bind, and stops when that session disconnects.
+  Existing token, remote-write and origin-audit rules remain effective;
+  status never discloses a token. The GUI exposes policy and listener controls
+  in Connection Settings, while the TUI offers a confirmed loopback-only
+  toggle. MCP remains explicitly scoped.
+- M7-A4: Documentation, source-anchored interface coverage, loopback tests,
+  and supported-platform CI qualify two sessions, isolation, lifecycle,
+  operation safety, REST controls, daemon startup races, and shutdown. No
+  physical KNX write is required for acceptance.
+
 ### M6: Publication and migration
 
 Tracking: [M6 issue](https://github.com/metaneutrons/devknx/issues/9)
-Dependencies: M1 through M5
+Dependencies: M1 through M5 and M7
 
 - M6-A1: A hardened release candidate builds seven GitHub CLI archives, one
   notarized macOS `.app.zip`, one deterministic source archive for the AUR
@@ -225,3 +265,10 @@ use. No time or runner-cost estimate has been measured.
 - 2026-09-27 (v4): Release preparation adds one deterministic, attested source
   archive for the AUR source package. It supplements the agreed binary matrix;
   it does not add a platform or authorize publication.
+- 2026-09-28 (v5): Endpoint-derived private databases replace one implicit CLI
+  profile. The GUI may remember a connection, while CLI write targets require
+  an explicit endpoint or database selector.
+- 2026-09-28 (v6): Fabian requested devserial-style automatic daemon startup
+  for appropriate CLI calls and a connection lifecycle separate from daemon
+  lifetime. M7 makes this a prerequisite of the first release. Release-Please
+  PRs remain manual; no merge, tag, or publication is authorized here.

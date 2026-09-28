@@ -4,8 +4,10 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use devknx::api::{self, ApiConfig};
 use devknx::capture::{CaptureEvent, RoutingLossEvent};
+use devknx::control::{ControlClient, ControlRequest, ControlResponse};
+use devknx::daemon;
 use devknx::ets::{CsvEncoding, EtsCatalog, EtsFormat, parse_group_address};
-use devknx::ipc::{IpcClient, IpcMessage, IpcServer};
+use devknx::ipc::{IpcClient, IpcMessage, IpcServer, WireState};
 use devknx::mcp;
 use devknx::operations::{OperationRequest, RawPayload, prepare};
 use devknx::paths;
@@ -17,6 +19,7 @@ use std::io::{self, Write as _};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
+use std::time::Duration;
 use std::time::UNIX_EPOCH;
 use tokio::sync::{broadcast, oneshot};
 
@@ -77,7 +80,43 @@ struct OptionalCaptureSelector {
 enum Command {
     /// Discover KNXnet/IP gateways on the local network.
     Discover,
-    /// Capture received KNXnet/IP telegrams to the endpoint's private database until interrupted.
+    /// Run the connection-independent daemon, or inspect/stop an existing daemon.
+    Daemon {
+        #[arg(long, conflicts_with = "stop")]
+        status: bool,
+        #[arg(long)]
+        stop: bool,
+    },
+    /// Start one KNX session in the per-user daemon.
+    Connect {
+        endpoint: String,
+        #[arg(long)]
+        database: Option<PathBuf>,
+        #[arg(long, default_value_t = NonZeroU32::new(100_000).expect("nonzero"))]
+        max_events: NonZeroU32,
+    },
+    /// Stop one KNX session without stopping the daemon.
+    Disconnect { endpoint: String },
+    /// List the daemon's active KNX sessions without starting it.
+    Sessions,
+    /// Enable, disable, or inspect the daemon-owned REST listener.
+    Rest {
+        #[arg(long, conflicts_with_all = ["disable", "status"])]
+        enable: bool,
+        #[arg(long, conflicts_with = "status")]
+        disable: bool,
+        #[arg(long)]
+        status: bool,
+        #[arg(long)]
+        endpoint: Option<String>,
+        #[arg(long, default_value = "127.0.0.1:8765")]
+        bind: SocketAddr,
+        #[arg(long)]
+        token_env: Option<String>,
+        #[arg(long)]
+        allow_remote_writes: bool,
+    },
+    /// Subscribe to a managed KNX session until interrupted; capture continues afterward.
     Monitor {
         /// Endpoint URL, for example `tunnel://192.0.2.1:3671` or `router://224.0.23.12:3671`.
         endpoint: String,
@@ -88,7 +127,8 @@ enum Command {
         #[arg(long, default_value_t = NonZeroU32::new(100_000).expect("nonzero"))]
         max_events: NonZeroU32,
     },
-    /// Run persistent capture in the foreground, independently of a monitor client.
+    /// Legacy single-connection foreground owner (use daemon + connect).
+    #[command(hide = true)]
     Serve {
         /// KNXnet/IP tunnel or router endpoint URL.
         endpoint: String,
@@ -99,7 +139,8 @@ enum Command {
         #[arg(long, default_value_t = NonZeroU32::new(100_000).expect("nonzero"))]
         max_events: NonZeroU32,
     },
-    /// Serve the versioned REST API (off unless explicitly started).
+    /// Legacy foreground REST listener (use rest --enable).
+    #[command(hide = true)]
     Api {
         /// Existing database owned by `serve` for live operations.
         #[command(flatten)]
@@ -116,19 +157,19 @@ enum Command {
     },
     /// Serve structured MCP tools over standard input/output.
     Mcp {
-        /// Existing database owned by `serve` for live operations.
+        /// Existing capture database; its KNX session must already be connected.
         #[command(flatten)]
         selector: CaptureSelector,
     },
-    /// Read the current state of an independent capture process.
+    /// Read the selected capture session's current connection state.
     Status {
-        /// Existing SQLite database owned by `serve`.
+        /// Existing SQLite capture database.
         #[command(flatten)]
         selector: CaptureSelector,
     },
-    /// Stream state changes and committed captures from `serve` as JSON lines.
+    /// Stream state changes and committed captures as JSON lines.
     Follow {
-        /// Existing SQLite database owned by `serve`.
+        /// Existing SQLite capture database.
         #[command(flatten)]
         selector: CaptureSelector,
     },
@@ -177,7 +218,7 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Transactionally replace ETS group-address metadata (stop `serve` first).
+    /// Transactionally replace ETS group-address metadata (disconnect the session first).
     EtsImport {
         /// Existing ETS CSV 3/1 or GA Export 01 XML file.
         file: PathBuf,
@@ -211,9 +252,9 @@ enum Command {
         /// Typed value, for example `true`, `42`, or `21.5`.
         value: String,
     },
-    /// Transmit a DPT-validated group value through the active `serve` owner.
+    /// Transmit a DPT-validated group value through the active KNX session.
     Write {
-        /// Database owned by the active capture process.
+        /// Active session database or KNX endpoint to connect on demand.
         #[command(flatten)]
         selector: CaptureSelector,
         /// Explicit DPT, required when ETS is absent or ambiguous.
@@ -226,7 +267,7 @@ enum Command {
     },
     /// Send an explicit raw group value; expert use only, audited separately.
     WriteRaw {
-        /// Database owned by the active capture process.
+        /// Active session database or KNX endpoint to connect on demand.
         #[command(flatten)]
         selector: CaptureSelector,
         /// Inline APCI value, 0–63; exclusive with `--bytes`.
@@ -240,7 +281,7 @@ enum Command {
     },
     /// Send a group read and report a matching response or no response.
     Read {
-        /// Database owned by the active capture process.
+        /// Active session database or KNX endpoint to connect on demand.
         #[command(flatten)]
         selector: CaptureSelector,
         /// Response deadline in milliseconds (1–30000).
@@ -295,14 +336,114 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{gateway:?}");
             }
         }
+        Some(Command::Daemon { status, stop }) => {
+            if status {
+                match ControlClient::request_existing(ControlRequest::Ping).await {
+                    Ok(ControlResponse::Pong) => println!("{{\"running\":true}}"),
+                    Ok(response) => print_control_response(&response)?,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::NotFound
+                                | io::ErrorKind::ConnectionRefused
+                                | io::ErrorKind::AddrNotAvailable
+                        ) =>
+                    {
+                        println!("{{\"running\":false}}");
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            } else if stop {
+                print_control_response(
+                    &ControlClient::request_existing(ControlRequest::Stop).await?,
+                )?;
+            } else {
+                daemon::run()
+                    .await
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+            }
+        }
+        Some(Command::Connect {
+            endpoint,
+            database,
+            max_events,
+        }) => {
+            let response = connect_session(&endpoint, database, max_events).await?;
+            print_control_response(&response)?;
+        }
+        Some(Command::Disconnect { endpoint }) => {
+            let endpoint = paths::canonical_endpoint(&endpoint).map_err(io::Error::other)?;
+            print_control_response(
+                &ControlClient::request_existing(ControlRequest::Disconnect { endpoint }).await?,
+            )?;
+        }
+        Some(Command::Sessions) => {
+            print_control_response(&ControlClient::request_existing(ControlRequest::List).await?)?;
+        }
+        Some(Command::Rest {
+            enable,
+            disable,
+            status: _,
+            endpoint,
+            bind,
+            token_env,
+            allow_remote_writes,
+        }) => {
+            if !enable
+                && (endpoint.is_some()
+                    || token_env.is_some()
+                    || allow_remote_writes
+                    || bind != "127.0.0.1:8765".parse::<SocketAddr>()?)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "REST listener options require --enable",
+                )
+                .into());
+            }
+            let request = if enable {
+                let endpoint = endpoint.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "rest --enable requires --endpoint",
+                    )
+                })?;
+                let endpoint = paths::canonical_endpoint(&endpoint).map_err(io::Error::other)?;
+                let token = token_env
+                    .map(|name| {
+                        std::env::var(name).map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "REST token environment variable is missing or not UTF-8",
+                            )
+                        })
+                    })
+                    .transpose()?;
+                ControlRequest::RestEnable {
+                    endpoint,
+                    bind,
+                    token,
+                    allow_remote_writes,
+                }
+            } else if disable {
+                ControlRequest::RestDisable
+            } else {
+                ControlRequest::RestStatus
+            };
+            print_control_response(&ControlClient::request_existing(request).await?)?;
+        }
         Some(Command::Monitor {
             endpoint,
             database,
             max_events,
         }) => {
-            let spec = parse_url(&endpoint)?;
-            let database = resolve_endpoint_database(database, &endpoint)?;
-            run_monitor(spec, database, max_events).await?;
+            let response = connect_session(&endpoint, database, max_events).await?;
+            let database = match response {
+                ControlResponse::Session { session } => session.database,
+                ControlResponse::Error { reason } => return Err(io::Error::other(reason).into()),
+                _ => return Err(io::Error::other("unexpected session response").into()),
+            };
+            run_monitor_client(&database).await?;
         }
         Some(Command::Serve {
             endpoint,
@@ -464,7 +605,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             address,
             value,
         }) => {
-            let database = resolve_capture_selector(selector)?;
+            let database = resolve_live_selector(selector).await?;
             let address_raw = parse_group_address(&address)?.raw();
             execute_remote_operation(
                 &database,
@@ -482,7 +623,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bytes,
             address,
         }) => {
-            let database = resolve_capture_selector(selector)?;
+            let database = resolve_live_selector(selector).await?;
             let address_raw = parse_group_address(&address)?.raw();
             let payload = match (inline, bytes) {
                 (Some(value), None) => RawPayload::Inline(value),
@@ -509,7 +650,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             timeout_ms,
             address,
         }) => {
-            let database = resolve_capture_selector(selector)?;
+            let database = resolve_live_selector(selector).await?;
             let address_raw = parse_group_address(&address)?.raw();
             execute_remote_operation(
                 &database,
@@ -572,6 +713,80 @@ async fn execute_remote_operation(
     }
 }
 
+async fn connect_session(
+    endpoint: &str,
+    database: Option<PathBuf>,
+    max_events: NonZeroU32,
+) -> io::Result<ControlResponse> {
+    let endpoint = paths::canonical_endpoint(endpoint).map_err(io::Error::other)?;
+    ControlClient::ensure_daemon().await?;
+    ControlClient::request_existing(ControlRequest::Connect {
+        endpoint,
+        database,
+        max_events: max_events.get(),
+    })
+    .await
+}
+
+async fn resolve_live_selector(selector: CaptureSelector) -> io::Result<PathBuf> {
+    match (selector.endpoint, selector.database) {
+        (Some(endpoint), None) => {
+            match connect_session(&endpoint, None, NonZeroU32::new(100_000).expect("nonzero"))
+                .await?
+            {
+                ControlResponse::Session { session } => {
+                    wait_connected(&session.database).await?;
+                    Ok(session.database)
+                }
+                ControlResponse::Error { reason } => Err(io::Error::other(reason)),
+                _ => Err(io::Error::other("unexpected session response")),
+            }
+        }
+        (None, Some(database)) => Ok(database),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "select exactly one of --endpoint or --database",
+        )),
+    }
+}
+
+async fn wait_connected(database: &std::path::Path) -> io::Result<()> {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut client = IpcClient::connect(database, true)
+            .await
+            .map_err(io::Error::other)?;
+        loop {
+            match client.next().await.map_err(io::Error::other)? {
+                Some(IpcMessage::State {
+                    value: WireState::Connected { .. },
+                    ..
+                }) => return Ok(()),
+                Some(IpcMessage::State {
+                    value: WireState::StorageFailed { reason },
+                    ..
+                }) => return Err(io::Error::other(reason)),
+                Some(_) => {}
+                None => return Err(io::Error::other("KNX session closed while connecting")),
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "KNX session did not connect within 15 seconds",
+        )
+    })?
+}
+
+fn print_control_response(response: &ControlResponse) -> Result<(), Box<dyn std::error::Error>> {
+    if let ControlResponse::Error { reason } = response {
+        return Err(io::Error::other(reason.clone()).into());
+    }
+    println!("{}", serde_json::to_string(&response)?);
+    Ok(())
+}
+
 fn parse_hex_bytes(value: &str) -> Result<Vec<u8>, io::Error> {
     let value = value.trim();
     if value.is_empty() || !value.len().is_multiple_of(2) || value.len() > 64 {
@@ -611,7 +826,7 @@ async fn run_service(
         ConnectionSpec::Tunnel(address) => format!("tunnel://{address}"),
         ConnectionSpec::Router(address) => format!("router://{address}"),
     };
-    let store = CaptureStore::open(&database, max_events)?;
+    let store = CaptureStore::open_bound(&database, max_events, &configured_endpoint)?;
     let queue_capacity = NonZeroUsize::new(1_024).expect("nonzero live queue capacity");
     let service = CaptureService::new(
         spec,
@@ -735,94 +950,30 @@ fn endpoint_database(endpoint: &str) -> io::Result<PathBuf> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
 }
 
-async fn run_monitor(
-    spec: ConnectionSpec,
-    database: PathBuf,
-    max_events: NonZeroU32,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let store = CaptureStore::open(&database, max_events)?;
-    let queue_capacity = NonZeroUsize::new(1_024).expect("nonzero live queue capacity");
-    let service = CaptureService::new(
-        spec,
-        Some(store),
-        ReconnectPolicy::default(),
-        queue_capacity,
-    );
-    let mut states = service.subscribe_state();
-    let mut frames = service.subscribe_frames();
-    let mut routing_losses = service.subscribe_routing_losses();
-    let (stop_tx, stop_rx) = oneshot::channel();
-    let mut stop_tx = Some(stop_tx);
-    let mut task = tokio::spawn(async move {
-        let mut service = service;
-        service
-            .run_until(async {
-                let _ = stop_rx.await;
-            })
-            .await
-    });
-    let signal = tokio::signal::ctrl_c();
-    tokio::pin!(signal);
-    let mut terminal_error: Option<io::Error> = None;
+async fn run_monitor_client(database: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = IpcClient::connect(database, true).await?;
     loop {
         tokio::select! {
-            biased;
-            result = &mut signal => {
-                if let Err(error) = result {
-                    terminal_error = Some(error);
+            _ = tokio::signal::ctrl_c() => return Ok(()),
+            message = client.next() => match message? {
+                Some(IpcMessage::Capture {
+                    id, observed_at_ms, endpoint, direction, source,
+                    destination, service, raw_cemi,
+                }) => {
+                    println!(
+                        "id={id:?} timestamp_ms={observed_at_ms} endpoint={endpoint} direction={direction} source={source} destination={destination} service={service} cemi={raw_cemi}"
+                    );
+                    io::stdout().flush()?;
                 }
-                break;
-            }
-            result = &mut task => return Ok(result??),
-            changed = states.changed() => {
-                if changed.is_ok() {
-                    eprintln!("connection_state={:?}", *states.borrow_and_update());
-                }
-            }
-            frame = frames.recv() => {
-                match frame {
-                    Ok(live) => {
-                        let event_line = format_event(&live.event);
-                        let result = {
-                            let stdout = io::stdout();
-                            let mut output = stdout.lock();
-                            match live.id {
-                                Some(id) => writeln!(output, "id={id} {event_line}"),
-                                None => writeln!(output, "{event_line}"),
-                            }.and_then(|()| output.flush())
-                        };
-                        if let Err(error) = result {
-                            terminal_error = Some(error);
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(count)) => {
-                        eprintln!("live_subscriber_lagged={count} (application events, not KNX bus telegrams)");
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {}
-                }
-            }
-            report = routing_losses.recv() => {
-                match report {
-                    Ok(live) => eprintln!("{}", format_routing_loss(&live.event, live.id)),
-                    Err(broadcast::error::RecvError::Lagged(count)) => {
-                        eprintln!("local_router_loss_subscriber_lagged={count}");
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {}
-                }
+                Some(message) => eprintln!("{}", serde_json::to_string(&message)?),
+                None => return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "managed KNX session closed",
+                ).into()),
             }
         }
     }
-    if let Some(sender) = stop_tx.take() {
-        let _ = sender.send(());
-    }
-    task.await??;
-    if let Some(error) = terminal_error {
-        return Err(Box::new(error));
-    }
-    Ok(())
 }
-
 fn format_event(event: &CaptureEvent) -> String {
     let timestamp_ms = event
         .observed_at()

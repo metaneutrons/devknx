@@ -1,18 +1,27 @@
 # REST API (experimental)
 
-`devknx api` is opt-in and reads the selected capture database. It never opens
-a second writer. Start `devknx serve tunnel://192.0.2.1:3671` separately for
-live status and group operations; history and ETS lookup work when the capture
-owner is offline. `--endpoint` selects that connection's default private
-capture. Use `--database PATH` on both commands when the owner uses a custom
-database path.
+The REST listener is owned by the per-user daemon and disabled by default.
+Connect a KNX session explicitly, then enable one listener scoped to that
+endpoint. The listener reads the session's capture database; it is not a
+second writer. A failed bind does not report REST as enabled. Disconnecting
+the selected session disables its listener. Only one REST listener is active
+at a time; requests never choose another KNX session implicitly.
+
+The GUI exposes listener status and controls in Connection Settings, including
+the bind address, a masked in-memory bearer token, and the explicit remote-write
+switch. It does not save the token. The TUI's `a` key offers a confirmed
+loopback-only toggle for its selected session; use the CLI or GUI for an
+authenticated non-loopback listener.
 
 ```sh
-devknx api --endpoint tunnel://192.0.2.1:3671
+devknx connect tunnel://192.0.2.1:3671
+devknx rest --enable --endpoint tunnel://192.0.2.1:3671
+devknx rest --status
 curl http://127.0.0.1:8765/v1/health
 curl 'http://127.0.0.1:8765/v1/captures?after=0&limit=100'
 curl -N -H 'Last-Event-ID: 42' http://127.0.0.1:8765/v1/events
 curl http://127.0.0.1:8765/v1/openapi.json
+devknx rest --disable
 ```
 
 The complete OpenAPI 3.1 route and schema document is served at
@@ -40,7 +49,10 @@ records a transport receipt, not confirmation that an actuator changed state.
 Raw writes are deliberately absent from REST. Operation attempts that pass
 preparation are audited with `rest_loopback` or `rest_remote` as their origin.
 
-The listener is disabled unless `api` is started. Loopback needs no token by
+The listener is disabled unless `rest --enable` succeeds. `rest --status` and
+`rest --disable` address only an already-running daemon; they do not launch
+one. Status reports the actual bound address and selected endpoint, never the
+token. Loopback needs no token by
 default; `--token-env VARIABLE` enables bearer authentication there too. A
 non-loopback `--bind` fails before listening unless `--token-env` names an
 environment variable containing at least 32 bytes. Do not put the token in

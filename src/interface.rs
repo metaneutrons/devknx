@@ -3,15 +3,16 @@
 
 //! Shared, non-visual model for the terminal and desktop monitors.
 
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
+use devknx::control::{ControlClient, ControlRequest, ControlResponse, RestStatus};
 use devknx::ets::parse_group_address;
 use devknx::ipc::{IpcClient, IpcMessage, WireState};
 use devknx::operations::{OperationRequest, prepare};
@@ -261,7 +262,7 @@ impl MonitorModel {
             delay_ms: 2_000,
         };
         if was_available {
-            self.notice(format!("Capture service disconnected: {error}"));
+            self.notice(format!("Capture connection unavailable: {error}"));
         }
     }
 
@@ -458,93 +459,32 @@ fn ensure_private_directory(path: &Path) -> Result<(), String> {
 }
 
 pub fn connect_owner(database: &Path, endpoint: &str) -> Result<String, String> {
-    parse_url(endpoint).map_err(|error| error.to_string())?;
+    let endpoint = paths::canonical_endpoint(endpoint)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
-    if let Ok(mut client) = runtime.block_on(IpcClient::connect(database, false)) {
-        let state = runtime
-            .block_on(async { tokio::time::timeout(Duration::from_secs(2), client.next()).await });
-        match state {
-            Ok(Ok(Some(IpcMessage::State {
-                value,
-                configured_endpoint,
-            }))) => {
-                verify_owner_endpoint(&value, configured_endpoint.as_deref(), endpoint)?;
-                return Ok("Attached to the active capture service".into());
-            }
-            _ => return Err("A capture owner is present but did not report its state".into()),
-        }
-    }
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    let mut child = Command::new(executable)
-        .arg("serve")
-        .arg(endpoint)
-        .arg("--database")
-        .arg(database)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("Could not start capture service: {error}"))?;
-    for _ in 0..50 {
-        if let Ok(mut client) = runtime.block_on(IpcClient::connect(database, false)) {
-            let state = runtime.block_on(async {
-                tokio::time::timeout(Duration::from_secs(2), client.next()).await
-            });
-            if let Ok(Ok(Some(IpcMessage::State {
-                value,
-                configured_endpoint,
-            }))) = state
-            {
-                match verify_owner_endpoint(&value, configured_endpoint.as_deref(), endpoint) {
-                    Ok(()) => return Ok(format!("Capture service started for {endpoint}")),
-                    Err(error) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(error);
-                    }
-                }
-            }
-        }
-        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-            return Err(format!("Capture service exited during startup ({status})"));
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    Err("Capture service did not start within five seconds".into())
-}
-
-fn verify_owner_endpoint(
-    state: &WireState,
-    configured_endpoint: Option<&str>,
-    requested_endpoint: &str,
-) -> Result<(), String> {
-    let active = configured_endpoint.or(match state {
-        WireState::Connected { endpoint } => Some(endpoint.as_str()),
-        _ => None,
-    });
-    match active {
-        Some(endpoint)
-            if endpoint == requested_endpoint
-                || matches!(
-                    (
-                        paths::canonical_endpoint(endpoint),
-                        paths::canonical_endpoint(requested_endpoint)
-                    ),
-                    (Ok(active), Ok(requested)) if active == requested
-                ) =>
+    runtime.block_on(async {
+        ControlClient::ensure_daemon()
+            .await
+            .map_err(|error| error.to_string())?;
+        match ControlClient::request_existing(ControlRequest::Connect {
+            endpoint: endpoint.clone(),
+            database: Some(database.to_path_buf()),
+            max_events: 100_000,
+        })
+        .await
+        .map_err(|error| error.to_string())?
         {
-            Ok(())
+            ControlResponse::Session { session } => Ok(format!(
+                "Connected to {} using {}",
+                session.endpoint,
+                session.database.display()
+            )),
+            ControlResponse::Error { reason } => Err(reason),
+            _ => Err("Capture daemon returned an unexpected connection response".into()),
         }
-        Some(endpoint) => Err(format!(
-            "Capture is already configured for {endpoint}. Disconnect it before switching gateways."
-        )),
-        None => Err("A capture owner is present but did not report its configured endpoint".into()),
-    }
+    })
 }
 
 pub fn disconnect_owner(database: &Path) -> Result<String, String> {
@@ -552,10 +492,114 @@ pub fn disconnect_owner(database: &Path) -> Result<String, String> {
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
-    runtime
-        .block_on(IpcClient::stop(database))
-        .map_err(|error| error.to_string())?;
-    Ok("Capture service stopped".into())
+    // Only the live database-scoped IPC owner can identify the session to
+    // disconnect. A saved sidecar may be stale or describe a different owner.
+    let endpoint = runtime.block_on(configured_endpoint(database));
+    let Some(endpoint) = endpoint else {
+        return Ok("No active capture connection".into());
+    };
+    let endpoint = paths::canonical_endpoint(&endpoint)?;
+    match runtime.block_on(ControlClient::request_existing(
+        ControlRequest::Disconnect {
+            endpoint: endpoint.clone(),
+        },
+    )) {
+        Ok(ControlResponse::Disconnected) => Ok(format!("Disconnected from {endpoint}")),
+        Ok(ControlResponse::Error { reason }) => Err(reason),
+        Ok(_) => Err("Capture daemon returned an unexpected disconnect response".into()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok("No active capture connection".into())
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn control_request(request: ControlRequest) -> io::Result<ControlResponse> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(ControlClient::request_existing(request))
+}
+
+pub fn rest_status() -> Result<RestStatus, String> {
+    match control_request(ControlRequest::RestStatus) {
+        Ok(ControlResponse::Rest { status }) => Ok(status),
+        Ok(ControlResponse::Error { reason }) => Err(reason),
+        Ok(_) => Err("Capture daemon returned an unexpected REST response".into()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(RestStatus {
+                enabled: false,
+                endpoint: None,
+                bind: None,
+                allow_remote_writes: false,
+            })
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+pub fn rest_enable(
+    endpoint: &str,
+    bind: &str,
+    token: Option<String>,
+    allow_remote_writes: bool,
+) -> Result<RestStatus, String> {
+    let endpoint = paths::canonical_endpoint(endpoint)?;
+    let bind: SocketAddr = bind
+        .parse()
+        .map_err(|_| "Enter a valid REST listen address".to_owned())?;
+    match control_request(ControlRequest::RestEnable {
+        endpoint,
+        bind,
+        token,
+        allow_remote_writes,
+    })
+    .map_err(|error| error.to_string())?
+    {
+        ControlResponse::Rest { status } => Ok(status),
+        ControlResponse::Error { reason } => Err(reason),
+        _ => Err("Capture daemon returned an unexpected REST response".into()),
+    }
+}
+
+pub fn rest_disable() -> Result<RestStatus, String> {
+    match control_request(ControlRequest::RestDisable).map_err(|error| error.to_string())? {
+        ControlResponse::Rest { status } => Ok(status),
+        ControlResponse::Error { reason } => Err(reason),
+        _ => Err("Capture daemon returned an unexpected REST response".into()),
+    }
+}
+
+async fn configured_endpoint(database: &Path) -> Option<String> {
+    let mut client = IpcClient::connect(database, false).await.ok()?;
+    let message = tokio::time::timeout(Duration::from_secs(2), client.next())
+        .await
+        .ok()?
+        .ok()??;
+    match message {
+        IpcMessage::State {
+            value,
+            configured_endpoint,
+        } => endpoint_from_status(&value, configured_endpoint),
+        _ => None,
+    }
+}
+
+fn endpoint_from_status(state: &WireState, configured_endpoint: Option<String>) -> Option<String> {
+    configured_endpoint.or_else(|| match state {
+        WireState::Connected { endpoint } => Some(endpoint.clone()),
+        _ => None,
+    })
 }
 
 pub fn format_time(timestamp_ms: u64) -> String {
@@ -793,42 +837,31 @@ mod tests {
     }
 
     #[test]
-    fn owner_identity_is_checked_even_during_reconnect() {
-        let requested = "tunnel://192.0.2.8:3671";
+    fn disconnect_endpoint_uses_configured_identity_during_reconnect() {
+        let configured = "tunnel://192.0.2.8:3671";
         let other = "tunnel://192.0.2.9:3671";
         let retry = WireState::WaitingRetry {
             reason: "gateway unavailable".into(),
             delay_ms: 2_000,
         };
-        assert!(verify_owner_endpoint(&retry, Some(requested), requested).is_ok());
-        assert!(
-            verify_owner_endpoint(
-                &retry,
-                Some("tunnel://[2001:0db8:0:0:0:0:0:1]:3671"),
-                "tunnel://[2001:db8::1]:3671",
-            )
-            .is_ok()
+        assert_eq!(
+            endpoint_from_status(&retry, Some(configured.into())).as_deref(),
+            Some(configured)
         );
-        assert!(verify_owner_endpoint(&retry, Some(other), requested).is_err());
-        assert!(verify_owner_endpoint(&retry, None, requested).is_err());
-        assert!(verify_owner_endpoint(&WireState::Idle, Some(other), requested).is_err());
-        assert!(
-            verify_owner_endpoint(
-                &WireState::Connecting { attempt: 1 },
-                Some(other),
-                requested
-            )
-            .is_err()
+        assert_eq!(
+            endpoint_from_status(&retry, Some(other.into())).as_deref(),
+            Some(other)
         );
-        assert!(
-            verify_owner_endpoint(
+        assert_eq!(endpoint_from_status(&retry, None), None);
+        assert_eq!(
+            endpoint_from_status(
                 &WireState::Connected {
-                    endpoint: requested.into()
+                    endpoint: configured.into(),
                 },
                 None,
-                requested
             )
-            .is_ok()
+            .as_deref(),
+            Some(configured)
         );
     }
 

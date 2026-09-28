@@ -164,7 +164,8 @@ async fn wait_for_owner(owner: &mut Process, database: &Path) {
                 && matches!(
                     client.next().await.unwrap(),
                     Some(IpcMessage::State {
-                        value: WireState::Connected { .. }
+                        value: WireState::Connected { .. },
+                        ..
                     })
                 )
             {

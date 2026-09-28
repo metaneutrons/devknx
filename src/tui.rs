@@ -6,7 +6,7 @@
 use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::ExecutableCommand as _;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -16,7 +16,9 @@ use crossterm::terminal::{
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
-use crate::interface::{self, Follower, MonitorModel};
+use crate::interface::{self, ConnectionSettings, Follower, MonitorModel};
+use devknx::control::RestStatus;
+use devknx::paths;
 
 struct TerminalGuard;
 
@@ -57,14 +59,23 @@ enum Mode {
     WriteDpt,
     WriteValue,
     ConfirmWrite,
+    ConfirmRest,
     Export,
+    ConnectionEndpoint,
 }
 
 struct App {
     model: MonitorModel,
     follower: Follower,
+    fixed_database: bool,
     action_receiver: Option<Receiver<Result<devknx::ipc::IpcMessage, String>>>,
     discovery_receiver: Option<Receiver<Result<Vec<knx_rs_ip::discovery::GatewayInfo>, String>>>,
+    connection_receiver: Option<Receiver<Result<String, String>>>,
+    rest_receiver: Option<Receiver<Result<RestStatus, String>>>,
+    rest_status: Option<RestStatus>,
+    last_rest_refresh: Instant,
+    rest_action_pending: bool,
+    settings: ConnectionSettings,
     mode: Mode,
     input: String,
     write_address: String,
@@ -76,14 +87,38 @@ struct App {
 }
 
 impl App {
-    fn new(database: PathBuf) -> Result<Self, String> {
-        let model = MonitorModel::open(database.clone())?;
+    fn new(
+        database: PathBuf,
+        fixed_database: bool,
+        selected_endpoint: Option<&str>,
+    ) -> Result<Self, String> {
+        let mut model = MonitorModel::open(database.clone())?;
+        let settings = if let Some(endpoint) = selected_endpoint {
+            ConnectionSettings::from_endpoint(endpoint)?
+        } else {
+            match interface::load_settings(&database) {
+                Ok(settings) => settings,
+                Err(error) => {
+                    model.notice(format!("Connection settings could not be loaded: {error}"));
+                    ConnectionSettings::default()
+                }
+            }
+        };
         let selected = model.rows.len().saturating_sub(1);
         Ok(Self {
             model,
             follower: Follower::start(database),
+            fixed_database,
             action_receiver: None,
             discovery_receiver: None,
+            connection_receiver: None,
+            rest_receiver: None,
+            rest_status: None,
+            last_rest_refresh: Instant::now()
+                .checked_sub(Duration::from_secs(5))
+                .unwrap_or_else(Instant::now),
+            rest_action_pending: false,
+            settings,
             mode: Mode::Normal,
             input: String::new(),
             write_address: String::new(),
@@ -96,6 +131,7 @@ impl App {
     }
 
     fn poll(&mut self) {
+        self.poll_rest();
         for result in self.follower.receiver.try_iter().take(500) {
             match result {
                 Ok(message) => self.model.ingest(message),
@@ -123,6 +159,59 @@ impl App {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
+        self.poll_discovery_and_connection();
+    }
+
+    fn poll_rest(&mut self) {
+        if self.rest_receiver.is_none()
+            && self.last_rest_refresh.elapsed() >= Duration::from_secs(5)
+        {
+            let (sender, receiver) = mpsc::channel();
+            self.rest_receiver = Some(receiver);
+            self.rest_action_pending = false;
+            self.last_rest_refresh = Instant::now();
+            std::thread::spawn(move || {
+                let _ = sender.send(interface::rest_status());
+            });
+        }
+        if let Some(receiver) = &self.rest_receiver {
+            match receiver.try_recv() {
+                Ok(Ok(status)) => {
+                    if self.rest_action_pending {
+                        self.model.notice(if status.enabled {
+                            format!(
+                                "REST enabled at http://{}/v1 for {}",
+                                status.bind.map_or_else(
+                                    || "unknown address".into(),
+                                    |bind| bind.to_string()
+                                ),
+                                status.endpoint.as_deref().unwrap_or("unknown endpoint")
+                            )
+                        } else {
+                            "REST disabled".into()
+                        });
+                    }
+                    self.rest_status = Some(status);
+                    self.rest_receiver = None;
+                    self.rest_action_pending = false;
+                }
+                Ok(Err(error)) => {
+                    self.model.notice(format!("REST control failed: {error}"));
+                    self.rest_receiver = None;
+                    self.rest_action_pending = false;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.model
+                        .notice("REST control worker stopped unexpectedly".into());
+                    self.rest_receiver = None;
+                    self.rest_action_pending = false;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+    }
+
+    fn poll_discovery_and_connection(&mut self) {
         if let Some(receiver) = &self.discovery_receiver {
             match receiver.try_recv() {
                 Ok(Ok(gateways)) => {
@@ -149,6 +238,24 @@ impl App {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
+        if let Some(receiver) = &self.connection_receiver {
+            match receiver.try_recv() {
+                Ok(Ok(notice)) => {
+                    self.model.notice(notice);
+                    self.connection_receiver = None;
+                }
+                Ok(Err(error)) => {
+                    self.model.notice(error);
+                    self.connection_receiver = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.model
+                        .notice("Connection worker stopped unexpectedly".into());
+                    self.connection_receiver = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
     }
 
     fn visible_count(&self) -> usize {
@@ -169,6 +276,155 @@ impl App {
         self.action_receiver = Some(receiver);
         std::thread::spawn(move || {
             let _ = sender.send(interface::operate(&database, &request));
+        });
+    }
+
+    fn start_connection(&mut self) {
+        if self.connection_receiver.is_some() {
+            return;
+        }
+        let endpoint = match self.settings.endpoint() {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                self.model.notice(error);
+                return;
+            }
+        };
+        let database = if self.fixed_database {
+            Ok(self.model.database.clone())
+        } else {
+            paths::database_for_endpoint(&endpoint)
+        };
+        let database = match database {
+            Ok(database) => database,
+            Err(error) => {
+                self.model.notice(error);
+                return;
+            }
+        };
+        if let Err(error) = self.select_endpoint_database(
+            self.settings.clone(),
+            database,
+            interface::save_recent_settings,
+        ) {
+            self.model
+                .notice(format!("Could not prepare connection storage: {error}"));
+            return;
+        }
+        let database = self.model.database.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.connection_receiver = Some(receiver);
+        std::thread::spawn(move || {
+            let _ = sender.send(interface::connect_owner(&database, &endpoint));
+        });
+    }
+
+    fn toggle_rest(&mut self) {
+        if self.rest_receiver.is_some() {
+            self.model
+                .notice("REST control is already in progress".into());
+            return;
+        }
+        let endpoint = match self.settings.endpoint() {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                self.model.notice(error);
+                return;
+            }
+        };
+        let (sender, receiver) = mpsc::channel();
+        self.rest_receiver = Some(receiver);
+        self.rest_action_pending = true;
+        std::thread::spawn(move || {
+            let result = interface::rest_status().and_then(|status| {
+                if status.enabled {
+                    if status.endpoint.as_deref() == Some(endpoint.as_str()) {
+                        interface::rest_disable()
+                    } else {
+                        Err("REST belongs to another KNX session; use the CLI to inspect it".into())
+                    }
+                } else {
+                    interface::rest_enable(&endpoint, "127.0.0.1:8765", None, false)
+                }
+            });
+            let _ = sender.send(result);
+        });
+    }
+
+    fn select_endpoint_database(
+        &mut self,
+        settings: ConnectionSettings,
+        database: PathBuf,
+        save_recent: impl FnOnce(&ConnectionSettings) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if self.model.owner_available && self.settings != settings {
+            return Err("Disconnect before changing connection settings".into());
+        }
+        let changing_database = self.model.database != database;
+        if changing_database && self.connection_receiver.is_some() {
+            return Err("Wait for the current connection operation to finish".into());
+        }
+        if changing_database && self.action_receiver.is_some() {
+            return Err(
+                "Wait for the current operation to finish before changing capture storage".into(),
+            );
+        }
+
+        interface::ensure_database(&database)?;
+        let replacement_model = if changing_database {
+            Some(MonitorModel::open(database.clone())?)
+        } else {
+            None
+        };
+        interface::save_settings(&database, &settings)?;
+        let recent_error = if self.fixed_database {
+            None
+        } else {
+            save_recent(&settings).err()
+        };
+
+        if let Some(model) = replacement_model {
+            self.follower = Follower::start(database);
+            self.model = model;
+            self.selected = self.model.rows.len().saturating_sub(1);
+            self.follow_tail = true;
+        }
+        self.settings = settings;
+        self.model
+            .notice("Connection settings saved. Press c to connect.".into());
+        if let Some(error) = recent_error {
+            self.model.notice(format!(
+                "Endpoint settings were saved, but recent connection settings could not be updated: {error}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn submit_endpoint_with(
+        &mut self,
+        input: &str,
+        resolve_database: impl FnOnce(&str) -> Result<PathBuf, String>,
+        save_recent: impl FnOnce(&ConnectionSettings) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let settings = ConnectionSettings::from_endpoint(input)?;
+        let endpoint = settings.endpoint()?;
+        let database = if self.fixed_database {
+            self.model.database.clone()
+        } else {
+            resolve_database(&endpoint)?
+        };
+        self.select_endpoint_database(settings, database, save_recent)
+    }
+
+    fn disconnect_connection(&mut self) {
+        if self.connection_receiver.is_some() {
+            return;
+        }
+        let database = self.model.database.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.connection_receiver = Some(receiver);
+        std::thread::spawn(move || {
+            let _ = sender.send(interface::disconnect_owner(&database));
         });
     }
 
@@ -219,7 +475,18 @@ impl App {
                 }
                 self.mode = Mode::Normal;
             }
-            Mode::Normal | Mode::ConfirmWrite => {}
+            Mode::ConnectionEndpoint => {
+                if let Err(error) = self.submit_endpoint_with(
+                    &input,
+                    paths::database_for_endpoint,
+                    interface::save_recent_settings,
+                ) {
+                    self.model
+                        .notice(format!("Could not save connection settings: {error}"));
+                }
+                self.mode = Mode::Normal;
+            }
+            Mode::Normal | Mode::ConfirmWrite | Mode::ConfirmRest => {}
         }
     }
 
@@ -251,6 +518,13 @@ impl App {
             self.preview.clear();
             return false;
         }
+        if self.mode == Mode::ConfirmRest {
+            if key.code == KeyCode::Char('y') {
+                self.toggle_rest();
+            }
+            self.mode = Mode::Normal;
+            return false;
+        }
         if self.mode != Mode::Normal {
             match key.code {
                 KeyCode::Enter => self.submit(),
@@ -266,6 +540,26 @@ impl App {
         }
         match key.code {
             KeyCode::Char('q') => return true,
+            KeyCode::Char('c') => {
+                if self.model.owner_available {
+                    self.disconnect_connection();
+                } else if self.settings.address.is_empty() {
+                    self.mode = Mode::ConnectionEndpoint;
+                    self.input = "tunnel://".into();
+                } else {
+                    self.start_connection();
+                }
+            }
+            KeyCode::Char('s') => {
+                self.mode = Mode::ConnectionEndpoint;
+                self.input = self
+                    .settings
+                    .endpoint()
+                    .unwrap_or_else(|_| "tunnel://".into());
+            }
+            KeyCode::Char('a') => {
+                self.mode = Mode::ConfirmRest;
+            }
             KeyCode::Char('/') => {
                 self.mode = Mode::Filter;
                 self.input = self.model.filter.clone();
@@ -335,7 +629,26 @@ impl App {
         terminal.draw(|frame| {
             let areas = Layout::vertical([Constraint::Length(3), Constraint::Min(5), Constraint::Length(3), Constraint::Length(3)])
                 .split(frame.area());
-            let title = format!(" devknx · {:?} · {} ", self.model.state, self.model.database.display());
+            let status = if self.model.owner_available {
+                match &self.model.state {
+                    devknx::ipc::WireState::Idle => "Starting".into(),
+                    devknx::ipc::WireState::Connecting { .. } => "Connecting".into(),
+                    devknx::ipc::WireState::Connected { endpoint } => format!("Connected · {endpoint}"),
+                    devknx::ipc::WireState::WaitingRetry { reason, .. } => format!("Retrying · {reason}"),
+                    devknx::ipc::WireState::Stopped => "Disconnected".into(),
+                    devknx::ipc::WireState::StorageFailed { reason } => format!("Storage error · {reason}"),
+                }
+            } else {
+                "Disconnected".to_owned()
+            };
+            let selected_endpoint = self.settings.endpoint().ok();
+            let rest = match &self.rest_status {
+                Some(rest) if rest.enabled && rest.endpoint.as_ref() == selected_endpoint.as_ref() => "on",
+                Some(rest) if rest.enabled => "other session",
+                Some(_) => "off",
+                None => "unknown",
+            };
+            let title = format!(" KNXnet/IP · {status} · REST {rest} ");
             frame.render_widget(Paragraph::new(title).block(Block::default().borders(Borders::ALL)), areas[0]);
 
             let visible: Vec<_> = self.model.rows.iter().filter(|row| row.matches(&self.model.filter)).collect();
@@ -344,9 +657,9 @@ impl App {
             let start = selected.saturating_sub(capacity.saturating_sub(1));
             let end = (start + capacity).min(visible.len());
             let items: Vec<ListItem> = visible[start..end].iter().enumerate().map(|(index, row)| {
-                let text = format!("{} {:8} {:8} → {:9} {:16} {}",
-                    row.timestamp_ms, row.direction, row.source, row.destination,
-                    row.service, row.label.as_deref().unwrap_or(""));
+                let text = format!("{} {:8} {:8} {:9} {:15} {:10} {}",
+                    interface::format_time(row.timestamp_ms), row.direction, row.source, row.destination,
+                    row.service, row.value.as_deref().unwrap_or("—"), row.label.as_deref().unwrap_or(""));
                 let style = if start + index == selected { Style::default().fg(Color::Black).bg(Color::Cyan) }
                     else { Style::default() };
                 ListItem::new(text).style(style)
@@ -356,18 +669,21 @@ impl App {
                 visible.len(), self.model.rows.len(), self.model.filter)).borders(Borders::ALL)), areas[1]);
             let detail = visible.get(selected).map_or_else(
                 || "No capture selected".to_owned(),
-                |row| format!("{} · {} · DPT [{}] · raw cEMI {}", row.destination,
-                    row.label.as_deref().unwrap_or("no ETS label"), row.dpts.join(", "), row.raw_cemi));
+                |row| format!("{} · {} · DPT [{}] · value {} · raw cEMI {}", row.destination,
+                    row.label.as_deref().unwrap_or("no ETS label"), row.dpts.join(", "),
+                    row.value.as_deref().unwrap_or("unknown"), row.raw_cemi));
             frame.render_widget(Paragraph::new(detail).block(Block::default().title(" Details ").borders(Borders::ALL)), areas[2]);
             let prompt = match self.mode {
-                Mode::Normal => "q quit · / filter · r read · w write · e export · h reload · PgUp older · d discover · j/k scroll".to_owned(),
+                Mode::Normal => "c connect/disconnect · s endpoint · a REST · d discover · / filter · r read · w write · e export · h reload · q quit".to_owned(),
                 Mode::Filter => format!("Filter: {}", self.input),
                 Mode::Read => format!("Read group address: {}", self.input),
                 Mode::WriteAddress => format!("Write group address: {}", self.input),
                 Mode::WriteDpt => format!("DPT (blank = ETS): {}", self.input),
                 Mode::WriteValue => format!("Typed value: {}", self.input),
                 Mode::ConfirmWrite => format!("{} · y transmit / n or Esc cancel", self.preview),
+                Mode::ConfirmRest => "Toggle REST for this KNX session (enable uses loopback)? y confirm / n or Esc cancel".to_owned(),
                 Mode::Export => format!("New CSV file path: {}", self.input),
+                Mode::ConnectionEndpoint => format!("KNXnet/IP endpoint (tunnel://IP:3671 or router://MULTICAST:3671): {}", self.input),
             };
             let notice = self.model.notices.last().map_or("", String::as_str);
             frame.render_widget(Paragraph::new(format!("{prompt}\n{notice}"))
@@ -377,8 +693,14 @@ impl App {
     }
 }
 
-pub fn run(database: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let mut app = App::new(database).map_err(io::Error::other)?;
+pub fn run(
+    database: PathBuf,
+    fixed_database: bool,
+    selected_endpoint: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    interface::ensure_database(&database).map_err(io::Error::other)?;
+    let mut app =
+        App::new(database, fixed_database, selected_endpoint).map_err(io::Error::other)?;
     install_panic_hook();
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -407,7 +729,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("capture.sqlite");
         drop(CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap());
-        let mut app = App::new(database).unwrap();
+        let mut app = App::new(database, true, None).unwrap();
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         app.draw(&mut terminal).unwrap();
         terminal.resize(Rect::new(0, 0, 40, 12)).unwrap();
@@ -424,11 +746,117 @@ mod tests {
     }
 
     #[test]
+    fn malformed_connection_settings_do_not_hide_capture_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("capture.sqlite");
+        drop(CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap());
+        std::fs::write(paths::connection_settings_file(&database), b"not JSON").unwrap();
+        let app = App::new(database, true, None).unwrap();
+        assert!(
+            app.model
+                .notices
+                .last()
+                .unwrap()
+                .contains("could not be loaded")
+        );
+        assert_eq!(app.settings, ConnectionSettings::default());
+    }
+
+    #[test]
+    fn endpoint_submission_saves_without_starting_a_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("capture.sqlite");
+        drop(CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap());
+        let mut app = App::new(database.clone(), true, None).unwrap();
+        app.mode = Mode::ConnectionEndpoint;
+        app.input = "tunnel://192.0.2.8:3671".into();
+        app.submit();
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.connection_receiver.is_none());
+        assert_eq!(
+            interface::load_settings(&database).unwrap(),
+            ConnectionSettings::from_endpoint("tunnel://192.0.2.8:3671").unwrap()
+        );
+        assert_eq!(app.model.database, database);
+        assert!(
+            app.model
+                .notices
+                .last()
+                .unwrap()
+                .contains("Press c to connect")
+        );
+    }
+
+    #[test]
+    fn endpoint_selector_populates_connection_before_first_connect() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("endpoint.sqlite");
+        drop(CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap());
+        let endpoint = "tunnel://192.0.2.8:3671";
+        let app = App::new(database, false, Some(endpoint)).unwrap();
+        assert_eq!(app.settings.endpoint().unwrap(), endpoint);
+        assert!(app.connection_receiver.is_none());
+    }
+
+    #[test]
+    fn automatic_endpoint_submission_switches_storage_without_connecting() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_database = directory.path().join("source.sqlite");
+        let target_database = directory.path().join("endpoint.sqlite");
+        drop(CaptureStore::open(&source_database, NonZeroU32::new(10).unwrap()).unwrap());
+        let mut app = App::new(source_database, false, None).unwrap();
+        app.model.rows.push(interface::DisplayCapture {
+            id: Some(1),
+            timestamp_ms: 1,
+            direction: "in".into(),
+            source: "1.1.1".into(),
+            destination: "1/1/1".into(),
+            service: "GroupValueWrite".into(),
+            label: None,
+            dpts: Vec::new(),
+            value: None,
+            raw_cemi: "29 00".into(),
+        });
+        app.selected = 1;
+        app.follow_tail = false;
+        let recent_saved = std::cell::Cell::new(false);
+        let endpoint = "tunnel://192.0.2.9:3671";
+
+        app.submit_endpoint_with(
+            endpoint,
+            |resolved_endpoint| {
+                assert_eq!(resolved_endpoint, endpoint);
+                Ok(target_database.clone())
+            },
+            |_| {
+                recent_saved.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(app.model.database, target_database);
+        assert!(app.model.rows.is_empty());
+        assert_eq!(app.selected, 0);
+        assert!(app.follow_tail);
+        assert_eq!(
+            app.settings,
+            ConnectionSettings::from_endpoint(endpoint).unwrap()
+        );
+        assert_eq!(
+            interface::load_settings(&target_database).unwrap(),
+            app.settings
+        );
+        assert!(recent_saved.get());
+        assert!(app.connection_receiver.is_none());
+    }
+
+    #[test]
     fn sustained_rows_scroll_filter_and_resize() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("capture.sqlite");
         drop(CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap());
-        let mut app = App::new(database).unwrap();
+        let mut app = App::new(database, true, None).unwrap();
         for id in 0..5_000 {
             app.model.rows.push(interface::DisplayCapture {
                 id: Some(id),
@@ -439,6 +867,7 @@ mod tests {
                 service: "GroupValueWrite".into(),
                 label: (id == 2_500).then(|| "kitchen light".into()),
                 dpts: vec!["DPT 1.001".into()],
+                value: None,
                 raw_cemi: "29 00".into(),
             });
         }

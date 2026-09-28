@@ -1,11 +1,29 @@
-# Local capture protocol (development version 3)
+# Local control and capture protocols (development)
 
-`devknx serve` owns the configured KNXnet/IP connection and SQLite writer.
-`devknx status --database PATH` requests one current connection state.
-`devknx follow --database PATH` receives that state and subsequent state,
+One per-user `devknx daemon` owns zero or more configured KNXnet/IP sessions.
+Starting it alone does not connect to KNX. Each connected session owns one
+SQLite writer and retains a database-scoped capture IPC endpoint. A separate
+current-user control endpoint accepts bounded JSON-line requests: `ping`,
+`list`, `connect`, `disconnect`, `rest_enable`, `rest_disable`, `rest_status`,
+and `stop`. Connect identifies a canonical endpoint and optional database
+override. Disconnect identifies one endpoint; Stop ends all sessions and the
+daemon. REST status omits its bearer token. CLI offline commands and status
+queries do not auto-start the daemon; endpoint-selected live operations and
+explicit Connect may do so.
+
+`devknx status --endpoint URL` requests one current connection state.
+`devknx follow --endpoint URL` receives that state and subsequent state,
 capture, router-loss, and application-subscriber-lag records as newline-delimited JSON.
+The selector can instead be `--database PATH` when the owner uses a custom
+capture path. CLI commands do not infer the target from the GUI's last-used
+connection.
+The GUI and TUI can launch that same owner on explicit Connect and leave it
+running after the window or terminal interface closes.
 
 The client sends `STATUS\n` or `FOLLOW\n` for status or the live stream.
+Legacy per-database `STOP\n` is not enabled for daemon sessions. Session
+lifecycle uses the control endpoint so a stopped session cannot terminate
+other connections or the daemon. This command is not exposed by REST or MCP.
 For one group operation it sends `OPERATE\n` followed by one bounded JSON line
 containing a tagged `read`, `typed_write`, or `raw_write` intent. Pre-encoded
 frames are not accepted: the connection owner resolves ETS metadata, validates
@@ -24,7 +42,10 @@ A connection interruption while waiting is reported as an error rather than
 The server closes unknown commands. Each JSON record has a `type` discriminator:
 `state`, `capture`, `routing_lost_message`, or `lagged`. A `state` record has a `value.state`
 discriminator (`idle`, `connecting`, `connected`, `waiting_retry`, `stopped`,
-`storage_failed`). Capture records carry the monotonic SQLite `id`, receive
+`storage_failed`). The optional `configured_endpoint` on a state record
+identifies the owner's target even while it is connecting or retrying; GUI and
+TUI check it before attaching or claiming that a new owner started. Capture
+records carry the monotonic SQLite `id`, receive
 timestamp, endpoint, direction, parsed addresses and group-value service, and
 exact `raw_cemi` hexadecimal bytes. A `routing_lost_message` record carries a
 separate SQLite `id` (or `null` for ephemeral monitoring), timestamp, multicast
@@ -37,7 +58,7 @@ the cEMI CSV export. A `lagged` record has `stream` (`capture` or
 frames reported lost by a router. A `waiting_retry` state denotes a connection
 interruption but cannot quantify unobserved telegrams.
 
-On Unix, the socket normally is `PATH.ipc/control.sock` under a 0700 directory,
+On Unix, a session socket normally is `PATH.ipc/control.sock` under a 0700 directory,
 with 0600 socket permissions. If that name would exceed the portable Unix
 socket path limit, it instead lives under a deterministic private
 `/tmp/devknx-ipc-<hash>/` directory. Both forms require the IPC directory to
@@ -48,8 +69,13 @@ Windows, the endpoint is a named pipe with a DACL granting access only to the
 current process user SID. The pipe requires first-instance creation and rejects
 remote clients. This is local transport protection, not remote authentication.
 
-There is no automatic startup, replay request, or version negotiation in this
-development protocol. Durable replay is read from SQLite
+The daemon control socket has a stable identity for the current user and
+application-data directory, independent of capture database paths. Its Unix
+directory is private and protected by an owner lease; Windows uses a
+SID-restricted named pipe whose name also identifies the application-data
+directory. Clients may spawn `devknx daemon`
+on demand, but the daemon connects to KNX only after a scoped Connect request.
+There is no replay request or version negotiation in this development protocol.
+Durable replay is read from SQLite
 with `history`, `router-losses`, or `export`; frontends must not interpret a transient stream as
-complete history. A stable wire contract will be specified before the REST,
-MCP, GUI, and TUI adapters rely on it.
+complete history. A stable external wire contract is not yet promised.

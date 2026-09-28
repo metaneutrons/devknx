@@ -10,6 +10,9 @@ pub enum Capability {
     GatewayDiscovery,
     LiveCapture,
     CaptureService,
+    SessionConnect,
+    SessionDisconnect,
+    SessionList,
     RestApi,
     McpServer,
     HistoryRead,
@@ -32,6 +35,9 @@ pub const ALL: &[Capability] = &[
     Capability::GatewayDiscovery,
     Capability::LiveCapture,
     Capability::CaptureService,
+    Capability::SessionConnect,
+    Capability::SessionDisconnect,
+    Capability::SessionList,
     Capability::RestApi,
     Capability::McpServer,
     Capability::HistoryRead,
@@ -76,11 +82,23 @@ pub const CLI: &[Declaration] = &[
     },
     Declaration {
         capability: Capability::CaptureService,
-        source_anchor: "Some(Command::Serve {",
+        source_anchor: "Some(Command::Daemon {",
+    },
+    Declaration {
+        capability: Capability::SessionConnect,
+        source_anchor: "Some(Command::Connect {",
+    },
+    Declaration {
+        capability: Capability::SessionDisconnect,
+        source_anchor: "Some(Command::Disconnect {",
+    },
+    Declaration {
+        capability: Capability::SessionList,
+        source_anchor: "Some(Command::Sessions) =>",
     },
     Declaration {
         capability: Capability::RestApi,
-        source_anchor: "Some(Command::Api {",
+        source_anchor: "Some(Command::Rest {",
     },
     Declaration {
         capability: Capability::McpServer,
@@ -151,6 +169,22 @@ pub const TUI: &[Declaration] = &[
         source_anchor: "follower.receiver.try_iter()",
     },
     Declaration {
+        capability: Capability::CaptureService,
+        source_anchor: "interface::connect_owner",
+    },
+    Declaration {
+        capability: Capability::SessionConnect,
+        source_anchor: "interface::connect_owner",
+    },
+    Declaration {
+        capability: Capability::SessionDisconnect,
+        source_anchor: "interface::disconnect_owner",
+    },
+    Declaration {
+        capability: Capability::RestApi,
+        source_anchor: "interface::rest_enable",
+    },
+    Declaration {
         capability: Capability::HistoryRead,
         source_anchor: "model.reload_history()",
     },
@@ -188,11 +222,27 @@ pub const TUI: &[Declaration] = &[
 pub const GUI: &[Declaration] = &[
     Declaration {
         capability: Capability::GatewayDiscovery,
-        source_anchor: "ui.button(\"Discover gateways\")",
+        source_anchor: "ui.button(\"Discover gateways…\")",
     },
     Declaration {
         capability: Capability::LiveCapture,
         source_anchor: "follower.receiver.try_iter()",
+    },
+    Declaration {
+        capability: Capability::CaptureService,
+        source_anchor: "interface::connect_owner",
+    },
+    Declaration {
+        capability: Capability::SessionConnect,
+        source_anchor: "interface::connect_owner",
+    },
+    Declaration {
+        capability: Capability::SessionDisconnect,
+        source_anchor: "interface::disconnect_owner",
+    },
+    Declaration {
+        capability: Capability::RestApi,
+        source_anchor: "interface::rest_enable",
     },
     Declaration {
         capability: Capability::HistoryRead,
@@ -208,7 +258,7 @@ pub const GUI: &[Declaration] = &[
     },
     Declaration {
         capability: Capability::ServiceFollow,
-        source_anchor: "Follower::start(database)",
+        source_anchor: "Follower::start(database.to_path_buf())",
     },
     Declaration {
         capability: Capability::EtsLookup,
@@ -239,15 +289,22 @@ pub struct Gap {
 
 const M4: &str = "https://github.com/metaneutrons/devknx/issues/7";
 const M5: &str = "https://github.com/metaneutrons/devknx/issues/8";
+const M7: &str = "https://github.com/metaneutrons/devknx/issues/40";
 
 /// Explicit exceptions. Import and backup require exclusive database ownership;
 /// raw sending and audit inspection remain expert CLI controls in this slice.
 pub const GAPS: &[Gap] = &[
     Gap {
-        capability: Capability::RestApi,
+        capability: Capability::SessionList,
         missing_on: Surface::Tui,
-        reason: "REST listener configuration is an explicit CLI service operation",
-        target_issue: M5,
+        reason: "The TUI currently displays one explicitly selected session",
+        target_issue: M7,
+    },
+    Gap {
+        capability: Capability::SessionList,
+        missing_on: Surface::Gui,
+        reason: "The GUI currently displays one explicitly selected session",
+        target_issue: M7,
     },
     Gap {
         capability: Capability::McpServer,
@@ -260,24 +317,6 @@ pub const GAPS: &[Gap] = &[
         missing_on: Surface::Gui,
         reason: "MCP stdio is an explicit CLI process for a local client",
         target_issue: M5,
-    },
-    Gap {
-        capability: Capability::RestApi,
-        missing_on: Surface::Gui,
-        reason: "REST listener configuration is an explicit CLI service operation",
-        target_issue: M5,
-    },
-    Gap {
-        capability: Capability::CaptureService,
-        missing_on: Surface::Tui,
-        reason: "TUI attaches to the service; it does not own it",
-        target_issue: M4,
-    },
-    Gap {
-        capability: Capability::CaptureService,
-        missing_on: Surface::Gui,
-        reason: "GUI attaches to the service; it does not own it",
-        target_issue: M4,
     },
     Gap {
         capability: Capability::DatabaseBackup,
@@ -350,6 +389,7 @@ mod tests {
     const TUI_SOURCE: &str = include_str!("tui.rs");
     const GUI_SOURCE: &str = include_str!("gui.rs");
 
+    #[expect(clippy::too_many_lines, reason = "one source-anchored registry audit")]
     fn audit(sources: [&str; 3], gaps: &[Gap]) -> Result<(), String> {
         let known: HashSet<_> = ALL.iter().copied().collect();
         if known.len() != ALL.len() {
@@ -385,7 +425,7 @@ mod tests {
             .lines()
             .filter_map(|line| line.trim_start().strip_prefix("Some(Command::"))
             .filter_map(|rest| rest.split(|ch: char| !ch.is_ascii_alphanumeric()).next())
-            .filter(|name| !matches!(*name, "Gui" | "Tui"))
+            .filter(|name| !matches!(*name, "Gui" | "Tui" | "Serve" | "Api"))
             .collect();
         let declared_cli: HashSet<_> = CLI
             .iter()
@@ -420,9 +460,12 @@ mod tests {
             }
         }
         for needle in [
-            "Open database…",
+            "Open…",
             "Discover gateways",
-            "Export CSV…",
+            "Settings…",
+            "Connect",
+            "Disconnect",
+            "Export…",
             "Read…",
             "Write…",
             "capture-filter",
@@ -440,6 +483,8 @@ mod tests {
             "'e'",
             "'h'",
             "'d'",
+            "'c'",
+            "'s'",
             "KeyCode::Down",
             "KeyCode::Up",
             "raw cEMI",
@@ -485,7 +530,8 @@ mod tests {
                 [
                     CLI_SOURCE,
                     TUI_SOURCE,
-                    &GUI_SOURCE.replace("ui.button(\"Discover gateways\")", "ui.button(\"Other\")")
+                    &GUI_SOURCE
+                        .replace("ui.button(\"Discover gateways…\")", "ui.button(\"Other\")")
                 ],
                 GAPS
             )

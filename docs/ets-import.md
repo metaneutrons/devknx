@@ -9,6 +9,10 @@ devknx ets-import group-addresses.xml --database captures.sqlite --format xml
 devknx ets-lookup --database captures.sqlite 1/2/3
 ```
 
+Use `--endpoint tunnel://IP:3671` instead of `--database PATH` to select the
+default capture for a connection. Both selectors refer to one capture store;
+they cannot be combined in one command.
+
 The format is explicit. CSV is decoded as UTF-8 (an optional BOM is accepted).
 For a legacy ISO-8859-1 CSV file, append `--latin1`; this flag is invalid for
 XML. GA Export 01 XML must be UTF-8. The standard ETS CSV 3/1 export has four
@@ -24,7 +28,7 @@ DPTs per group, malformed addresses, duplicate canonical 16-bit addresses,
 invalid DPT tokens, unsupported XML namespaces, and XML DTDs fail. No rows
 from a rejected import are made active. A successful import creates a new
 metadata revision; the previous revision and raw capture bytes remain intact.
-`backup` includes both capture history and ETS revisions. Stop `serve` before
+`backup` includes both capture history and ETS revisions. Disconnect the selected session before
 importing because the capture process exclusively owns the database writer.
 
 Multiple declared DPTs are not silently reduced to the first one. A typed

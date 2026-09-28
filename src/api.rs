@@ -5,6 +5,7 @@
 
 use std::borrow::Cow;
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -107,27 +108,69 @@ impl IntoResponse for ApiError {
 
 type ApiResult<T> = Result<T, ApiError>;
 
-/// Run REST until interrupted. This is intentionally separate from `serve`.
+/// Validated and bound REST listener. Binding precedes an enabled status reply.
+pub struct ApiServer {
+    listener: tokio::net::TcpListener,
+    config: ApiConfig,
+}
+
+impl ApiServer {
+    /// Validate policy and bind one database-scoped listener.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid configuration, missing database or listener failures.
+    pub async fn bind(
+        mut config: ApiConfig,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        config.validate()?;
+        CaptureStore::open_existing(&config.database)?;
+        let listener = tokio::net::TcpListener::bind(config.bind).await?;
+        config.bind = listener.local_addr()?;
+        Ok(Self { listener, config })
+    }
+
+    /// Actual bound address, including the assigned port when port zero was requested.
+    #[must_use]
+    pub const fn address(&self) -> SocketAddr {
+        self.config.bind
+    }
+
+    /// Serve until the owning daemon requests graceful shutdown.
+    ///
+    /// # Errors
+    ///
+    /// Returns a listener failure.
+    pub async fn run(
+        self,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        eprintln!(
+            "REST listening on http://{}/v1 (typed writes allowed: {})",
+            self.config.bind,
+            self.config.writes_allowed()
+        );
+        axum::serve(self.listener, router(self.config))
+            .with_graceful_shutdown(shutdown)
+            .await?;
+        Ok(())
+    }
+}
+
+/// Run REST in the foreground until interrupted.
 ///
 /// # Errors
 ///
 /// Returns invalid configuration, missing database or listener failures.
-pub async fn run(mut config: ApiConfig) -> Result<(), Box<dyn std::error::Error>> {
-    config.validate()?;
-    CaptureStore::open_existing(&config.database)?;
-    let listener = tokio::net::TcpListener::bind(config.bind).await?;
-    let address = listener.local_addr()?;
-    config.bind = address;
-    eprintln!(
-        "REST listening on http://{address}/v1 (typed writes allowed: {})",
-        config.writes_allowed()
-    );
-    axum::serve(listener, router(config))
-        .with_graceful_shutdown(async {
+pub async fn run(config: ApiConfig) -> Result<(), Box<dyn std::error::Error>> {
+    ApiServer::bind(config)
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+        .run(async {
             let _ = tokio::signal::ctrl_c().await;
         })
-        .await?;
-    Ok(())
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()).into())
 }
 
 fn router(config: ApiConfig) -> Router {

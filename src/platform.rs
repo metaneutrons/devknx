@@ -7,7 +7,7 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum MenuAction {
-    /// Show the capture database picker.
+    /// Open the native capture-file picker.
     OpenDatabase = 1,
     /// Show export controls.
     ExportCsv = 2,
@@ -19,6 +19,10 @@ pub enum MenuAction {
     Read = 16,
     /// Show the typed-write controls.
     Write = 32,
+    /// Connect or disconnect the KNX capture owner.
+    ToggleConnection = 64,
+    /// Show gateway and storage settings.
+    ConnectionSettings = 128,
 }
 
 impl MenuAction {
@@ -31,6 +35,8 @@ impl MenuAction {
         Self::FocusFilter,
         Self::Read,
         Self::Write,
+        Self::ToggleConnection,
+        Self::ConnectionSettings,
     ];
 }
 
@@ -121,6 +127,8 @@ mod tests {
             (MenuAction::FocusFilter, "focusFilter:"),
             (MenuAction::Read, "readGroup:"),
             (MenuAction::Write, "writeGroup:"),
+            (MenuAction::ToggleConnection, "toggleConnection:"),
+            (MenuAction::ConnectionSettings, "connectionSettings:"),
         ] {
             assert!(MenuAction::ALL.contains(&action));
             assert!(native.contains(&format!("@selector({selector})")));

@@ -3,7 +3,8 @@
 
 //! Shared, non-visual model for the terminal and desktop monitors.
 
-use std::net::Ipv4Addr;
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,12 +12,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
+use devknx::control::{ControlClient, ControlRequest, ControlResponse, RestStatus};
 use devknx::ets::parse_group_address;
 use devknx::ipc::{IpcClient, IpcMessage, WireState};
 use devknx::operations::{OperationRequest, prepare};
+use devknx::paths;
 use devknx::service::LiveCapture;
 use devknx::storage::CaptureStore;
 use knx_rs_ip::discovery::{self, GatewayInfo};
+use knx_rs_ip::{ConnectionSpec, parse_url};
+use serde::{Deserialize, Serialize};
 
 const VISIBLE_CAP: usize = 5_000;
 
@@ -31,6 +36,7 @@ pub struct DisplayCapture {
     pub service: String,
     pub label: Option<String>,
     pub dpts: Vec<String>,
+    pub value: Option<String>,
     pub raw_cemi: String,
 }
 
@@ -44,6 +50,7 @@ impl DisplayCapture {
                 self.destination.as_str(),
                 self.service.as_str(),
                 self.label.as_deref().unwrap_or(""),
+                self.value.as_deref().unwrap_or(""),
                 self.raw_cemi.as_str(),
             ]
             .iter()
@@ -55,8 +62,11 @@ impl DisplayCapture {
 pub struct MonitorModel {
     pub database: PathBuf,
     pub state: WireState,
+    pub owner_available: bool,
     pub rows: Vec<DisplayCapture>,
     pub notices: Vec<String>,
+    pub router_lost_messages: u64,
+    pub local_lag_events: u64,
     pub filter: String,
     last_seen_id: i64,
     store: CaptureStore,
@@ -68,8 +78,11 @@ impl MonitorModel {
         let mut model = Self {
             database,
             state: WireState::Idle,
+            owner_available: false,
             rows: Vec::new(),
             notices: Vec::new(),
+            router_lost_messages: 0,
+            local_lag_events: 0,
             filter: String::new(),
             last_seen_id: 0,
             store,
@@ -141,7 +154,8 @@ impl MonitorModel {
 
     pub fn ingest(&mut self, message: IpcMessage) {
         match message {
-            IpcMessage::State { value } => {
+            IpcMessage::State { value, .. } => {
+                self.owner_available = true;
                 self.state = value;
                 if let Err(error) = self.catch_up() {
                     self.notice(format!("History catch-up failed: {error}"));
@@ -154,21 +168,29 @@ impl MonitorModel {
                 lost_messages,
                 device_state,
                 ..
-            } => self.notice(format!(
-                "Router {source} reported {lost_messages} lost routing frames (device state {device_state})"
-            )),
+            } => {
+                self.router_lost_messages += u64::from(lost_messages);
+                self.notice(format!(
+                    "Router {source} reported {lost_messages} lost routing frames (device state {device_state})"
+                ));
+            }
             IpcMessage::Lagged { stream, count } => {
+                self.local_lag_events += count;
                 self.notice(format!("Local {stream:?} subscriber missed {count} events"));
                 if matches!(stream, devknx::ipc::LaggedStream::Capture) {
                     if let Err(error) = self.catch_up() {
                         self.notice(format!("History catch-up failed: {error}"));
                     }
                 } else {
-                    self.notice("Use `devknx router-losses` for durable router-loss history".into());
+                    self.notice(
+                        "Use `devknx router-losses` for durable router-loss history".into(),
+                    );
                 }
             }
             IpcMessage::OperationResult { audit_id, read, .. } => {
-                self.notice(format!("Operation transmitted (audit {audit_id}); read={read:?}"));
+                self.notice(format!(
+                    "Operation transmitted (audit {audit_id}); read={read:?}"
+                ));
             }
             IpcMessage::OperationError { reason } => self.notice(reason),
         }
@@ -201,6 +223,10 @@ impl MonitorModel {
         } else {
             None
         };
+        let dpts = group
+            .as_ref()
+            .map_or_else(Vec::new, |group| group.dpts.clone());
+        let value = decode_capture_value(&raw_cemi, &dpts, &service);
         self.rows.push(DisplayCapture {
             id,
             timestamp_ms: observed_at_ms,
@@ -209,7 +235,8 @@ impl MonitorModel {
             destination,
             service,
             label: group.as_ref().map(|group| group.name.clone()),
-            dpts: group.map_or_else(Vec::new, |group| group.dpts),
+            value,
+            dpts,
             raw_cemi,
         });
         if self.rows.len() > VISIBLE_CAP {
@@ -228,11 +255,19 @@ impl MonitorModel {
     }
 
     pub fn owner_unavailable(&mut self, error: &str) {
+        let was_available = self.owner_available;
+        self.owner_available = false;
         self.state = WireState::WaitingRetry {
             reason: "capture owner unavailable".to_owned(),
             delay_ms: 2_000,
         };
-        self.notice(format!("Capture owner unavailable: {error}"));
+        if was_available {
+            self.notice(if error == "capture owner closed IPC stream" {
+                "Capture connection closed".into()
+            } else {
+                format!("Capture connection unavailable: {error}")
+            });
+        }
     }
 
     pub fn preview_write(&self, address: &str, dpt: &str, value: &str) -> Result<String, String> {
@@ -261,6 +296,7 @@ impl MonitorModel {
         ))
     }
 
+    #[cfg(feature = "gui")]
     pub fn ets_for_address(&self, address: &str) -> Result<Option<(String, Vec<String>)>, String> {
         let address = parse_group_address(address).map_err(|error| error.to_string())?;
         Ok(self
@@ -269,6 +305,345 @@ impl MonitorModel {
             .map_err(|error| error.to_string())?
             .map(|group| (group.name, group.dpts)))
     }
+}
+
+/// Connection settings shared by the interactive surfaces. No credential is stored.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConnectionSettings {
+    pub mode: ConnectionMode,
+    pub address: String,
+    pub port: u16,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionMode {
+    #[default]
+    Tunnel,
+    Routing,
+}
+
+impl Default for ConnectionSettings {
+    fn default() -> Self {
+        Self {
+            mode: ConnectionMode::Tunnel,
+            address: String::new(),
+            port: 3671,
+        }
+    }
+}
+
+impl ConnectionSettings {
+    #[cfg(any(feature = "tui", test))]
+    pub fn from_endpoint(endpoint: &str) -> Result<Self, String> {
+        let spec = parse_url(endpoint.trim()).map_err(|error| error.to_string())?;
+        let (mode, address) = match spec {
+            ConnectionSpec::Tunnel(address) => (ConnectionMode::Tunnel, address),
+            ConnectionSpec::Router(address) => (ConnectionMode::Routing, address),
+        };
+        let settings = Self {
+            mode,
+            address: address.ip().to_string(),
+            port: address.port(),
+        };
+        settings.endpoint()?;
+        Ok(settings)
+    }
+
+    pub fn endpoint(&self) -> Result<String, String> {
+        let address_error = match self.mode {
+            ConnectionMode::Tunnel => "Enter a numeric gateway IP address",
+            ConnectionMode::Routing => "Enter a numeric multicast group address",
+        };
+        let ip: IpAddr = self
+            .address
+            .trim()
+            .parse()
+            .map_err(|_| address_error.to_owned())?;
+        if self.port == 0 {
+            return Err("The KNXnet/IP port must be nonzero".into());
+        }
+        let scheme = match self.mode {
+            ConnectionMode::Tunnel if ip.is_multicast() => {
+                return Err("A tunnel needs a unicast gateway address".into());
+            }
+            ConnectionMode::Routing if !matches!(ip, IpAddr::V4(address) if address.is_multicast()) =>
+            {
+                return Err("Routing needs a multicast group address".into());
+            }
+            ConnectionMode::Tunnel => "tunnel",
+            ConnectionMode::Routing => "router",
+        };
+        let endpoint = format!("{scheme}://{}", SocketAddr::new(ip, self.port));
+        let spec = parse_url(&endpoint).map_err(|error| error.to_string())?;
+        if !matches!(
+            (&self.mode, spec),
+            (ConnectionMode::Tunnel, ConnectionSpec::Tunnel(_))
+                | (ConnectionMode::Routing, ConnectionSpec::Router(_))
+        ) {
+            return Err("Connection mode and address disagree".into());
+        }
+        Ok(endpoint)
+    }
+}
+
+pub fn ensure_database(database: &Path) -> Result<(), String> {
+    if database.exists() {
+        return Ok(());
+    }
+    let parent = database
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    ensure_private_directory(parent)?;
+    drop(
+        CaptureStore::open(database, NonZeroU32::new(100_000).expect("nonzero"))
+            .map_err(|error| error.to_string())?,
+    );
+    Ok(())
+}
+
+pub fn load_settings(database: &Path) -> Result<ConnectionSettings, String> {
+    let path = paths::connection_settings_file(database);
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| error.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if paths::legacy_database().ok().as_deref() == Some(database) {
+                load_recent_settings()
+            } else {
+                Ok(ConnectionSettings::default())
+            }
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+pub fn save_settings(database: &Path, settings: &ConnectionSettings) -> Result<(), String> {
+    write_settings(&paths::connection_settings_file(database), settings)
+}
+
+pub fn load_recent_settings() -> Result<ConnectionSettings, String> {
+    let path = paths::recent_connection_file()?;
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| error.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(ConnectionSettings::default())
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+pub fn save_recent_settings(settings: &ConnectionSettings) -> Result<(), String> {
+    write_settings(&paths::recent_connection_file()?, settings)
+}
+
+fn write_settings(path: &Path, settings: &ConnectionSettings) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    ensure_private_directory(parent)?;
+    let mut file = tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
+    serde_json::to_writer_pretty(&mut file, settings).map_err(|error| error.to_string())?;
+    file.persist(path).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn ensure_private_directory(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(path).map_err(|error| error.to_string())?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(path).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub fn connect_owner(database: &Path, endpoint: &str) -> Result<String, String> {
+    let endpoint = paths::canonical_endpoint(endpoint)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    runtime.block_on(async {
+        ControlClient::ensure_daemon()
+            .await
+            .map_err(|error| error.to_string())?;
+        match ControlClient::request_existing(ControlRequest::Connect {
+            endpoint: endpoint.clone(),
+            database: Some(database.to_path_buf()),
+            max_events: 100_000,
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        {
+            ControlResponse::Session { session } => Ok(format!(
+                "Connected to {} using {}",
+                session.endpoint,
+                session.database.display()
+            )),
+            ControlResponse::Error { reason } => Err(reason),
+            _ => Err("Capture daemon returned an unexpected connection response".into()),
+        }
+    })
+}
+
+pub fn disconnect_owner(database: &Path) -> Result<String, String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    // Only the live database-scoped IPC owner can identify the session to
+    // disconnect. A saved sidecar may be stale or describe a different owner.
+    let endpoint = runtime.block_on(configured_endpoint(database));
+    let Some(endpoint) = endpoint else {
+        return Ok("No active capture connection".into());
+    };
+    let endpoint = paths::canonical_endpoint(&endpoint)?;
+    match runtime.block_on(ControlClient::request_existing(
+        ControlRequest::Disconnect {
+            endpoint: endpoint.clone(),
+        },
+    )) {
+        Ok(ControlResponse::Disconnected) => Ok(format!("Disconnected from {endpoint}")),
+        Ok(ControlResponse::Error { reason }) => Err(reason),
+        Ok(_) => Err("Capture daemon returned an unexpected disconnect response".into()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok("No active capture connection".into())
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn control_request(request: ControlRequest) -> io::Result<ControlResponse> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(ControlClient::request_existing(request))
+}
+
+pub fn rest_status() -> Result<RestStatus, String> {
+    match control_request(ControlRequest::RestStatus) {
+        Ok(ControlResponse::Rest { status }) => Ok(status),
+        Ok(ControlResponse::Error { reason }) => Err(reason),
+        Ok(_) => Err("Capture daemon returned an unexpected REST response".into()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(RestStatus {
+                enabled: false,
+                endpoint: None,
+                bind: None,
+                allow_remote_writes: false,
+            })
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+pub fn rest_enable(
+    endpoint: &str,
+    bind: &str,
+    token: Option<String>,
+    allow_remote_writes: bool,
+) -> Result<RestStatus, String> {
+    let endpoint = paths::canonical_endpoint(endpoint)?;
+    let bind: SocketAddr = bind
+        .parse()
+        .map_err(|_| "Enter a valid REST listen address".to_owned())?;
+    match control_request(ControlRequest::RestEnable {
+        endpoint,
+        bind,
+        token,
+        allow_remote_writes,
+    })
+    .map_err(|error| error.to_string())?
+    {
+        ControlResponse::Rest { status } => Ok(status),
+        ControlResponse::Error { reason } => Err(reason),
+        _ => Err("Capture daemon returned an unexpected REST response".into()),
+    }
+}
+
+pub fn rest_disable() -> Result<RestStatus, String> {
+    match control_request(ControlRequest::RestDisable).map_err(|error| error.to_string())? {
+        ControlResponse::Rest { status } => Ok(status),
+        ControlResponse::Error { reason } => Err(reason),
+        _ => Err("Capture daemon returned an unexpected REST response".into()),
+    }
+}
+
+async fn configured_endpoint(database: &Path) -> Option<String> {
+    let mut client = IpcClient::connect(database, false).await.ok()?;
+    let message = tokio::time::timeout(Duration::from_secs(2), client.next())
+        .await
+        .ok()?
+        .ok()??;
+    match message {
+        IpcMessage::State {
+            value,
+            configured_endpoint,
+        } => endpoint_from_status(&value, configured_endpoint),
+        _ => None,
+    }
+}
+
+fn endpoint_from_status(state: &WireState, configured_endpoint: Option<String>) -> Option<String> {
+    configured_endpoint.or_else(|| match state {
+        WireState::Connected { endpoint } => Some(endpoint.clone()),
+        _ => None,
+    })
+}
+
+pub fn format_time(timestamp_ms: u64) -> String {
+    use chrono::{Local, TimeZone as _};
+    i64::try_from(timestamp_ms)
+        .ok()
+        .and_then(|timestamp| Local.timestamp_millis_opt(timestamp).single())
+        .map_or_else(
+            || "—".into(),
+            |time| time.format("%H:%M:%S%.3f").to_string(),
+        )
+}
+
+fn decode_capture_value(raw_cemi: &str, dpts: &[String], service: &str) -> Option<String> {
+    if service == "Read" {
+        return Some("Read request".into());
+    }
+    if !matches!(service, "Write" | "Response")
+        || dpts.len() != 1
+        || !raw_cemi.len().is_multiple_of(2)
+    {
+        return None;
+    }
+    let bytes = raw_cemi
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| {
+            std::str::from_utf8(pair)
+                .ok()
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let frame = knx_rs_core::cemi::CemiFrame::parse(&bytes).ok()?;
+    let apdu = frame.tpdu()?.apdu()?.clone();
+    let dpt = devknx::ets::parse_dpt(&dpts[0]).ok()?;
+    knx_rs_core::dpt::decode(dpt, &apdu.data)
+        .ok()
+        .map(|value| value.to_string())
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -425,6 +800,7 @@ mod tests {
             service: "Write".into(),
             label: Some("Kitchen light".into()),
             dpts: vec!["DPT-1-1".into()],
+            value: Some("true".into()),
             raw_cemi: "2900".into(),
         };
         assert!(row.matches("kitchen"));
@@ -436,6 +812,102 @@ mod tests {
     fn request_parsing_rejects_invalid_addresses() {
         assert!(read_request("99/9/999").is_err());
         assert!(write_request("99/9/999", "1.001", "true").is_err());
+    }
+
+    #[test]
+    fn connection_settings_validate_mode_and_address_without_network_access() {
+        let start = ConnectionSettings::default();
+        assert_eq!(start.mode, ConnectionMode::Tunnel);
+        assert_eq!(start.port, 3671);
+        let tunnel = ConnectionSettings::from_endpoint("tunnel://192.168.2.8:3671").unwrap();
+        assert_eq!(tunnel.mode, ConnectionMode::Tunnel);
+        assert_eq!(tunnel.endpoint().unwrap(), "tunnel://192.168.2.8:3671");
+        let router = ConnectionSettings::from_endpoint("router://224.0.23.12:3671").unwrap();
+        assert_eq!(router.mode, ConnectionMode::Routing);
+        assert_eq!(router.endpoint().unwrap(), "router://224.0.23.12:3671");
+        assert!(ConnectionSettings::from_endpoint("router://192.168.2.8:3671").is_err());
+        assert!(ConnectionSettings::from_endpoint("tunnel://224.0.23.12:3671").is_err());
+        assert!(ConnectionSettings::from_endpoint("tunnel://not-an-ip:3671").is_err());
+        assert_eq!(
+            ConnectionSettings {
+                mode: ConnectionMode::Routing,
+                address: "invalid".into(),
+                port: 3671,
+            }
+            .endpoint()
+            .unwrap_err(),
+            "Enter a numeric multicast group address"
+        );
+    }
+
+    #[test]
+    fn disconnect_endpoint_uses_configured_identity_during_reconnect() {
+        let configured = "tunnel://192.0.2.8:3671";
+        let other = "tunnel://192.0.2.9:3671";
+        let retry = WireState::WaitingRetry {
+            reason: "gateway unavailable".into(),
+            delay_ms: 2_000,
+        };
+        assert_eq!(
+            endpoint_from_status(&retry, Some(configured.into())).as_deref(),
+            Some(configured)
+        );
+        assert_eq!(
+            endpoint_from_status(&retry, Some(other.into())).as_deref(),
+            Some(other)
+        );
+        assert_eq!(endpoint_from_status(&retry, None), None);
+        assert_eq!(
+            endpoint_from_status(
+                &WireState::Connected {
+                    endpoint: configured.into(),
+                },
+                None,
+            )
+            .as_deref(),
+            Some(configured)
+        );
+    }
+
+    #[test]
+    fn private_capture_storage_and_connection_settings_round_trip() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("application").join("captures.sqlite");
+        ensure_database(&database).unwrap();
+        assert!(database.exists());
+        assert!(MonitorModel::open(database.clone()).is_ok());
+        let settings = ConnectionSettings::from_endpoint("tunnel://192.0.2.8:3671").unwrap();
+        save_settings(&database, &settings).unwrap();
+        assert_eq!(load_settings(&database).unwrap(), settings);
+        ensure_database(&database).unwrap();
+        assert_eq!(load_settings(&database).unwrap(), settings);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(database.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o077,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn connection_settings_are_scoped_to_each_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.sqlite");
+        let second = directory.path().join("second.sqlite");
+        let first_settings = ConnectionSettings::from_endpoint("tunnel://192.0.2.8:3671").unwrap();
+        let second_settings =
+            ConnectionSettings::from_endpoint("router://224.0.23.12:3671").unwrap();
+        save_settings(&first, &first_settings).unwrap();
+        save_settings(&second, &second_settings).unwrap();
+        assert_eq!(load_settings(&first).unwrap(), first_settings);
+        assert_eq!(load_settings(&second).unwrap(), second_settings);
+        assert!(!directory.path().join("connection.json").exists());
     }
 
     #[test]
@@ -467,6 +939,7 @@ mod tests {
         let mut model = MonitorModel::open(database.clone()).unwrap();
         assert_eq!(model.rows.len(), 1);
         assert_eq!(model.rows[0].label.as_deref(), Some("Kitchen light"));
+        assert_eq!(model.rows[0].value.as_deref(), Some("true"));
         let mut writer = CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap();
         let late_frame = CemiFrame::new_l_data(
             MessageCode::LDataInd,
@@ -484,6 +957,7 @@ mod tests {
         drop(writer);
         model.ingest(IpcMessage::State {
             value: WireState::Idle,
+            configured_endpoint: None,
         });
         assert_eq!(
             model.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
@@ -525,7 +999,8 @@ mod tests {
                 if matches!(
                     event,
                     Ok(IpcMessage::State {
-                        value: WireState::Idle
+                        value: WireState::Idle,
+                        ..
                     })
                 ) {
                     saw_idle = true;
@@ -574,7 +1049,8 @@ mod tests {
                 if matches!(
                     event,
                     Ok(IpcMessage::State {
-                        value: WireState::Connected { .. }
+                        value: WireState::Connected { .. },
+                        ..
                     })
                 ) {
                     reconnected = true;
@@ -592,6 +1068,20 @@ mod tests {
         drop(follower);
         server.abort();
         drop((state_tx, frames_tx, losses_tx));
+    }
+
+    #[test]
+    fn closed_capture_owner_has_a_readable_notice() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("capture.sqlite");
+        drop(CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap());
+        let mut model = MonitorModel::open(database).unwrap();
+        model.owner_available = true;
+        model.owner_unavailable("capture owner closed IPC stream");
+        assert_eq!(
+            model.notices.last().map(String::as_str),
+            Some("Capture connection closed")
+        );
     }
 
     #[test]

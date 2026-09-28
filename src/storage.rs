@@ -22,7 +22,7 @@ use thiserror::Error;
 use crate::capture::{CaptureDirection, CaptureEndpoint, CaptureEvent, RoutingLossEvent};
 use crate::ets::{EtsCatalog, EtsGroup, parse_dpt, parse_group_address};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 /// Maximum number of rows returned by one cursor query.
 pub const MAX_PAGE_SIZE: u32 = 1_000;
 const EXPORT_PAGE_SIZE: NonZeroU32 = NonZeroU32::new(500).expect("nonzero export page size");
@@ -92,6 +92,14 @@ const SCHEMA_V4: &str = "
     PRAGMA user_version = 4;
 ";
 
+const SCHEMA_V5: &str = "
+    CREATE TABLE session_binding (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        endpoint TEXT NOT NULL
+    );
+    PRAGMA user_version = 5;
+";
+
 /// Errors opening, writing, reading, or exporting capture history.
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -119,6 +127,9 @@ pub enum StorageError {
     /// Another process already owns the writable capture store.
     #[error("capture writer is already active for {0}")]
     WriterBusy(PathBuf),
+    /// A database already belongs to a different KNX endpoint.
+    #[error("capture database belongs to {existing}, not {requested}")]
+    EndpointMismatch { existing: String, requested: String },
     /// A writable capture directory must not be writable by other users.
     #[error("capture directory is writable by another user: {0}")]
     InsecureDirectory(PathBuf),
@@ -226,8 +237,78 @@ impl CaptureStore {
         Self::open_writable(path, Some(max_events))
     }
 
+    /// Open a writable capture only for the selected canonical endpoint.
+    /// Existing captures or a prior binding to another endpoint fail before
+    /// retention can prune any history.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage, migration, or endpoint-identity error.
+    pub fn open_bound(
+        path: &Path,
+        max_events: NonZeroU32,
+        endpoint: &str,
+    ) -> Result<Self, StorageError> {
+        let mut store = Self::open_writable(path, None)?;
+        store.bind_endpoint(endpoint)?;
+        let transaction = store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        prune(&transaction, max_events)?;
+        transaction.commit()?;
+        store.max_events = Some(max_events);
+        Ok(store)
+    }
+
+    fn bind_endpoint(&mut self, endpoint: &str) -> Result<(), StorageError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let bound: Option<String> = transaction
+            .query_row(
+                "SELECT endpoint FROM session_binding WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let conflicting_capture: Option<String> = transaction
+            .query_row(
+                "SELECT transport || '://' || endpoint FROM capture_events
+                 WHERE transport || '://' || endpoint <> ?1 LIMIT 1",
+                [endpoint],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let conflicting_router: Option<String> = transaction
+            .query_row(
+                "SELECT 'router://' || endpoint FROM routing_loss_events
+                 WHERE 'router://' || endpoint <> ?1 LIMIT 1",
+                [endpoint],
+                |row| row.get(0),
+            )
+            .optional()?;
+        for existing in [bound, conflicting_capture, conflicting_router]
+            .into_iter()
+            .flatten()
+        {
+            if existing != endpoint {
+                return Err(StorageError::EndpointMismatch {
+                    existing,
+                    requested: endpoint.to_owned(),
+                });
+            }
+        }
+        transaction.execute(
+            "INSERT OR IGNORE INTO session_binding (id, endpoint) VALUES (1, ?1)",
+            [endpoint],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Open a writable store for metadata replacement without pruning capture history.
-    /// The same single-writer lease applies; stop `serve` before importing.
+    /// The same single-writer lease applies; disconnect the managed session
+    /// before importing.
     ///
     /// # Errors
     ///
@@ -241,6 +322,14 @@ impl CaptureStore {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
         {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                let mut builder = std::fs::DirBuilder::new();
+                builder.recursive(true).mode(0o700);
+                builder.create(parent)?;
+            }
+            #[cfg(not(unix))]
             std::fs::create_dir_all(parent)?;
         }
         let database_path = normalized_sqlite_path(path)?;
@@ -897,6 +986,7 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
             transaction.execute_batch(SCHEMA_V2)?;
             transaction.execute_batch(SCHEMA_V3)?;
             transaction.execute_batch(SCHEMA_V4)?;
+            transaction.execute_batch(SCHEMA_V5)?;
             transaction.commit()?;
             Ok(())
         }
@@ -906,6 +996,7 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
             transaction.execute_batch(SCHEMA_V2)?;
             transaction.execute_batch(SCHEMA_V3)?;
             transaction.execute_batch(SCHEMA_V4)?;
+            transaction.execute_batch(SCHEMA_V5)?;
             transaction.commit()?;
             Ok(())
         }
@@ -914,6 +1005,7 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             transaction.execute_batch(SCHEMA_V3)?;
             transaction.execute_batch(SCHEMA_V4)?;
+            transaction.execute_batch(SCHEMA_V5)?;
             transaction.commit()?;
             Ok(())
         }
@@ -921,6 +1013,14 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             transaction.execute_batch(SCHEMA_V4)?;
+            transaction.execute_batch(SCHEMA_V5)?;
+            transaction.commit()?;
+            Ok(())
+        }
+        4 => {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(SCHEMA_V5)?;
             transaction.commit()?;
             Ok(())
         }
@@ -1128,7 +1228,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_migrates_to_v4_without_losing_captures() {
+    fn v1_migrates_to_v5_without_losing_captures() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("captures.sqlite");
         let mut original = CaptureStore::open(&path, nz(10)).unwrap();
@@ -1137,7 +1237,8 @@ mod tests {
         let connection = Connection::open(&path).unwrap();
         connection
             .execute_batch(
-                "DROP INDEX idx_operation_audit_time;
+                "DROP TABLE session_binding;
+                 DROP INDEX idx_operation_audit_time;
                  DROP TABLE operation_audit;
                  DROP INDEX idx_ets_groups_address;
                  DROP TABLE ets_groups;
@@ -1490,7 +1591,7 @@ mod tests {
         writer.insert(&event(tunnel(), 7)).unwrap();
         drop(writer);
         let legacy = Connection::open(&path).unwrap();
-        legacy.execute_batch("DROP INDEX idx_operation_audit_time; DROP TABLE operation_audit; DROP INDEX idx_ets_groups_address; DROP TABLE ets_groups; DROP TABLE ets_imports; PRAGMA user_version = 2;").unwrap();
+        legacy.execute_batch("DROP TABLE session_binding; DROP INDEX idx_operation_audit_time; DROP TABLE operation_audit; DROP INDEX idx_ets_groups_address; DROP TABLE ets_groups; DROP TABLE ets_imports; PRAGMA user_version = 2;").unwrap();
         drop(legacy);
         assert_eq!(
             CaptureStore::open_existing(&path)
@@ -1526,7 +1627,7 @@ mod tests {
         writer.import_ets(&ets_fixture("Preserved")).unwrap();
         drop(writer);
         let legacy = Connection::open(&path).unwrap();
-        legacy.execute_batch("DROP INDEX idx_operation_audit_time; DROP TABLE operation_audit; PRAGMA user_version = 3;").unwrap();
+        legacy.execute_batch("DROP TABLE session_binding; DROP INDEX idx_operation_audit_time; DROP TABLE operation_audit; PRAGMA user_version = 3;").unwrap();
         drop(legacy);
 
         let migrated = CaptureStore::open_for_ets_import(&path).unwrap();
@@ -1546,7 +1647,7 @@ mod tests {
         drop(migrated);
 
         let conflicting = Connection::open(&path).unwrap();
-        conflicting.execute_batch("DROP INDEX idx_operation_audit_time; DROP TABLE operation_audit; CREATE TABLE operation_audit (marker TEXT); PRAGMA user_version = 3;").unwrap();
+        conflicting.execute_batch("DROP TABLE session_binding; DROP INDEX idx_operation_audit_time; DROP TABLE operation_audit; CREATE TABLE operation_audit (marker TEXT); PRAGMA user_version = 3;").unwrap();
         drop(conflicting);
         assert!(matches!(
             CaptureStore::open_for_ets_import(&path),
@@ -1568,6 +1669,73 @@ mod tests {
             })
             .unwrap();
         assert_eq!(revision, 1);
+    }
+
+    #[test]
+    fn bound_capture_rejects_another_endpoint_before_retention_prunes_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bound.sqlite");
+        let mut first = CaptureStore::open_bound(&path, nz(10), "tunnel://192.0.2.1:3671").unwrap();
+        first.insert(&event(tunnel(), 1)).unwrap();
+        first.insert(&event(tunnel(), 2)).unwrap();
+        drop(first);
+
+        assert!(matches!(
+            CaptureStore::open_bound(&path, nz(1), "tunnel://192.0.2.2:3671"),
+            Err(StorageError::EndpointMismatch { .. })
+        ));
+        assert_eq!(
+            CaptureStore::open_existing(&path)
+                .unwrap()
+                .read_after(0, nz(10))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(CaptureStore::open_bound(&path, nz(10), "tunnel://192.0.2.1:3671").is_ok());
+
+        let empty = directory.path().join("empty.sqlite");
+        drop(CaptureStore::open_bound(&empty, nz(10), "tunnel://192.0.2.1:3671").unwrap());
+        assert!(matches!(
+            CaptureStore::open_bound(&empty, nz(10), "tunnel://192.0.2.2:3671"),
+            Err(StorageError::EndpointMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn v4_binding_migration_preserves_captures_and_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v4.sqlite");
+        let mut original = CaptureStore::open(&path, nz(10)).unwrap();
+        original.insert(&event(tunnel(), 9)).unwrap();
+        drop(original);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("DROP TABLE session_binding; PRAGMA user_version = 4;")
+            .unwrap();
+        drop(connection);
+
+        let migrated = CaptureStore::open_bound(&path, nz(10), "tunnel://192.0.2.1:3671").unwrap();
+        assert_eq!(
+            schema_version(&migrated.connection).unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(migrated.read_after(0, nz(10)).unwrap().len(), 1);
+        let snapshot = directory.path().join("snapshot.sqlite");
+        migrated.backup_to(&snapshot).unwrap();
+        drop(migrated);
+        assert_eq!(
+            CaptureStore::open_existing(&snapshot)
+                .unwrap()
+                .read_after(0, nz(10))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(matches!(
+            CaptureStore::open_bound(&snapshot, nz(10), "tunnel://192.0.2.2:3671"),
+            Err(StorageError::EndpointMismatch { .. })
+        ));
     }
 
     #[test]

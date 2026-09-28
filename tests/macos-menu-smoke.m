@@ -49,7 +49,7 @@ int main(void) {
         for (NSString *title in @[@"Undo", @"Redo", @"Cut", @"Copy", @"Paste", @"Select All"]) {
             expect([submenu(@"Edit") itemWithTitle:title] != nil, [title UTF8String]);
         }
-        check_action(@"File", @"Open Capture Database…", @"o", 1);
+        check_action(@"File", @"Open Capture…", @"o", 1);
         check_action(@"File", @"Export CSV…", @"e", 2);
         check_action(@"View", @"Discover Gateways", @"d", 4);
         check_action(@"View", @"Filter Captures", @"f", 8);

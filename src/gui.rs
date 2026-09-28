@@ -124,6 +124,22 @@ fn render_connection_form(
     .inner
 }
 
+fn rest_indicator(status: Option<&RestStatus>, error: Option<&str>) -> String {
+    if error.is_some() {
+        return "REST unavailable".into();
+    }
+    match status {
+        Some(RestStatus {
+            enabled: true,
+            bind: Some(bind),
+            ..
+        }) => format!("REST :{}", bind.port()),
+        Some(RestStatus { enabled: true, .. }) => "REST on".into(),
+        Some(_) => "REST off".into(),
+        None => "REST checking…".into(),
+    }
+}
+
 struct SmokeRun {
     started: Instant,
     frames: u32,
@@ -146,6 +162,12 @@ struct LiveSmoke {
     result: Arc<AtomicBool>,
 }
 
+#[derive(Clone, Copy)]
+enum RestRequestKind {
+    Status,
+    Change,
+}
+
 #[derive(Default)]
 #[expect(
     clippy::struct_excessive_bools,
@@ -162,7 +184,11 @@ struct MonitorApp {
     action_receiver: Option<Receiver<Result<devknx::ipc::IpcMessage, String>>>,
     connection_receiver: Option<Receiver<Result<String, String>>>,
     rest_receiver: Option<Receiver<Result<RestStatus, String>>>,
+    rest_request_kind: Option<RestRequestKind>,
     rest_status: Option<RestStatus>,
+    rest_error: Option<String>,
+    rest_action_error: Option<String>,
+    rest_last_refresh: Option<Instant>,
     rest_bind: String,
     rest_token: String,
     rest_allow_remote_writes: bool,
@@ -170,6 +196,7 @@ struct MonitorApp {
     settings_draft: ConnectionSettings,
     error: Option<String>,
     show_settings: bool,
+    show_rest: bool,
     show_gateways: bool,
     show_export: bool,
     show_read: bool,
@@ -243,6 +270,7 @@ impl MonitorApp {
                 baseline_id: model.rows.last().and_then(|row| row.id).unwrap_or(0),
             };
         }
+        app.refresh_rest_status();
         app
     }
 
@@ -316,7 +344,7 @@ impl MonitorApp {
         let endpoint = match self.settings.endpoint() {
             Ok(endpoint) => endpoint,
             Err(error) => {
-                self.error = Some(error);
+                self.rest_action_error = Some(error);
                 return;
             }
         };
@@ -408,8 +436,10 @@ impl MonitorApp {
         if self.rest_receiver.is_some() {
             return;
         }
+        self.rest_last_refresh = Some(Instant::now());
         let (sender, receiver) = mpsc::channel();
         self.rest_receiver = Some(receiver);
+        self.rest_request_kind = Some(RestRequestKind::Status);
         std::thread::spawn(move || {
             let _ = sender.send(interface::rest_status());
         });
@@ -432,6 +462,8 @@ impl MonitorApp {
         let allow_remote_writes = self.rest_allow_remote_writes;
         let (sender, receiver) = mpsc::channel();
         self.rest_receiver = Some(receiver);
+        self.rest_request_kind = Some(RestRequestKind::Change);
+        self.rest_action_error = None;
         std::thread::spawn(move || {
             let _ = sender.send(interface::rest_enable(
                 &endpoint,
@@ -448,6 +480,8 @@ impl MonitorApp {
         }
         let (sender, receiver) = mpsc::channel();
         self.rest_receiver = Some(receiver);
+        self.rest_request_kind = Some(RestRequestKind::Change);
+        self.rest_action_error = None;
         std::thread::spawn(move || {
             let _ = sender.send(interface::rest_disable());
         });
@@ -463,25 +497,54 @@ impl MonitorApp {
         });
     }
 
-    fn process_background(&mut self) {
+    fn process_rest_background(&mut self) {
         if let Some(receiver) = &self.rest_receiver {
             match receiver.try_recv() {
                 Ok(Ok(status)) => {
+                    if status.enabled
+                        && let Some(bind) = status.bind
+                    {
+                        self.rest_bind = bind.to_string();
+                    }
+                    if status.enabled {
+                        self.rest_allow_remote_writes = status.allow_remote_writes;
+                    }
                     self.rest_status = Some(status);
+                    self.rest_error = None;
+                    if matches!(self.rest_request_kind.take(), Some(RestRequestKind::Change)) {
+                        self.rest_action_error = None;
+                    }
                     self.rest_receiver = None;
-                    self.error = None;
                 }
                 Ok(Err(error)) => {
-                    self.error = Some(format!("REST control failed: {error}"));
+                    match self.rest_request_kind.take() {
+                        Some(RestRequestKind::Change) => self.rest_action_error = Some(error),
+                        Some(RestRequestKind::Status) | None => self.rest_error = Some(error),
+                    }
                     self.rest_receiver = None;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.error = Some("REST control worker stopped unexpectedly".into());
+                    let error = "REST control worker stopped unexpectedly".into();
+                    match self.rest_request_kind.take() {
+                        Some(RestRequestKind::Change) => self.rest_action_error = Some(error),
+                        Some(RestRequestKind::Status) | None => self.rest_error = Some(error),
+                    }
                     self.rest_receiver = None;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
+        if self.rest_receiver.is_none()
+            && self
+                .rest_last_refresh
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(3))
+        {
+            self.refresh_rest_status();
+        }
+    }
+
+    fn process_background(&mut self) {
+        self.process_rest_background();
         if let Some(receiver) = &self.gateway_receiver {
             match receiver.try_recv() {
                 Ok(Ok(gateways)) => {
@@ -571,7 +634,6 @@ impl MonitorApp {
         if platform::take(MenuAction::ConnectionSettings) {
             self.settings_draft = self.settings.clone();
             self.show_settings = true;
-            self.refresh_rest_status();
         }
         if platform::take(MenuAction::ToggleConnection) {
             if self
@@ -721,9 +783,6 @@ impl MonitorApp {
             let mut save = false;
             let mut connect = false;
             let mut discover = false;
-            let mut rest_refresh = false;
-            let mut rest_enable = false;
-            let mut rest_disable = false;
             egui::Window::new("Connection Settings")
                 .open(&mut open)
                 .resizable(false)
@@ -737,56 +796,6 @@ impl MonitorApp {
                     ui.label("Capture storage");
                     ui.small("History is saved automatically for this connection.");
                     ui.small("Use Open… to choose another capture in the system file dialog.");
-                    ui.separator();
-                    ui.collapsing("REST API", |ui| {
-                        if let Some(status) = &self.rest_status {
-                            if status.enabled {
-                                ui.label(format!(
-                                    "Listening at http://{}/v1 for {}",
-                                    status.bind.map_or_else(
-                                        || "unknown address".into(),
-                                        |bind| bind.to_string()
-                                    ),
-                                    status.endpoint.as_deref().unwrap_or("unknown endpoint")
-                                ));
-                                ui.small(if status.allow_remote_writes {
-                                    "Remote typed writes enabled"
-                                } else {
-                                    "Remote typed writes disabled"
-                                });
-                            } else {
-                                ui.label("Disabled");
-                            }
-                        } else {
-                            ui.label("Status not loaded");
-                        }
-                        rest_refresh = ui
-                            .add_enabled(self.rest_receiver.is_none(), egui::Button::new("Refresh status"))
-                            .clicked();
-                        ui.horizontal(|ui| {
-                            ui.label("Listen address");
-                            ui.text_edit_singleline(&mut self.rest_bind);
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Bearer token");
-                            ui.add(egui::TextEdit::singleline(&mut self.rest_token).password(true));
-                        });
-                        ui.small("Required for non-loopback binding (at least 32 printable ASCII characters). Not saved.");
-                        ui.checkbox(&mut self.rest_allow_remote_writes, "Allow remote typed writes");
-                        ui.small("REST uses plain HTTP. Expose it only on a trusted network or behind a TLS proxy.");
-                        ui.horizontal(|ui| {
-                            let connected = self.model.as_ref().is_some_and(|model| model.owner_available);
-                            let active = self.rest_status.as_ref().is_some_and(|status| status.enabled);
-                            rest_enable = ui.add_enabled(
-                                connected && !active && self.rest_receiver.is_none(),
-                                egui::Button::new("Enable REST"),
-                            ).clicked();
-                            rest_disable = ui.add_enabled(
-                                active && self.rest_receiver.is_none(),
-                                egui::Button::new("Disable REST"),
-                            ).clicked();
-                        });
-                    });
                     ui.separator();
                     ui.horizontal(|ui| {
                         save = ui.button("Save settings").clicked();
@@ -804,15 +813,6 @@ impl MonitorApp {
                     });
                 });
             self.show_settings = open;
-            if rest_refresh {
-                self.refresh_rest_status();
-            }
-            if rest_enable {
-                self.enable_rest();
-            }
-            if rest_disable {
-                self.disable_rest();
-            }
             if discover {
                 self.discover();
             }
@@ -835,6 +835,99 @@ impl MonitorApp {
                     }
                     Err(error) => self.error = Some(error),
                 }
+            }
+        }
+        if self.show_rest {
+            let mut open = self.show_rest;
+            let mut refresh = false;
+            let mut enable = false;
+            let mut disable = false;
+            egui::Window::new("REST API")
+                .open(&mut open)
+                .resizable(false)
+                .max_height((ctx.content_rect().height() - 24.0).max(240.0))
+                .vscroll(true)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .default_width(400.0)
+                .show(ctx, |ui| {
+                    if let Some(error) = &self.rest_action_error {
+                        ui.colored_label(egui::Color32::LIGHT_RED, format!("REST request failed: {error}"));
+                    }
+                    if let Some(error) = &self.rest_error {
+                        ui.colored_label(egui::Color32::LIGHT_RED, format!("Status unavailable: {error}"));
+                    } else if let Some(status) = &self.rest_status {
+                        if status.enabled {
+                            ui.label(format!(
+                                "Listening at http://{}/v1",
+                                status.bind.map_or_else(
+                                    || "unknown address".into(),
+                                    |bind| bind.to_string()
+                                )
+                            ));
+                            ui.label(format!(
+                                "Serving {}",
+                                status.endpoint.as_deref().unwrap_or("unknown KNX connection")
+                            ));
+                            ui.small(if status.allow_remote_writes {
+                                "Remote typed writes enabled"
+                            } else {
+                                "Remote typed writes disabled"
+                            });
+                        } else {
+                            ui.label("REST is off");
+                        }
+                    } else {
+                        ui.label("Checking REST status…");
+                    }
+                    ui.small("The REST listener is a daemon service for one active KNX connection. Disconnecting that connection stops it.");
+                    ui.separator();
+                    let active = self.rest_status.as_ref().is_some_and(|status| status.enabled);
+                    ui.add_enabled_ui(!active, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Listen address");
+                            ui.text_edit_singleline(&mut self.rest_bind);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Bearer token");
+                            ui.add(egui::TextEdit::singleline(&mut self.rest_token).password(true));
+                        });
+                        ui.checkbox(&mut self.rest_allow_remote_writes, "Allow remote typed writes");
+                    });
+                    ui.small("Required for non-loopback binding (at least 32 printable ASCII characters). Not saved.");
+                    if active {
+                        ui.small("Stop REST before changing its settings.");
+                    }
+                    ui.small("REST uses plain HTTP. Expose it only on a trusted network or behind a TLS proxy.");
+                    let connected = !self.offline_capture
+                        && self.model.as_ref().is_some_and(|model| model.owner_available);
+                    let status_known = self.rest_status.is_some() && self.rest_error.is_none();
+                    if !connected && !active {
+                        ui.small("Connect to a KNX gateway before starting REST.");
+                    }
+                    ui.horizontal(|ui| {
+                        enable = ui.add_enabled(
+                            connected && status_known && !active && self.rest_receiver.is_none(),
+                            egui::Button::new("Start REST"),
+                        ).clicked();
+                        disable = ui.add_enabled(
+                            status_known && active && self.rest_receiver.is_none(),
+                            egui::Button::new("Stop REST"),
+                        ).clicked();
+                        refresh = ui.add_enabled(
+                            self.rest_receiver.is_none(),
+                            egui::Button::new("Refresh status"),
+                        ).clicked();
+                    });
+                });
+            self.show_rest = open;
+            if refresh {
+                self.refresh_rest_status();
+            }
+            if enable {
+                self.enable_rest();
+            }
+            if disable {
+                self.disable_rest();
             }
         }
         if self.show_gateways {
@@ -1095,7 +1188,6 @@ impl MonitorApp {
             {
                 self.settings_draft = self.settings.clone();
                 self.show_settings = true;
-                self.refresh_rest_status();
             }
             ui.separator();
             let connected = !self.offline_capture
@@ -1312,8 +1404,25 @@ impl MonitorApp {
         Some(output.state.offset.y)
     }
 
-    fn render_status(&self, ui: &mut egui::Ui) {
+    fn render_status(&mut self, ui: &mut egui::Ui) {
         let (_, status, detail) = self.connection_status();
+        let rest_label = rest_indicator(self.rest_status.as_ref(), self.rest_error.as_deref());
+        let rest_color = if self.rest_error.is_some() {
+            egui::Color32::from_rgb(255, 180, 60)
+        } else if self
+            .rest_status
+            .as_ref()
+            .is_some_and(|status| status.enabled)
+        {
+            egui::Color32::from_rgb(80, 200, 120)
+        } else {
+            egui::Color32::from_rgb(160, 160, 160)
+        };
+        let rest_tip = self.rest_error.as_ref().map_or_else(
+            || "Show and change the daemon's REST API".to_owned(),
+            |error| format!("REST status unavailable: {error}. Click to inspect."),
+        );
+        let mut open_rest = false;
         ui.horizontal_wrapped(|ui| {
             ui.label(format!("{status} · {detail}"));
             if let Some(model) = &self.model {
@@ -1330,7 +1439,19 @@ impl MonitorApp {
                 ui.label("History saved locally")
                     .on_hover_text(model.database.display().to_string());
             }
+            ui.separator();
+            open_rest = ui
+                .add(egui::Button::new(egui::RichText::new(rest_label).color(rest_color)).small())
+                .on_hover_text(rest_tip)
+                .clicked();
         });
+        if open_rest {
+            if let Some(bind) = self.rest_status.as_ref().and_then(|status| status.bind) {
+                self.rest_bind = bind.to_string();
+            }
+            self.show_rest = true;
+            self.refresh_rest_status();
+        }
     }
 }
 
@@ -1400,6 +1521,72 @@ mod tests {
     use super::*;
     use devknx::storage::CaptureStore;
     use std::num::NonZeroU32;
+
+    #[test]
+    fn rest_indicator_distinguishes_live_off_and_unavailable() {
+        let status = RestStatus {
+            enabled: true,
+            endpoint: Some("tunnel://192.0.2.10:3671".into()),
+            bind: Some("127.0.0.1:8765".parse().unwrap()),
+            allow_remote_writes: false,
+        };
+        assert_eq!(rest_indicator(None, None), "REST checking…");
+        assert_eq!(rest_indicator(Some(&status), None), "REST :8765");
+        assert_eq!(
+            rest_indicator(Some(&status), Some("IPC failed")),
+            "REST unavailable"
+        );
+        assert_eq!(
+            rest_indicator(
+                Some(&RestStatus {
+                    enabled: false,
+                    ..status
+                }),
+                None
+            ),
+            "REST off"
+        );
+    }
+
+    #[test]
+    fn rest_status_updates_when_another_surface_changes_the_daemon() {
+        let mut app = MonitorApp {
+            rest_last_refresh: Some(Instant::now()),
+            ..MonitorApp::default()
+        };
+        let (sender, receiver) = mpsc::channel();
+        app.rest_receiver = Some(receiver);
+        app.rest_request_kind = Some(RestRequestKind::Status);
+        app.rest_action_error = Some("Invalid listen address".into());
+        sender
+            .send(Ok(RestStatus {
+                enabled: true,
+                endpoint: Some("tunnel://192.0.2.10:3671".into()),
+                bind: Some("127.0.0.1:8765".parse().unwrap()),
+                allow_remote_writes: false,
+            }))
+            .unwrap();
+        app.process_rest_background();
+        assert_eq!(rest_indicator(app.rest_status.as_ref(), None), "REST :8765");
+
+        let (sender, receiver) = mpsc::channel();
+        app.rest_receiver = Some(receiver);
+        app.rest_request_kind = Some(RestRequestKind::Status);
+        sender
+            .send(Ok(RestStatus {
+                enabled: false,
+                endpoint: None,
+                bind: None,
+                allow_remote_writes: false,
+            }))
+            .unwrap();
+        app.process_rest_background();
+        assert_eq!(rest_indicator(app.rest_status.as_ref(), None), "REST off");
+        assert_eq!(
+            app.rest_action_error.as_deref(),
+            Some("Invalid listen address")
+        );
+    }
 
     fn append_rows(model: &mut MonitorModel, start: i64, end: i64) {
         for id in start..=end {

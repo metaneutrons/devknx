@@ -262,7 +262,11 @@ impl MonitorModel {
             delay_ms: 2_000,
         };
         if was_available {
-            self.notice(format!("Capture connection unavailable: {error}"));
+            self.notice(if error == "capture owner closed IPC stream" {
+                "Capture connection closed".into()
+            } else {
+                format!("Capture connection unavailable: {error}")
+            });
         }
     }
 
@@ -1064,6 +1068,20 @@ mod tests {
         drop(follower);
         server.abort();
         drop((state_tx, frames_tx, losses_tx));
+    }
+
+    #[test]
+    fn closed_capture_owner_has_a_readable_notice() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("capture.sqlite");
+        drop(CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap());
+        let mut model = MonitorModel::open(database).unwrap();
+        model.owner_available = true;
+        model.owner_unavailable("capture owner closed IPC stream");
+        assert_eq!(
+            model.notices.last().map(String::as_str),
+            Some("Capture connection closed")
+        );
     }
 
     #[test]

@@ -91,13 +91,13 @@ fn render_connection_form(
             let (address_label, address_hint, help) = match settings.mode {
                 ConnectionMode::Tunnel => (
                     "Gateway IP address",
-                    "192.168.2.8",
-                    "Enter a unicast gateway address. Discovery is optional.",
+                    "Enter gateway IP address",
+                    "Enter a unicast address (for example, 192.168.1.10). Discovery is optional.",
                 ),
                 ConnectionMode::Routing => (
                     "Multicast group",
-                    "224.0.23.12",
-                    "Enter a multicast group reachable from this computer.",
+                    "Enter multicast group",
+                    "Enter a reachable multicast group (usually 224.0.23.12).",
                 ),
             };
             ui.label(egui::RichText::new(address_label).strong());
@@ -727,6 +727,8 @@ impl MonitorApp {
             egui::Window::new("Connection Settings")
                 .open(&mut open)
                 .resizable(false)
+                .max_height((ctx.content_rect().height() - 24.0).max(240.0))
+                .vscroll(true)
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .default_width(400.0)
                 .show(ctx, |ui| {
@@ -1009,7 +1011,10 @@ impl MonitorApp {
             return (
                 egui::Color32::GRAY,
                 "Offline capture",
-                model.database.display().to_string(),
+                model.database.file_name().map_or_else(
+                    || model.database.display().to_string(),
+                    |name| name.to_string_lossy().into_owned(),
+                ),
             );
         }
         if !model.owner_available {
@@ -1428,6 +1433,7 @@ mod tests {
         app.attach(&archive, true);
         assert!(app.follower.is_none());
         assert_eq!(app.connection_status().1, "Offline capture");
+        assert_eq!(app.connection_status().2, "archive.sqlite");
         app.connect();
         assert!(
             app.error

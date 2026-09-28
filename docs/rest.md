@@ -7,11 +7,12 @@ second writer. A failed bind does not report REST as enabled. Disconnecting
 the selected session disables its listener. Only one REST listener is active
 at a time; requests never choose another KNX session implicitly.
 
-The GUI exposes listener status and controls in Connection Settings, including
-the bind address, a masked in-memory bearer token, and the explicit remote-write
-switch. It does not save the token. The TUI's `a` key offers a confirmed
-loopback-only toggle for its selected session; use the CLI or GUI for an
-authenticated non-loopback listener.
+The GUI has a clickable REST status in the bottom bar that opens a separate
+REST API dialog. The status is refreshed in the background, including after
+changes made through the CLI. The dialog contains the bind address, a masked
+in-memory bearer token, and the explicit remote-write switch. It does not save
+the token. The TUI's `a` key offers a confirmed loopback-only toggle for its
+selected session; use the CLI or GUI for an authenticated non-loopback listener.
 
 ```sh
 devknx connect tunnel://192.0.2.1:3671

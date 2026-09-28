@@ -117,9 +117,10 @@ connection as a write target.
 
 The daemon owns one opt-in REST listener, bound to `127.0.0.1:8765` by
 default and scoped to one connected endpoint. The GUI controls it in
-Connection Settings; the TUI's `a` key toggles a loopback listener after
-confirmation. The CLI also exposes the bind address, bearer token and remote
-write policy. See the [REST API guide](docs/rest.md) for versioned routes,
+its own REST API dialog, opened from the live status in the bottom bar.
+The TUI's `a` key toggles a loopback listener after confirmation. The CLI
+also exposes the bind address, bearer token and remote-write policy. See the
+[REST API guide](docs/rest.md) for versioned routes,
 SSE resume, authentication and remote-write policy.
 The MCP adapter is a separate local stdio process; see the [MCP guide](docs/mcp.md)
 for tool names, structured results, bounded search and write semantics.

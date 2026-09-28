@@ -202,9 +202,9 @@ Dependencies: M2 through M5; prerequisite to M6 publication
   default, bound to one chosen active session, reports the actual listening
   address only after successful bind, and stops when that session disconnects.
   Existing token, remote-write and origin-audit rules remain effective;
-  status never discloses a token. The GUI exposes policy and listener controls
-  in Connection Settings, while the TUI offers a confirmed loopback-only
-  toggle. MCP remains explicitly scoped.
+  status never discloses a token. The GUI exposes live status in the bottom bar
+  and policy and listener controls in a separate REST API dialog. The TUI offers
+  a confirmed loopback-only toggle. MCP remains explicitly scoped.
 - M7-A4: Documentation, source-anchored interface coverage, loopback tests,
   and supported-platform CI qualify two sessions, isolation, lifecycle,
   operation safety, REST controls, daemon startup races, and shutdown. No

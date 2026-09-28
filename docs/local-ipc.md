@@ -69,9 +69,11 @@ Windows, the endpoint is a named pipe with a DACL granting access only to the
 current process user SID. The pipe requires first-instance creation and rejects
 remote clients. This is local transport protection, not remote authentication.
 
-The daemon control socket has a stable per-user identity independent of
-database paths. Its Unix directory is private and protected by an owner lease;
-Windows uses a SID-restricted named pipe. Clients may spawn `devknx daemon`
+The daemon control socket has a stable identity for the current user and
+application-data directory, independent of capture database paths. Its Unix
+directory is private and protected by an owner lease; Windows uses a
+SID-restricted named pipe whose name also identifies the application-data
+directory. Clients may spawn `devknx daemon`
 on demand, but the daemon connects to KNX only after a scoped Connect request.
 There is no replay request or version negotiation in this development protocol.
 Durable replay is read from SQLite

@@ -699,7 +699,10 @@ impl MonitorApp {
             LiveSmokePhase::Reconnect {
                 last_id: previous_id,
             } if matches!(model.state, WireState::Connected { .. })
-                && last_id >= previous_id + 50
+                // The loopback tunnel server still retries ACKs to the forcibly
+                // killed first owner, so recovery checks several new frames,
+                // not the pre-disconnect throughput threshold.
+                && last_id >= previous_id + 5
                 && scroll_offset.is_some_and(|offset| offset <= 2.0) =>
             {
                 eprintln!("GUI live smoke: recovered");
@@ -1531,7 +1534,7 @@ mod tests {
         };
         app.live_smoke_step(&ctx, Some(0.0));
         assert!(!result.load(Ordering::Acquire));
-        append_rows(app.model.as_mut().unwrap(), 151, 200);
+        append_rows(app.model.as_mut().unwrap(), 151, 155);
         app.live_smoke_step(&ctx, Some(0.0));
         assert!(result.load(Ordering::Acquire));
     }

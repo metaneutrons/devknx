@@ -28,7 +28,6 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
-#[cfg(unix)]
 use crate::paths;
 
 const MAX_MESSAGE_SIZE: usize = 16 * 1024;
@@ -442,11 +441,9 @@ fn create_private_directory(path: &Path) -> io::Result<()> {
     }
 }
 
-#[cfg(unix)]
 #[derive(Default)]
 struct StableHasher(u64);
 
-#[cfg(unix)]
 impl std::hash::Hasher for StableHasher {
     fn finish(&self) -> u64 {
         self.0
@@ -516,8 +513,16 @@ fn acquire_owner_lease(path: &Path) -> io::Result<File> {
 
 #[cfg(windows)]
 fn pipe_name() -> io::Result<String> {
+    use std::hash::Hasher as _;
+    use std::os::windows::ffi::OsStrExt as _;
+
     let sid = windows_permissions::utilities::current_process_sid()?;
-    Ok(format!("devknx-{sid}-control"))
+    let data_dir = paths::data_dir().map_err(io::Error::other)?;
+    let mut hasher = StableHasher::default();
+    for unit in data_dir.as_os_str().encode_wide() {
+        hasher.write(&unit.to_le_bytes());
+    }
+    Ok(format!("devknx-{sid}-{:016x}-control", hasher.finish()))
 }
 
 #[cfg(windows)]

@@ -45,6 +45,16 @@ fn devknx_application_data_dir(data_dir: &Path) -> PathBuf {
     base.join("devknx")
 }
 
+#[test]
+fn forced_color_never_enters_json_status() {
+    let root = tempfile::tempdir().unwrap();
+    let output = devknx_with_data_dir(&["--color", "always", "daemon", "--status"], root.path());
+    assert!(output.status.success());
+    assert!(!output.stdout.contains(&0x1b));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["running"], false);
+}
+
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut output = String::with_capacity(bytes.len() * 2);

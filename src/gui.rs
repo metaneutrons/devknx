@@ -13,10 +13,35 @@ use devknx::paths;
 use eframe::egui;
 use knx_rs_ip::discovery::GatewayInfo;
 
+use crate::color::{self, Tone};
 use crate::interface::{
     self, ConnectionMode, ConnectionSettings, DisplayCapture, Follower, MonitorModel,
 };
 use crate::platform::{self, MenuAction};
+
+const fn sent_color(dark_mode: bool) -> egui::Color32 {
+    if dark_mode {
+        egui::Color32::from_rgb(105, 205, 240)
+    } else {
+        egui::Color32::from_rgb(0, 95, 150)
+    }
+}
+
+const fn warning_color(dark_mode: bool) -> egui::Color32 {
+    if dark_mode {
+        egui::Color32::from_rgb(255, 200, 90)
+    } else {
+        egui::Color32::from_rgb(145, 90, 0)
+    }
+}
+
+const fn loss_color(dark_mode: bool) -> egui::Color32 {
+    if dark_mode {
+        egui::Color32::from_rgb(255, 110, 110)
+    } else {
+        egui::Color32::from_rgb(175, 35, 35)
+    }
+}
 
 pub fn run(
     database: Option<PathBuf>,
@@ -208,6 +233,7 @@ struct MonitorApp {
     write_value: String,
     preview: Option<(String, String, String, String)>,
     selected: Option<DisplayCapture>,
+    color_enabled: bool,
     window_title: String,
     smoke: Option<SmokeRun>,
     live_smoke: Option<LiveSmoke>,
@@ -220,6 +246,7 @@ impl MonitorApp {
         smoke_live: bool,
     ) -> Self {
         let mut app = Self {
+            color_enabled: color::ui_enabled(),
             rest_bind: "127.0.0.1:8765".into(),
             smoke: smoke_result
                 .clone()
@@ -1221,6 +1248,8 @@ impl MonitorApp {
                 self.show_export = true;
             }
             ui.separator();
+            self.render_color_toggle(ui);
+            ui.separator();
             // Keep the label and editor together when the toolbar wraps.
             if ui.available_size_before_wrap().x < 240.0 {
                 ui.end_row();
@@ -1238,6 +1267,19 @@ impl MonitorApp {
                 );
             }
         });
+    }
+
+    fn render_color_toggle(&mut self, ui: &mut egui::Ui) {
+        let toggle = ui.add_enabled(
+            !color::ui_is_locked(),
+            egui::Checkbox::new(&mut self.color_enabled, "Color"),
+        );
+        if toggle.changed()
+            && let Err(error) = color::save_preference(self.color_enabled)
+        {
+            self.error = Some(format!("Could not save color preference: {error}"));
+        }
+        toggle.on_hover_text("Color changes display only, not captures or exports");
     }
 
     fn render_empty(&mut self, ui: &mut egui::Ui) {
@@ -1360,15 +1402,20 @@ impl MonitorApp {
                         row.label.as_deref().unwrap_or("")
                     )
                 };
-                if ui
-                    .selectable_label(
-                        self.selected
-                            .as_ref()
-                            .is_some_and(|current| current.id == row.id),
-                        egui::RichText::new(text).monospace(),
-                    )
-                    .clicked()
+                let is_selected = self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|current| current.id == row.id);
+                let rich = egui::RichText::new(text).monospace();
+                let rich = if self.color_enabled
+                    && !is_selected
+                    && color::direction_tone(&row.direction) == Tone::Sent
                 {
+                    rich.color(sent_color(ui.visuals().dark_mode))
+                } else {
+                    rich
+                };
+                if ui.selectable_label(is_selected, rich).clicked() {
                     selected = Some((*row).clone());
                 }
             }
@@ -1429,12 +1476,20 @@ impl MonitorApp {
                 ui.separator();
                 ui.label(format!("{} captures", model.rows.len()));
                 ui.separator();
-                ui.label(format!(
-                    "Router losses (session): {}",
-                    model.router_lost_messages
-                ));
+                let router_label =
+                    format!("Router losses (session): {}", model.router_lost_messages);
+                if self.color_enabled && model.router_lost_messages > 0 {
+                    ui.colored_label(loss_color(ui.visuals().dark_mode), router_label);
+                } else {
+                    ui.label(router_label);
+                }
                 ui.separator();
-                ui.label(format!("Local lag (session): {}", model.local_lag_events));
+                let lag_label = format!("Local lag (session): {}", model.local_lag_events);
+                if self.color_enabled && model.local_lag_events > 0 {
+                    ui.colored_label(warning_color(ui.visuals().dark_mode), lag_label);
+                } else {
+                    ui.label(lag_label);
+                }
                 ui.separator();
                 ui.label("History saved locally")
                     .on_hover_text(model.database.display().to_string());

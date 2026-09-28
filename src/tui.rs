@@ -16,6 +16,7 @@ use crossterm::terminal::{
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
+use crate::color::{self, Tone};
 use crate::interface::{self, ConnectionSettings, Follower, MonitorModel};
 use devknx::control::RestStatus;
 use devknx::paths;
@@ -64,6 +65,10 @@ enum Mode {
     ConnectionEndpoint,
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent terminal view and connection state"
+)]
 struct App {
     model: MonitorModel,
     follower: Follower,
@@ -84,6 +89,7 @@ struct App {
     preview: String,
     selected: usize,
     follow_tail: bool,
+    color_enabled: bool,
 }
 
 impl App {
@@ -127,6 +133,7 @@ impl App {
             preview: String::new(),
             selected,
             follow_tail: true,
+            color_enabled: color::ui_enabled(),
         })
     }
 
@@ -503,6 +510,25 @@ impl App {
             self.input.clear();
             return false;
         }
+        if key.code == KeyCode::F(8) {
+            if color::ui_is_locked() {
+                self.model
+                    .notice("Color is controlled by --color or NO_COLOR".into());
+            } else {
+                self.color_enabled = !self.color_enabled;
+                if let Err(error) = color::save_preference(self.color_enabled) {
+                    self.model
+                        .notice(format!("Could not save color preference: {error}"));
+                } else {
+                    self.model.notice(if self.color_enabled {
+                        "Capture colors on".into()
+                    } else {
+                        "Capture colors off".into()
+                    });
+                }
+            }
+            return false;
+        }
         if self.mode == Mode::ConfirmWrite {
             if key.code == KeyCode::Char('y') {
                 match interface::write_request(
@@ -660,8 +686,14 @@ impl App {
                 let text = format!("{} {:8} {:8} {:9} {:15} {:10} {}",
                     interface::format_time(row.timestamp_ms), row.direction, row.source, row.destination,
                     row.service, row.value.as_deref().unwrap_or("—"), row.label.as_deref().unwrap_or(""));
-                let style = if start + index == selected { Style::default().fg(Color::Black).bg(Color::Cyan) }
-                    else { Style::default() };
+                let style = if start + index == selected {
+                    if self.color_enabled { Style::default().fg(Color::Black).bg(Color::Cyan) }
+                    else { Style::default().add_modifier(Modifier::REVERSED) }
+                } else if self.color_enabled && color::direction_tone(&row.direction) == Tone::Sent {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default()
+                };
                 ListItem::new(text).style(style)
             }).collect();
             frame.render_widget(List::new(items).block(Block::default().title(format!(
@@ -674,7 +706,7 @@ impl App {
                     row.value.as_deref().unwrap_or("unknown"), row.raw_cemi));
             frame.render_widget(Paragraph::new(detail).block(Block::default().title(" Details ").borders(Borders::ALL)), areas[2]);
             let prompt = match self.mode {
-                Mode::Normal => "c connect/disconnect · s endpoint · a REST · d discover · / filter · r read · w write · e export · h reload · q quit".to_owned(),
+                Mode::Normal => "c connect/disconnect · s endpoint · a REST · d discover · / filter · r read · w write · e export · h reload · F8 color · q quit".to_owned(),
                 Mode::Filter => format!("Filter: {}", self.input),
                 Mode::Read => format!("Read group address: {}", self.input),
                 Mode::WriteAddress => format!("Write group address: {}", self.input),
@@ -686,7 +718,16 @@ impl App {
                 Mode::ConnectionEndpoint => format!("KNXnet/IP endpoint (tunnel://IP:3671 or router://MULTICAST:3671): {}", self.input),
             };
             let notice = self.model.notices.last().map_or("", String::as_str);
-            frame.render_widget(Paragraph::new(format!("{prompt}\n{notice}"))
+            let notice_style = if self.color_enabled {
+                match color::notice_tone(notice) {
+                    Tone::Error => Style::default().fg(Color::Red),
+                    Tone::Warning => Style::default().fg(Color::Yellow),
+                    Tone::Sent | Tone::Plain => Style::default(),
+                }
+            } else {
+                Style::default()
+            };
+            frame.render_widget(Paragraph::new(vec![Line::raw(prompt), Line::styled(notice, notice_style)])
                 .block(Block::default().borders(Borders::ALL)), areas[3]);
         })?;
         Ok(())

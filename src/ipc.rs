@@ -953,9 +953,25 @@ mod tests {
         let (losses_tx, losses_rx) = broadcast::channel(8);
         let (operations_tx, _operations_rx) = mpsc::channel(8);
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
-        let server = IpcServer::bind(&database)
-            .unwrap()
-            .with_shutdown(shutdown_tx);
+        // On Windows, a client task can retain the previous named-pipe
+        // instance briefly after the listener task is aborted. Rebinding is
+        // valid once that instance closes; any other bind error is immediate.
+        let server = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match IpcServer::bind(&database) {
+                    Ok(server) => break server,
+                    Err(IpcError::Io(error))
+                        if cfg!(windows) && error.kind() == io::ErrorKind::PermissionDenied =>
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("IPC listener could not restart: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("previous Windows named-pipe instance did not close")
+        .with_shutdown(shutdown_tx);
         let task = tokio::spawn(server.run(state_rx, frames_rx, losses_rx, operations_tx));
         IpcClient::stop(&database).await.unwrap();
         assert!(

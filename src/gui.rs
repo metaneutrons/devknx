@@ -1090,12 +1090,6 @@ impl MonitorApp {
             }
             ui.separator();
             if ui
-                .add_enabled(!self.offline_capture, egui::Button::new("Gateways…"))
-                .clicked()
-            {
-                self.discover();
-            }
-            if ui
                 .add_enabled(!self.offline_capture, egui::Button::new("Settings…"))
                 .clicked()
             {
@@ -1135,6 +1129,10 @@ impl MonitorApp {
                 self.show_export = true;
             }
             ui.separator();
+            // Keep the label and editor together when the toolbar wraps.
+            if ui.available_size_before_wrap().x < 240.0 {
+                ui.end_row();
+            }
             ui.label("Filter");
             if let Some(model) = &mut self.model {
                 let id = egui::Id::new("capture-filter");

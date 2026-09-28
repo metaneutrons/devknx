@@ -662,6 +662,10 @@ impl MonitorApp {
             self.settings_draft = self.settings.clone();
             self.show_settings = true;
         }
+        if platform::take(MenuAction::ToggleColor) && !color::ui_is_locked() {
+            self.color_enabled = !self.color_enabled;
+            self.save_color_preference();
+        }
         if platform::take(MenuAction::ToggleConnection) {
             if self
                 .model
@@ -1274,12 +1278,16 @@ impl MonitorApp {
             !color::ui_is_locked(),
             egui::Checkbox::new(&mut self.color_enabled, "Color"),
         );
-        if toggle.changed()
-            && let Err(error) = color::save_preference(self.color_enabled)
-        {
-            self.error = Some(format!("Could not save color preference: {error}"));
+        if toggle.changed() {
+            self.save_color_preference();
         }
         toggle.on_hover_text("Color changes display only, not captures or exports");
+    }
+
+    fn save_color_preference(&mut self) {
+        if let Err(error) = color::save_preference(self.color_enabled) {
+            self.error = Some(format!("Could not save color preference: {error}"));
+        }
     }
 
     fn render_empty(&mut self, ui: &mut egui::Ui) {
@@ -1568,6 +1576,7 @@ impl eframe::App for MonitorApp {
         });
         self.live_smoke_step(&ctx, scroll_offset);
         self.dialogs(&ctx);
+        platform::update_color_menu_state(self.color_enabled, color::ui_is_locked());
     }
 }
 

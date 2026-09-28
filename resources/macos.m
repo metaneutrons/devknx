@@ -9,6 +9,8 @@
 static uint32_t pending_actions = 0;
 static NSString *app_version = @"0.1.0";
 static NSImage *app_icon = nil;
+static NSMenuItem *color_menu_item = nil;
+static BOOL color_menu_locked = NO;
 
 enum {
     ACTION_OPEN_DATABASE = 1 << 0,
@@ -19,6 +21,7 @@ enum {
     ACTION_WRITE = 1 << 5,
     ACTION_TOGGLE_CONNECTION = 1 << 6,
     ACTION_CONNECTION_SETTINGS = 1 << 7,
+    ACTION_TOGGLE_COLOR = 1 << 8,
 };
 
 // The winit view is not an AppKit text view. Deliver standard edit-menu
@@ -56,7 +59,7 @@ static void forward_edit_action(id target, unsigned short key_code,
 - (void)selectAll:(id)sender { (void)sender; forward_edit_action(self, 0, @"a", 0); }
 @end
 
-@interface DevknxMenuHandler : NSObject
+@interface DevknxMenuHandler : NSObject <NSMenuItemValidation>
 - (void)showAbout:(id)sender;
 - (void)openHelp:(id)sender;
 - (void)openDatabase:(id)sender;
@@ -67,9 +70,14 @@ static void forward_edit_action(id target, unsigned short key_code,
 - (void)writeGroup:(id)sender;
 - (void)toggleConnection:(id)sender;
 - (void)connectionSettings:(id)sender;
+- (void)toggleColor:(id)sender;
 @end
 
 @implementation DevknxMenuHandler
+- (BOOL)validateMenuItem:(NSMenuItem *)item {
+    if ([item action] == @selector(toggleColor:)) return !color_menu_locked;
+    return YES;
+}
 - (void)showAbout:(id)sender {
     (void)sender;
     NSMutableDictionary *options = [NSMutableDictionary dictionary];
@@ -93,6 +101,7 @@ static void forward_edit_action(id target, unsigned short key_code,
 - (void)writeGroup:(id)sender { (void)sender; pending_actions |= ACTION_WRITE; }
 - (void)toggleConnection:(id)sender { (void)sender; pending_actions |= ACTION_TOGGLE_CONNECTION; }
 - (void)connectionSettings:(id)sender { (void)sender; pending_actions |= ACTION_CONNECTION_SETTINGS; }
+- (void)toggleColor:(id)sender { (void)sender; pending_actions |= ACTION_TOGGLE_COLOR; }
 @end
 
 static DevknxMenuHandler *menu_handler = nil;
@@ -101,6 +110,12 @@ bool devknx_take_menu_action(uint32_t action) {
     bool requested = (pending_actions & action) != 0;
     pending_actions &= ~action;
     return requested;
+}
+
+void devknx_update_color_menu_state(bool enabled, bool locked) {
+    color_menu_locked = locked;
+    [color_menu_item setState:enabled ? NSControlStateValueOn : NSControlStateValueOff];
+    [color_menu_item setEnabled:!locked];
 }
 
 bool devknx_macos_menu_installed(void) {
@@ -112,7 +127,9 @@ bool devknx_macos_menu_installed(void) {
         NSMenuItem *item = [main itemAtIndex:index];
         if (![[item title] isEqualToString:titles[index]] || ![item submenu]) return false;
     }
-    return [[[[main itemAtIndex:0] submenu] itemWithTitle:@"About devknx"] action] == @selector(showAbout:);
+    NSMenu *view = [[main itemAtIndex:3] submenu];
+    return [[[[main itemAtIndex:0] submenu] itemWithTitle:@"About devknx"] action] == @selector(showAbout:)
+        && [[view itemWithTitle:@"Color"] action] == @selector(toggleColor:);
 }
 
 static void add_item(NSMenu *menu, NSString *title, SEL selector, NSString *key,
@@ -181,6 +198,11 @@ void devknx_init_macos_app(const char *version, const uint8_t *icon, size_t icon
         NSMenu *view = add_menu(main, @"View");
         add_item(view, @"Discover Gateways", @selector(discover:), @"d", menu_handler, NSEventModifierFlagCommand);
         add_item(view, @"Filter Captures", @selector(focusFilter:), @"f", menu_handler, NSEventModifierFlagCommand);
+        [view addItem:[NSMenuItem separatorItem]];
+        add_item(view, @"Color", @selector(toggleColor:), @"", menu_handler, 0);
+        color_menu_item = [view itemWithTitle:@"Color"];
+        [color_menu_item setState:NSControlStateValueOn];
+        [view addItem:[NSMenuItem separatorItem]];
         add_item(view, @"Toggle Full Screen", @selector(toggleFullScreen:), @"f", nil,
                  NSEventModifierFlagCommand | NSEventModifierFlagControl);
 

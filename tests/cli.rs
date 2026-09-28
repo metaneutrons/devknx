@@ -262,6 +262,27 @@ async fn serve_and_monitor_use_the_endpoint_default_database() {
         "second writer unexpectedly opened the capture"
     );
 
+    // `monitor` starts the connection-independent daemon even when the
+    // legacy foreground writer makes Connect fail. Stop it before Windows
+    // rebuilds the executable in the following CI step.
+    let stopped = devknx_with_data_dir(&["daemon", "--stop"], directory.path());
+    assert!(stopped.status.success(), "{:?}", stopped.stderr);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = devknx_with_data_dir(&["daemon", "--status"], directory.path());
+            assert!(status.status.success());
+            if !serde_json::from_slice::<serde_json::Value>(&status.stdout).unwrap()["running"]
+                .as_bool()
+                .expect("boolean daemon status")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("test daemon stopped");
+
     drop(child);
     server.stop().await;
 }

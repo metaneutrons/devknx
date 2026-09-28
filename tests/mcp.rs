@@ -37,7 +37,7 @@ async fn receive(
 }
 
 #[tokio::test]
-async fn stdio_handshake_lists_structured_tools_and_rejects_unprepared_write() {
+async fn stdio_handshake_lists_read_only_tools_and_hides_write_by_default() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("mcp.sqlite");
     CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap();
@@ -75,8 +75,14 @@ async fn stdio_handshake_lists_structured_tools_and_rejects_unprepared_write() {
     .await;
     let listed = receive(&mut lines, 2).await;
     let tools = listed["result"]["tools"].as_array().expect("tool list");
-    assert_eq!(tools.len(), 7);
-    assert!(tools.iter().any(|tool| tool["name"] == "knx_typed_write"));
+    assert_eq!(tools.len(), 8);
+    assert!(!tools.iter().any(|tool| tool["name"] == "knx_typed_write"));
+    assert!(tools.iter().any(|tool| tool["name"] == "knx_list_captures"));
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "knx_list_routing_losses")
+    );
     assert!(
         !tools
             .iter()
@@ -113,8 +119,7 @@ async fn stdio_handshake_lists_structured_tools_and_rejects_unprepared_write() {
     )
     .await;
     let rejected = receive(&mut lines, 5).await;
-    assert_eq!(rejected["result"]["isError"], true);
-    assert!(rejected["result"]["structuredContent"]["error"].is_string());
+    assert!(rejected["error"].is_object());
 
     drop(stdin);
     let status = tokio::time::timeout(Duration::from_secs(5), child.wait())

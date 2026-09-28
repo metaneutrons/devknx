@@ -174,6 +174,7 @@ async fn rest_routes_use_capture_owner_dpt_rules_and_origin_audit() {
     assert_eq!(code, 200);
     assert_eq!(sent["type"], "operation_result");
     assert_eq!(sent["raw_cemi"], preview["raw_cemi"]);
+    assert!(sent["response_enrichment"].is_null());
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(3), gateway.recv())
             .await
@@ -195,6 +196,7 @@ async fn rest_routes_use_capture_owner_dpt_rules_and_origin_audit() {
         .unwrap();
     assert_eq!(code, 200);
     assert_eq!(receipt["read"]["status"], "no_response");
+    assert!(receipt["response_enrichment"].is_null());
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(3), gateway.recv())
             .await

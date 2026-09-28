@@ -122,8 +122,9 @@ The TUI's `a` key toggles a loopback listener after confirmation. The CLI
 also exposes the bind address, bearer token and remote-write policy. See the
 [REST API guide](docs/rest.md) for versioned routes,
 SSE resume, authentication and remote-write policy.
-The MCP adapter is a separate local stdio process; see the [MCP guide](docs/mcp.md)
-for tool names, structured results, bounded search and write semantics.
+The MCP adapter is a separate local stdio process and hides typed writes by
+default. See the [MCP guide](docs/mcp.md) for tool names, structured results,
+bounded search and exact-address write opt-in.
 
 The GUI shows a bounded live/history view with readable local timestamps,
 ETS names and unambiguous DPT-decoded values, a text filter, raw cEMI details,

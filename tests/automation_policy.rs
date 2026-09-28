@@ -79,7 +79,14 @@ struct McpPeer {
 impl McpPeer {
     async fn start(database: &Path) -> Self {
         let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_devknx"))
-            .args(["mcp", "--database", database.to_str().unwrap()])
+            .args([
+                "mcp",
+                "--database",
+                database.to_str().unwrap(),
+                "--allow-writes",
+                "--write-address",
+                "1/2/5",
+            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -271,6 +278,22 @@ async fn cli_rest_and_mcp_cannot_bypass_dpt_policy_and_audit_distinct_origins() 
             .as_str()
             .unwrap()
             .contains("not declared")
+    );
+    let mcp_unlisted = mcp
+        .request(
+            "tools/call",
+            json!({
+                "name": "knx_typed_write",
+                "arguments": { "address": "1/2/4", "dpt": "1.001", "value": "true" }
+            }),
+        )
+        .await;
+    assert_eq!(mcp_unlisted["result"]["isError"], true);
+    assert!(
+        mcp_unlisted["result"]["structuredContent"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not enabled")
     );
     let smuggled_raw = json!({ "address": "1/2/5", "dpt": "1.001", "value": "true", "payload": { "form": "inline", "value": 1 } });
     let (code, _) = http(address, &smuggled_raw).await.unwrap();

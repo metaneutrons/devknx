@@ -1,4 +1,4 @@
-# Initiative plan: devknx (v6)
+# Initiative plan: devknx (v7)
 
 Epic: [devknx initiative](https://github.com/metaneutrons/devknx/issues/3)
 Decision state: product scope agreed with Fabian in September 2026
@@ -79,6 +79,15 @@ occur only at their acceptance stages.
 - Local IPC is restricted to the current user. REST is disabled by default;
   non-loopback binding requires authentication. Remote writes require an
   explicit configuration decision and are logged with their origin.
+- Automation clients see raw captures plus separately versioned, current-ETS
+  enrichment. Router-reported routing losses have their own REST/MCP cursors,
+  never a capture cursor or a bus-wide loss total. REST SSE replays durable
+  history and uses the owner's live feed for wake-ups, with bounded fallback
+  checks if the feed is unavailable.
+- MCP typed writes are absent from the default tool set. Starting a writable
+  stdio adapter requires an explicit switch and at least one exact group
+  address in its allowlist. The existing DPT preparation and audit paths
+  remain mandatory; an allowlist is not a claim of human confirmation.
 - The app icon has one reviewed master asset. Build tooling derives macOS
   `.icns`, Windows `.ico` embedded in the executable, and Linux icon sizes.
   The GUI is a native desktop application, not the browser UI from
@@ -210,10 +219,36 @@ Dependencies: M2 through M5; prerequisite to M6 publication
   operation safety, REST controls, daemon startup races, and shutdown. No
   physical KNX write is required for acceptance.
 
+### M8: Automation contract and safety hardening
+
+Tracking: [M8 issue](https://github.com/metaneutrons/devknx/issues/45)
+Dependencies: M5; coordinates with M7; prerequisite to M6 publication
+
+- M8-A1: REST OpenAPI describes actual conditional bearer security, a valid
+  `WWW-Authenticate` challenge, JSON error shape, route schemas, and bounded
+  request/SSE behavior. Positive and counter-probe tests verify each gate.
+- M8-A2: Router-reported losses have distinct REST page/SSE and MCP cursor
+  access. MCP has unfiltered capture pagination. Both histories retain
+  separate monotonic IDs and retention-gap semantics; local subscriber lag is
+  not misreported as KNX routing loss.
+- M8-A3: GUI, REST and MCP share one versioned additive ETS enrichment model.
+  Captures retain exact raw cEMI bytes, while current ETS names, hierarchy,
+  DPTs and safely decoded values are shown separately. A matching group-read
+  response is enriched without fabricating a response on timeout. Unknown or
+  ambiguous DPTs produce no guessed value.
+- M8-A4: MCP typed writes are not listed or callable by default. A writable
+  adapter requires explicit CLI opt-in and one or more exact allowed group
+  addresses, checked again at invocation. Bounded tool/bus call rates and
+  accurate risk annotations accompany the existing validation and audit path.
+  No physical KNX write is required for acceptance.
+- M8-A5: Documentation, focused integration tests, and supported CI checks
+  verify the adapter contract and misuse cases. This milestone does not
+  publish packages or alter `KnxMonitor`.
+
 ### M6: Publication and migration
 
 Tracking: [M6 issue](https://github.com/metaneutrons/devknx/issues/9)
-Dependencies: M1 through M5 and M7
+Dependencies: M1 through M5, M7 and M8
 
 - M6-A1: A hardened release candidate builds seven GitHub CLI archives, one
   notarized macOS `.app.zip`, one deterministic source archive for the AUR

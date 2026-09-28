@@ -4,16 +4,19 @@
 //! Versioned HTTP adapter over durable history and the sole KNX connection owner.
 
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_stream::stream;
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode, header, uri::Authority};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header, uri::Authority};
 use axum::middleware::{self, Next};
 use axum::response::{
     IntoResponse, Response,
@@ -25,14 +28,49 @@ use knx_rs_core::address::GroupAddress;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq as _;
+use tokio::sync::Semaphore;
 
+use crate::enrichment::{enrich_response_frame, enriched_capture_json};
 use crate::ets::parse_group_address;
-use crate::ipc::{IpcClient, IpcMessage};
+use crate::ipc::{IpcClient, IpcMessage, ReadOutcome};
 use crate::operations::{OperationOrigin, OperationRequest, prepare};
-use crate::service::LiveCapture;
+use crate::service::{LiveCapture, LiveRoutingLoss};
 use crate::storage::CaptureStore;
 
 const MAX_PAGE: u32 = 1_000;
+const REQUESTS_PER_MINUTE: usize = 600;
+const BUS_REQUESTS_PER_MINUTE: usize = 60;
+const MAX_SSE_CLIENTS: usize = 8;
+
+#[derive(Default)]
+struct ApiRate {
+    all: VecDeque<Instant>,
+    bus: VecDeque<Instant>,
+}
+
+impl ApiRate {
+    fn check(&mut self, bus: bool, now: Instant) -> Result<(), &'static str> {
+        for queue in [&mut self.all, &mut self.bus] {
+            while queue
+                .front()
+                .is_some_and(|time| now.duration_since(*time) >= Duration::from_secs(60))
+            {
+                queue.pop_front();
+            }
+        }
+        if self.all.len() >= REQUESTS_PER_MINUTE {
+            return Err("REST request rate limit exceeded");
+        }
+        if bus && self.bus.len() >= BUS_REQUESTS_PER_MINUTE {
+            return Err("REST KNX operation rate limit exceeded");
+        }
+        self.all.push_back(now);
+        if bus {
+            self.bus.push_back(now);
+        }
+        Ok(())
+    }
+}
 
 /// Explicit listener policy. Constructing this value does not start HTTP.
 #[derive(Clone, Debug)]
@@ -85,6 +123,8 @@ impl ApiConfig {
 #[derive(Clone)]
 struct ApiState {
     config: ApiConfig,
+    rate: Arc<Mutex<ApiRate>>,
+    sse_slots: Arc<Semaphore>,
 }
 
 #[derive(Debug)]
@@ -102,8 +142,33 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({ "error": self.1 }))).into_response()
+        let unauthorized = self.0 == StatusCode::UNAUTHORIZED;
+        let mut response = (self.0, Json(json!({ "error": self.1 }))).into_response();
+        if unauthorized {
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                HeaderValue::from_static("Bearer realm=\"devknx\""),
+            );
+        }
+        if self.0 == StatusCode::TOO_MANY_REQUESTS {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+        }
+        response
     }
+}
+
+fn path_extractor_error(rejection: &PathRejection) -> ApiError {
+    ApiError::static_message(rejection.status(), "invalid path parameter")
+}
+
+fn query_extractor_error(rejection: &QueryRejection) -> ApiError {
+    ApiError::static_message(rejection.status(), "invalid query parameters")
+}
+
+fn json_extractor_error(rejection: &JsonRejection) -> ApiError {
+    ApiError::static_message(rejection.status(), "invalid JSON request body")
 }
 
 type ApiResult<T> = Result<T, ApiError>;
@@ -174,19 +239,48 @@ pub async fn run(config: ApiConfig) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn router(config: ApiConfig) -> Router {
-    let state = ApiState { config };
+    let state = ApiState {
+        config,
+        rate: Arc::new(Mutex::new(ApiRate::default())),
+        sse_slots: Arc::new(Semaphore::new(MAX_SSE_CLIENTS)),
+    };
     Router::new()
         .route("/v1/health", get(health))
         .route("/v1/captures", get(captures))
         .route("/v1/events", get(events))
+        .route("/v1/routing-losses", get(routing_losses))
+        .route("/v1/routing-loss-events", get(routing_loss_events))
         .route("/v1/ets/{address}", get(ets_lookup))
         .route("/v1/operations/preview", post(write_preview))
         .route("/v1/operations/typed-write", post(typed_write))
         .route("/v1/operations/read", post(read))
         .route("/v1/openapi.json", get(openapi))
+        .method_not_allowed_fallback(|| async {
+            ApiError::static_message(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
+        })
+        .fallback(|| async { ApiError::static_message(StatusCode::NOT_FOUND, "route not found") })
         .layer(DefaultBodyLimit::max(16 * 1024))
+        .layer(middleware::from_fn_with_state(state.clone(), rate_limit))
         .layer(middleware::from_fn_with_state(state.clone(), authorize))
         .with_state(state)
+}
+
+async fn rate_limit(
+    State(state): State<ApiState>,
+    request: Request,
+    next: Next,
+) -> ApiResult<Response> {
+    let bus = matches!(
+        request.uri().path(),
+        "/v1/operations/read" | "/v1/operations/typed-write"
+    );
+    state
+        .rate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .check(bus, Instant::now())
+        .map_err(|message| ApiError::static_message(StatusCode::TOO_MANY_REQUESTS, message))?;
+    Ok(next.run(request).await)
 }
 
 async fn authorize(
@@ -229,7 +323,9 @@ async fn authorize(
         let authorized = headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
+            .and_then(|value| value.split_once(' '))
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
+            .map(|(_, credentials)| credentials.trim_start_matches(' '))
             .is_some_and(|provided| {
                 provided.len() == token.len()
                     && bool::from(provided.as_bytes().ct_eq(token.as_bytes()))
@@ -276,40 +372,85 @@ struct PageQuery {
 
 #[derive(Serialize)]
 struct CapturePage {
+    items: Vec<Value>,
+    next_after: i64,
+    limit: u32,
+}
+
+#[derive(Serialize)]
+struct RoutingLossPage {
     items: Vec<IpcMessage>,
     next_after: i64,
     limit: u32,
 }
 
-async fn captures(
-    State(state): State<ApiState>,
-    Query(query): Query<PageQuery>,
-) -> ApiResult<Json<CapturePage>> {
+fn page_bounds(query: &PageQuery) -> ApiResult<NonZeroU32> {
     if query.after < 0 {
         return Err(ApiError::static_message(
             StatusCode::BAD_REQUEST,
             "after must be nonnegative",
         ));
     }
-    let limit = query.limit.unwrap_or(100);
-    let limit_nonzero = NonZeroU32::new(limit)
+    NonZeroU32::new(query.limit.unwrap_or(100))
         .filter(|value| value.get() <= MAX_PAGE)
         .ok_or(ApiError::static_message(
             StatusCode::BAD_REQUEST,
             "limit must be 1–1000",
-        ))?;
+        ))
+}
+
+async fn captures(
+    State(state): State<ApiState>,
+    query: Result<Query<PageQuery>, QueryRejection>,
+) -> ApiResult<Json<CapturePage>> {
+    let Query(query) = query.map_err(|error| query_extractor_error(&error))?;
+    let limit_nonzero = page_bounds(&query)?;
+    let limit = limit_nonzero.get();
+    let database = state.config.database.clone();
+    let (items, next_after) = tokio::task::spawn_blocking(move || {
+        let store = CaptureStore::open_existing(&database).map_err(|error| error.to_string())?;
+        let rows = store
+            .read_after(query.after, limit_nonzero)
+            .map_err(|error| error.to_string())?;
+        let next_after = rows.last().map_or(query.after, |row| row.id);
+        let items = rows
+            .into_iter()
+            .map(|row| {
+                enriched_capture_json(&capture_message(row), &store)
+                    .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok::<_, String>((items, next_after))
+    })
+    .await
+    .map_err(|_| internal_error())?
+    .map_err(|_| internal_error())?;
+    Ok(Json(CapturePage {
+        items,
+        next_after,
+        limit,
+    }))
+}
+
+async fn routing_losses(
+    State(state): State<ApiState>,
+    query: Result<Query<PageQuery>, QueryRejection>,
+) -> ApiResult<Json<RoutingLossPage>> {
+    let Query(query) = query.map_err(|error| query_extractor_error(&error))?;
+    let limit_nonzero = page_bounds(&query)?;
     let database = state.config.database.clone();
     let rows = tokio::task::spawn_blocking(move || {
-        CaptureStore::open_existing(&database)?.read_after(query.after, limit_nonzero)
+        CaptureStore::open_existing(&database)?
+            .read_routing_losses_after(query.after, limit_nonzero)
     })
     .await
     .map_err(|_| internal_error())?
     .map_err(|_| internal_error())?;
     let next_after = rows.last().map_or(query.after, |row| row.id);
-    Ok(Json(CapturePage {
-        items: rows.into_iter().map(capture_message).collect(),
+    Ok(Json(RoutingLossPage {
+        items: rows.into_iter().map(routing_loss_message).collect(),
         next_after,
-        limit,
+        limit: limit_nonzero.get(),
     }))
 }
 
@@ -320,10 +461,18 @@ fn capture_message(row: crate::storage::StoredCapture) -> IpcMessage {
     })
 }
 
+fn routing_loss_message(row: crate::storage::StoredRoutingLoss) -> IpcMessage {
+    IpcMessage::from(&LiveRoutingLoss {
+        id: Some(row.id),
+        event: row.event,
+    })
+}
+
 async fn ets_lookup(
     State(state): State<ApiState>,
-    Path(address): Path<String>,
+    path: Result<Path<String>, PathRejection>,
 ) -> ApiResult<Json<Value>> {
+    let Path(address) = path.map_err(|error| path_extractor_error(&error))?;
     let address = parse_group_address(&address)
         .map_err(|_| ApiError::static_message(StatusCode::BAD_REQUEST, "invalid group address"))?;
     let database = state.config.database.clone();
@@ -364,8 +513,9 @@ impl TypedInput {
 
 async fn write_preview(
     State(state): State<ApiState>,
-    Json(input): Json<TypedInput>,
+    input: Result<Json<TypedInput>, JsonRejection>,
 ) -> ApiResult<Json<Value>> {
+    let Json(input) = input.map_err(|error| json_extractor_error(&error))?;
     let request = input.request()?;
     let OperationRequest::TypedWrite { address_raw, .. } = request else {
         unreachable!("typed input only constructs typed writes")
@@ -391,14 +541,15 @@ async fn write_preview(
 
 async fn typed_write(
     State(state): State<ApiState>,
-    Json(input): Json<TypedInput>,
-) -> ApiResult<Json<IpcMessage>> {
+    input: Result<Json<TypedInput>, JsonRejection>,
+) -> ApiResult<Json<Value>> {
     if !state.config.writes_allowed() {
         return Err(ApiError::static_message(
             StatusCode::FORBIDDEN,
             "remote writes are disabled",
         ));
     }
+    let Json(input) = input.map_err(|error| json_extractor_error(&error))?;
     let request = input.request()?;
     operate(&state, request).await
 }
@@ -417,8 +568,9 @@ const fn default_read_timeout() -> u32 {
 
 async fn read(
     State(state): State<ApiState>,
-    Json(input): Json<ReadInput>,
-) -> ApiResult<Json<IpcMessage>> {
+    input: Result<Json<ReadInput>, JsonRejection>,
+) -> ApiResult<Json<Value>> {
+    let Json(input) = input.map_err(|error| json_extractor_error(&error))?;
     let address_raw = parse_group_address(&input.address)
         .map_err(|_| ApiError::static_message(StatusCode::BAD_REQUEST, "invalid group address"))?
         .raw();
@@ -438,14 +590,41 @@ async fn read(
     .await
 }
 
-async fn operate(state: &ApiState, request: OperationRequest) -> ApiResult<Json<IpcMessage>> {
+async fn operate(state: &ApiState, request: OperationRequest) -> ApiResult<Json<Value>> {
     let result = IpcClient::operate_as(&state.config.database, &request, state.config.origin())
         .await
         .map_err(|_| {
             ApiError::static_message(StatusCode::SERVICE_UNAVAILABLE, "capture owner unavailable")
         })?;
     match result {
-        IpcMessage::OperationResult { .. } => Ok(Json(result)),
+        IpcMessage::OperationResult { ref read, .. } => {
+            let response_raw = match read {
+                Some(ReadOutcome::Response { raw_cemi }) => Some(raw_cemi.clone()),
+                _ => None,
+            };
+            let enrichment = if let Some(raw_cemi) = response_raw {
+                let database = state.config.database.clone();
+                tokio::task::spawn_blocking(move || {
+                    let store = CaptureStore::open_existing(&database)
+                        .map_err(|error| error.to_string())?;
+                    enrich_response_frame(&raw_cemi, &store).map_err(|error| error.to_string())
+                })
+                .await
+                .map_err(|_| internal_error())?
+                .map_err(|_| internal_error())?
+            } else {
+                None
+            };
+            let mut value = serde_json::to_value(result).expect("operation result serializes");
+            value
+                .as_object_mut()
+                .expect("operation result serializes as object")
+                .insert(
+                    "response_enrichment".into(),
+                    serde_json::to_value(enrichment).expect("response enrichment serializes"),
+                );
+            Ok(Json(value))
+        }
         IpcMessage::OperationError { reason } => {
             Err(ApiError::dynamic(StatusCode::UNPROCESSABLE_ENTITY, reason))
         }
@@ -460,9 +639,56 @@ struct EventQuery {
 
 async fn events(
     State(state): State<ApiState>,
-    Query(query): Query<EventQuery>,
+    query: Result<Query<EventQuery>, QueryRejection>,
     headers: HeaderMap,
 ) -> ApiResult<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>>> {
+    let Query(query) = query.map_err(|error| query_extractor_error(&error))?;
+    let cursor = event_cursor(&query, &headers)?;
+    let permit = state.sse_slots.clone().try_acquire_owned().map_err(|_| {
+        ApiError::static_message(StatusCode::TOO_MANY_REQUESTS, "too many active SSE clients")
+    })?;
+    let database = state.config.database;
+    let event_stream = stream! {
+        let _permit = permit;
+        let mut cursor = cursor;
+        let mut live = IpcClient::connect(&database, true).await.ok();
+        loop {
+            let path = database.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let store = CaptureStore::open_existing(&path).map_err(|error| error.to_string())?;
+                let rows = store.read_after(cursor, NonZeroU32::new(100).expect("nonzero")).map_err(|error| error.to_string())?;
+                rows.into_iter()
+                    .map(|row| {
+                        let id = row.id;
+                        enriched_capture_json(&capture_message(row), &store)
+                            .map(|value| (id, value))
+                            .map_err(|error| error.to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            }).await;
+            if let Ok(Ok(rows)) = result {
+                if rows.is_empty() {
+                    wait_for_live(&mut live, &database, cursor, false).await;
+                }
+                for (id, value) in rows {
+                    if id > cursor.saturating_add(1) {
+                        let data = json!({ "after": cursor, "next_available": id });
+                        yield Ok(Event::default().event("retention_gap").data(data.to_string()));
+                    }
+                    cursor = id;
+                    let data = value.to_string();
+                    yield Ok(Event::default().event("capture").id(cursor.to_string()).data(data));
+                }
+            } else {
+                yield Ok(Event::default().event("error").data("capture database unavailable"));
+                break;
+            }
+        }
+    };
+    Ok(Sse::new(event_stream).keep_alive(KeepAlive::default()))
+}
+
+fn event_cursor(query: &EventQuery, headers: &HeaderMap) -> ApiResult<i64> {
     let last_id = headers.get("last-event-id").map(|value| {
         value
             .to_str()
@@ -491,17 +717,32 @@ async fn events(
             "event cursor must be nonnegative",
         ));
     }
+    Ok(cursor)
+}
+
+async fn routing_loss_events(
+    State(state): State<ApiState>,
+    query: Result<Query<EventQuery>, QueryRejection>,
+    headers: HeaderMap,
+) -> ApiResult<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>>> {
+    let Query(query) = query.map_err(|error| query_extractor_error(&error))?;
+    let cursor = event_cursor(&query, &headers)?;
+    let permit = state.sse_slots.clone().try_acquire_owned().map_err(|_| {
+        ApiError::static_message(StatusCode::TOO_MANY_REQUESTS, "too many active SSE clients")
+    })?;
     let database = state.config.database;
     let event_stream = stream! {
+        let _permit = permit;
         let mut cursor = cursor;
+        let mut live = IpcClient::connect(&database, true).await.ok();
         loop {
             let path = database.clone();
             let result = tokio::task::spawn_blocking(move || {
-                CaptureStore::open_existing(&path)?.read_after(cursor, NonZeroU32::new(100).expect("nonzero"))
+                CaptureStore::open_existing(&path)?.read_routing_losses_after(cursor, NonZeroU32::new(100).expect("nonzero"))
             }).await;
             if let Ok(Ok(rows)) = result {
                 if rows.is_empty() {
-                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    wait_for_live(&mut live, &database, cursor, true).await;
                 }
                 for row in rows {
                     if row.id > cursor.saturating_add(1) {
@@ -509,11 +750,11 @@ async fn events(
                         yield Ok(Event::default().event("retention_gap").data(data.to_string()));
                     }
                     cursor = row.id;
-                    let data = serde_json::to_string(&capture_message(row)).expect("capture message serializes");
-                    yield Ok(Event::default().event("capture").id(cursor.to_string()).data(data));
+                    let data = serde_json::to_string(&routing_loss_message(row)).expect("router-loss message serializes");
+                    yield Ok(Event::default().event("routing_loss").id(cursor.to_string()).data(data));
                 }
             } else {
-                yield Ok(Event::default().event("error").data("capture database unavailable"));
+                yield Ok(Event::default().event("error").data("router-loss database unavailable"));
                 break;
             }
         }
@@ -521,10 +762,51 @@ async fn events(
     Ok(Sse::new(event_stream).keep_alive(KeepAlive::default()))
 }
 
-async fn openapi() -> Json<Value> {
-    Json(json!({
+async fn wait_for_live(
+    live: &mut Option<IpcClient>,
+    database: &std::path::Path,
+    cursor: i64,
+    routing_losses: bool,
+) {
+    if let Some(client) = live {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            match tokio::time::timeout(remaining, client.next()).await {
+                Ok(Ok(Some(IpcMessage::Capture { id: Some(id), .. })))
+                    if !routing_losses && id > cursor =>
+                {
+                    return;
+                }
+                Ok(Ok(Some(IpcMessage::RoutingLostMessage { id: Some(id), .. })))
+                    if routing_losses && id > cursor =>
+                {
+                    return;
+                }
+                Ok(Ok(Some(IpcMessage::Lagged { .. }))) | Err(_) => return,
+                Ok(Ok(Some(_))) => {}
+                Ok(Ok(None) | Err(_)) => {
+                    *live = None;
+                    break;
+                }
+            }
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    *live = IpcClient::connect(database, true).await.ok();
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the complete OpenAPI route and schema document is kept in one auditable value"
+)]
+async fn openapi(State(state): State<ApiState>) -> Json<Value> {
+    let mut document = json!({
         "openapi": "3.1.0",
-        "info": { "title": "devknx REST API", "version": "1.0.0", "description": "Bearer authentication is required when a token is configured and always for non-loopback bindings. Remote typed writes additionally require explicit enablement. Raw writes are not exposed." },
+        "info": { "title": "devknx REST API", "version": env!("CARGO_PKG_VERSION"), "description": "Bearer authentication is required when a token is configured and always for non-loopback bindings. Remote typed writes additionally require explicit enablement. Raw writes are not exposed." },
         "paths": {
             "/v1/health": { "get": { "operationId": "health", "responses": { "200": { "description": "API and capture owner state", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Health" } } } } } } },
             "/v1/captures": { "get": { "operationId": "listCaptures", "parameters": [
@@ -535,6 +817,14 @@ async fn openapi() -> Json<Value> {
                 { "name": "after", "in": "query", "schema": { "type": "integer", "minimum": 0 } },
                 { "name": "Last-Event-ID", "in": "header", "schema": { "type": "integer", "minimum": 0 } }
             ], "responses": { "200": { "description": "Resumable capture events", "content": { "text/event-stream": { "schema": { "type": "string" } } } } } } },
+            "/v1/routing-losses": { "get": { "operationId": "listRoutingLosses", "parameters": [
+                { "name": "after", "in": "query", "schema": { "type": "integer", "minimum": 0 } },
+                { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000 } }
+            ], "responses": { "200": { "description": "Separate router-loss cursor page", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RoutingLossPage" } } } } } } },
+            "/v1/routing-loss-events": { "get": { "operationId": "streamRoutingLosses", "parameters": [
+                { "name": "after", "in": "query", "schema": { "type": "integer", "minimum": 0 } },
+                { "name": "Last-Event-ID", "in": "header", "schema": { "type": "integer", "minimum": 0 } }
+            ], "responses": { "200": { "description": "Resumable router-loss events", "content": { "text/event-stream": { "schema": { "type": "string" } } } } } } },
             "/v1/ets/{address}": { "get": { "operationId": "lookupEts", "parameters": [
                 { "name": "address", "in": "path", "required": true, "schema": { "type": "string" } }
             ], "responses": { "200": { "description": "Active ETS group metadata", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EtsLookup" } } } } } } },
@@ -546,15 +836,31 @@ async fn openapi() -> Json<Value> {
         "components": {
             "securitySchemes": { "bearer": { "type": "http", "scheme": "bearer" } },
             "schemas": {
-                "Capture": { "type": "object", "required": ["type", "id", "observed_at_ms", "endpoint", "direction", "source", "destination", "service", "raw_cemi"], "properties": {
+                "Capture": { "type": "object", "required": ["type", "id", "observed_at_ms", "endpoint", "direction", "source", "destination", "service", "raw_cemi", "enrichment"], "properties": {
                     "type": { "const": "capture" }, "id": { "type": "integer", "minimum": 1 },
                     "observed_at_ms": { "type": "integer", "minimum": 0 }, "endpoint": { "type": "string" },
                     "direction": { "type": "string" }, "source": { "type": "string" },
                     "destination": { "type": "string" }, "service": { "type": "string" },
-                    "raw_cemi": { "type": "string", "pattern": "^[0-9a-f]+$" }
+                    "raw_cemi": { "type": "string", "pattern": "^[0-9a-f]+$" },
+                    "enrichment": { "$ref": "#/components/schemas/CaptureEnrichment" }
+                } },
+                "CaptureEnrichment": { "type": "object", "required": ["schema_version", "ets_revision", "group_name", "hierarchy", "dpts", "value"], "properties": {
+                    "schema_version": { "const": 1 }, "ets_revision": { "type": ["integer", "null"] },
+                    "group_name": { "type": ["string", "null"] }, "hierarchy": { "type": "array", "items": { "type": "string" } },
+                    "dpts": { "type": "array", "items": { "type": "string" } }, "value": { "type": ["string", "null"] }
                 } },
                 "CapturePage": { "type": "object", "required": ["items", "next_after", "limit"], "properties": {
                     "items": { "type": "array", "items": { "$ref": "#/components/schemas/Capture" } },
+                    "next_after": { "type": "integer", "minimum": 0 }, "limit": { "type": "integer", "minimum": 1, "maximum": 1000 }
+                } },
+                "RoutingLoss": { "type": "object", "required": ["type", "id", "observed_at_ms", "endpoint", "source", "device_state", "lost_messages"], "properties": {
+                    "type": { "const": "routing_lost_message" }, "id": { "type": "integer", "minimum": 1 },
+                    "observed_at_ms": { "type": "integer", "minimum": 0 }, "endpoint": { "type": "string" },
+                    "source": { "type": "string" }, "device_state": { "type": "integer", "minimum": 0, "maximum": 255 },
+                    "lost_messages": { "type": "integer", "minimum": 0, "maximum": 65535 }
+                } },
+                "RoutingLossPage": { "type": "object", "required": ["items", "next_after", "limit"], "properties": {
+                    "items": { "type": "array", "items": { "$ref": "#/components/schemas/RoutingLoss" } },
                     "next_after": { "type": "integer", "minimum": 0 }, "limit": { "type": "integer", "minimum": 1, "maximum": 1000 }
                 } },
                 "Health": { "type": "object", "required": ["api", "capture_owner", "ets_revision", "writes_allowed"], "properties": {
@@ -569,10 +875,14 @@ async fn openapi() -> Json<Value> {
                     "address_raw": { "type": "integer", "minimum": 0, "maximum": 65535 }, "dpt": { "type": "string" },
                     "raw_cemi": { "type": "string", "pattern": "^[0-9a-f]+$" }, "transmitted": { "const": false }
                 } },
-                "OperationResult": { "type": "object", "required": ["type", "audit_id", "capture_id", "raw_cemi", "read"], "properties": {
+                "OperationResult": { "type": "object", "required": ["type", "audit_id", "capture_id", "raw_cemi", "read", "response_enrichment"], "properties": {
                     "type": { "const": "operation_result" }, "audit_id": { "type": "integer", "minimum": 1 },
                     "capture_id": { "type": "integer", "minimum": 1 }, "raw_cemi": { "type": "string", "pattern": "^[0-9a-f]+$" },
-                    "read": { "type": ["object", "null"] }
+                    "read": { "type": ["object", "null"] },
+                    "response_enrichment": { "anyOf": [{ "$ref": "#/components/schemas/CaptureEnrichment" }, { "type": "null" }] }
+                } },
+                "ApiError": { "type": "object", "required": ["error"], "properties": {
+                    "error": { "type": "string" }
                 } }
             },
             "requestBodies": {
@@ -584,7 +894,53 @@ async fn openapi() -> Json<Value> {
                 } } } } }
             }
         }
-    }))
+    });
+    if let Some(paths) = document.get_mut("paths").and_then(Value::as_object_mut) {
+        for path_item in paths.values_mut() {
+            let Some(operations) = path_item.as_object_mut() else {
+                continue;
+            };
+            for operation in operations.values_mut() {
+                let Some(operation) = operation.as_object_mut() else {
+                    continue;
+                };
+                if state.config.token.is_some() {
+                    operation.insert("security".into(), json!([{ "bearer": [] }]));
+                }
+                let responses = operation
+                    .entry("responses")
+                    .or_insert_with(|| json!({}))
+                    .as_object_mut()
+                    .expect("OpenAPI responses are objects");
+                responses.insert(
+                    "default".into(),
+                    json!({
+                        "description": "API error",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } }
+                    }),
+                );
+                responses.insert(
+                    "429".into(),
+                    json!({
+                        "description": "Request or SSE concurrency limit exceeded",
+                        "headers": { "Retry-After": { "schema": { "type": "integer", "minimum": 0 } } },
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } }
+                    }),
+                );
+                if state.config.token.is_some() {
+                    responses.insert(
+                        "401".into(),
+                        json!({
+                            "description": "Bearer authentication required",
+                            "headers": { "WWW-Authenticate": { "schema": { "type": "string" } } },
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } }
+                        }),
+                    );
+                }
+            }
+        }
+    }
+    Json(document)
 }
 
 const fn internal_error() -> ApiError {
@@ -606,7 +962,8 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::{CaptureEndpoint, CaptureEvent};
+    use crate::capture::{CaptureEndpoint, CaptureEvent, RoutingLossEvent};
+    use crate::ets::{CsvEncoding, EtsCatalog, EtsFormat};
     use axum::body::{Body, to_bytes};
     use axum::http::{Method, Request};
     use futures_util::StreamExt as _;
@@ -614,6 +971,7 @@ mod tests {
     use knx_rs_core::cemi::CemiFrame;
     use knx_rs_core::message::MessageCode;
     use knx_rs_core::types::Priority;
+    use knx_rs_ip::RoutingLostMessage;
     use tower::ServiceExt as _;
 
     fn config(database: PathBuf) -> ApiConfig {
@@ -644,6 +1002,35 @@ mod tests {
         .unwrap()
     }
 
+    async fn raw_request(
+        app: Router,
+        method: Method,
+        path: &str,
+        body: &str,
+        content_type: Option<&str>,
+    ) -> Response {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::HOST, "127.0.0.1:8765");
+        if let Some(content_type) = content_type {
+            request = request.header(header::CONTENT_TYPE, content_type);
+        }
+        app.oneshot(request.body(Body::from(body.to_owned())).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn assert_api_error(response: Response, status: StatusCode) -> Value {
+        assert_eq!(response.status(), status);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert!(error["error"].is_string(), "{error}");
+        assert_eq!(error.as_object().unwrap().len(), 1, "{error}");
+        error
+    }
+
     #[test]
     fn external_bind_fails_closed_without_secret_and_writes_remain_separate() {
         let mut config = config(PathBuf::from("unused"));
@@ -654,6 +1041,98 @@ mod tests {
         assert!(!config.writes_allowed());
         config.allow_remote_writes = true;
         assert!(config.writes_allowed());
+    }
+
+    #[test]
+    fn rest_rate_limits_bus_actions_separately_and_recovers_after_window() {
+        let mut rate = ApiRate::default();
+        let now = Instant::now();
+        for _ in 0..BUS_REQUESTS_PER_MINUTE {
+            assert!(rate.check(true, now).is_ok());
+        }
+        assert!(rate.check(true, now).is_err());
+        assert!(rate.check(false, now).is_ok());
+        assert!(rate.check(true, now + Duration::from_secs(60)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn sse_client_cap_rejects_excess_streams_with_retry_hint() {
+        let app = router(config(PathBuf::from("unused")));
+        let mut streams = Vec::new();
+        for _ in 0..MAX_SSE_CLIENTS {
+            let response = request(app.clone(), Method::GET, "/v1/events", None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            streams.push(response);
+        }
+        let rejected = request(app.clone(), Method::GET, "/v1/routing-loss-events", None).await;
+        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(rejected.headers()[header::RETRY_AFTER], "60");
+        drop(streams.pop());
+        let recovered = request(app, Method::GET, "/v1/routing-loss-events", None).await;
+        assert_eq!(recovered.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn capture_enrichment_and_router_loss_history_have_distinct_cursors() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("api.sqlite");
+        let mut store = CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap();
+        let xml = br#"<GroupAddress-Export xmlns="http://knx.org/xml/ga-export/01"><GroupRange Name="Lighting"><GroupAddress Name="Desk" Address="1/2/3" DPTs="DPT-1-1" /></GroupRange></GroupAddress-Export>"#;
+        let catalog = EtsCatalog::from_bytes(xml, EtsFormat::GaXml01, CsvEncoding::Utf8).unwrap();
+        store.import_ets(&catalog).unwrap();
+        let frame = CemiFrame::new_l_data(
+            MessageCode::LDataInd,
+            IndividualAddress::from_raw(0x1101),
+            DestinationAddress::Group(GroupAddress::from_raw(0x0a03)),
+            Priority::Low,
+            &[0x00, 0x80, 1],
+        );
+        store
+            .insert(&CaptureEvent::received(
+                CaptureEndpoint::Tunnel("127.0.0.1:3671".parse().unwrap()),
+                frame,
+            ))
+            .unwrap();
+        store
+            .insert_routing_loss(&RoutingLossEvent::received(
+                CaptureEndpoint::Router("224.0.23.12:3671".parse().unwrap()),
+                RoutingLostMessage {
+                    source: "192.0.2.2:3671".parse().unwrap(),
+                    device_state: 3,
+                    lost_messages: 7,
+                },
+            ))
+            .unwrap();
+        drop(store);
+        let app = router(config(database));
+        let response = request(app.clone(), Method::GET, "/v1/captures?limit=1", None).await;
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let captures: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(captures["items"][0]["enrichment"]["group_name"], "Desk");
+        assert_eq!(captures["items"][0]["enrichment"]["value"], "true");
+        assert_eq!(captures["next_after"], 1);
+        let response = request(app.clone(), Method::GET, "/v1/routing-losses?limit=1", None).await;
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let losses: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(losses["items"][0]["type"], "routing_lost_message");
+        assert_eq!(losses["items"][0]["lost_messages"], 7);
+        assert_eq!(losses["next_after"], 1);
+        let response = request(app.clone(), Method::GET, "/v1/routing-losses?after=1", None).await;
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let empty: Value = serde_json::from_slice(&body).unwrap();
+        assert!(empty["items"].as_array().unwrap().is_empty());
+
+        let response = request(app, Method::GET, "/v1/routing-loss-events?after=0", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body().into_data_stream();
+        let chunk = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8(chunk.to_vec()).unwrap();
+        assert!(text.contains("event: routing_loss"), "{text}");
+        assert!(text.contains("id: 1"), "{text}");
     }
 
     #[tokio::test]
@@ -710,6 +1189,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openapi_declares_configured_bearer_security_and_api_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("api.sqlite");
+        CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap();
+
+        let public_app = router(config(database.clone()));
+        let response = request(public_app, Method::GET, "/v1/openapi.json", None).await;
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let public_schema: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            public_schema["components"]["schemas"]["ApiError"]["required"],
+            json!(["error"])
+        );
+        for path in public_schema["paths"].as_object().unwrap().values() {
+            for operation in path.as_object().unwrap().values() {
+                assert!(operation.get("security").is_none());
+                assert_eq!(
+                    operation["responses"]["default"]["content"]["application/json"]["schema"]["$ref"],
+                    "#/components/schemas/ApiError"
+                );
+            }
+        }
+
+        let mut secured_config = config(database);
+        secured_config.token = Some("s".repeat(32));
+        let secured_app = router(secured_config);
+        let unauthorized =
+            request(secured_app.clone(), Method::GET, "/v1/openapi.json", None).await;
+        assert_eq!(
+            unauthorized.headers()[header::WWW_AUTHENTICATE],
+            "Bearer realm=\"devknx\""
+        );
+        assert_api_error(unauthorized, StatusCode::UNAUTHORIZED).await;
+
+        let response = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/openapi.json")
+            .header(header::HOST, "127.0.0.1:8765")
+            .header(header::AUTHORIZATION, format!("bEaReR  {}", "s".repeat(32)))
+            .body(Body::empty())
+            .unwrap();
+        let response = secured_app.oneshot(response).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let secured_schema: Value = serde_json::from_slice(&body).unwrap();
+        for path in secured_schema["paths"].as_object().unwrap().values() {
+            for operation in path.as_object().unwrap().values() {
+                assert_eq!(operation["security"], json!([{ "bearer": [] }]));
+                assert_eq!(
+                    operation["responses"]["401"]["headers"]["WWW-Authenticate"]["schema"]["type"],
+                    "string"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn path_query_and_json_extractor_rejections_use_api_error_shape() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("api.sqlite");
+        CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap();
+        let app = router(config(database));
+
+        assert_api_error(
+            request(app.clone(), Method::GET, "/v1/ets/%FF", None).await,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_api_error(
+            request(
+                app.clone(),
+                Method::GET,
+                "/v1/captures?limit=not-a-number",
+                None,
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_api_error(
+            raw_request(
+                app.clone(),
+                Method::POST,
+                "/v1/operations/preview",
+                "{invalid",
+                Some("application/json"),
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_api_error(
+            raw_request(
+                app.clone(),
+                Method::POST,
+                "/v1/operations/preview",
+                "{}",
+                Some("text/plain"),
+            )
+            .await,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        )
+        .await;
+        assert_api_error(
+            raw_request(
+                app,
+                Method::POST,
+                "/v1/operations/preview",
+                &" ".repeat(16 * 1024 + 1),
+                Some("application/json"),
+            )
+            .await,
+            StatusCode::PAYLOAD_TOO_LARGE,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unknown_routes_and_methods_use_api_error_shape() {
+        let app = router(config(PathBuf::from("unused")));
+        assert_api_error(
+            request(app.clone(), Method::GET, "/v1/not-a-route", None).await,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_api_error(
+            request(app, Method::POST, "/v1/health", Some(json!({}))).await,
+            StatusCode::METHOD_NOT_ALLOWED,
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn typed_preview_uses_shared_dpt_validation() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("api.sqlite");
@@ -746,6 +1358,10 @@ mod tests {
             .unwrap();
         let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers()[header::WWW_AUTHENTICATE],
+            "Bearer realm=\"devknx\""
+        );
         let request = Request::builder()
             .method(Method::POST)
             .uri("/v1/operations/typed-write")

@@ -21,6 +21,8 @@ devknx rest --status
 curl http://127.0.0.1:8765/v1/health
 curl 'http://127.0.0.1:8765/v1/captures?after=0&limit=100'
 curl -N -H 'Last-Event-ID: 42' http://127.0.0.1:8765/v1/events
+curl 'http://127.0.0.1:8765/v1/routing-losses?after=0&limit=100'
+curl -N http://127.0.0.1:8765/v1/routing-loss-events
 curl http://127.0.0.1:8765/v1/openapi.json
 devknx rest --disable
 ```
@@ -31,8 +33,20 @@ exclusive cursor; `limit` is 1–1000. SSE emits `capture` events with the same
 IDs. Reconnect using `Last-Event-ID` or `?after=`, not both. If retention has
 removed events between the requested cursor and the next available ID, SSE
 first emits `retention_gap` with `after` and `next_available`. It does not
-claim to reconstruct discarded events. The stream polls the durable database,
-so an API restart does not erase the resume cursor.
+claim to reconstruct discarded events. The stream replays from the durable
+database and follows the capture owner's local live feed for wake-ups. If that
+feed is temporarily unavailable, it checks the database once per second. An
+API restart does not erase the resume cursor.
+
+Router-reported `RoutingLostMessage` diagnostics use a separate history and
+SSE cursor. `/v1/routing-losses` pages that history and
+`/v1/routing-loss-events` emits `routing_loss` events with resumable IDs and
+retention-gap notices. Capture IDs and router-loss IDs must not be mixed.
+Router reports are distinct from local subscriber lag and do not establish a
+bus-wide loss total. Each capture response additionally has a versioned
+`enrichment` object with the active ETS revision, name, hierarchy, declared
+DPTs and a decoded value when one DPT permits it. The raw cEMI and stored
+capture are unchanged when ETS metadata is updated.
 
 ```sh
 curl -X POST http://127.0.0.1:8765/v1/operations/preview \
@@ -47,6 +61,9 @@ curl -X POST http://127.0.0.1:8765/v1/operations/typed-write \
 Preview does not transmit. Typed writes and group reads use the capture
 owner's existing DPT validation, transmission and audit path. The response
 records a transport receipt, not confirmation that an actuator changed state.
+Operation results include `response_enrichment`: it is `null` for writes and
+read timeouts, and contains current ETS metadata and a decoded value when a
+matching group-value response is observed and its DPT is unambiguous.
 Raw writes are deliberately absent from REST. Operation attempts that pass
 preparation are audited with `rest_loopback` or `rest_remote` as their origin.
 
@@ -61,6 +78,12 @@ the command line or in the repository. Non-loopback writes remain disabled
 unless `--allow-remote-writes` is supplied as a separate explicit choice.
 The loopback listener rejects cross-site browser requests and unexpected Host
 headers.
+
+The listener limits traffic to 600 requests and 60 KNX read/write requests per
+rolling minute. At most eight SSE clients can remain connected across both
+streams. Excess requests receive JSON `429` with `Retry-After: 60`; failed
+authentication is checked before consuming a rate-limit slot. These bounds
+protect the local daemon but are not a substitute for network access control.
 
 The built-in HTTP listener does **not** provide TLS. A bearer token on plain
 HTTP is visible to anyone who can observe that network path. Do not expose a

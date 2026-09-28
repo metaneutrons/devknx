@@ -3,10 +3,13 @@
 
 //! Local MCP stdio adapter. All bus actions remain with the capture owner.
 
+use std::collections::BTreeSet;
+use std::collections::VecDeque;
 use std::net::Ipv4Addr;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use knx_rs_core::address::GroupAddress;
 use knx_rs_ip::discovery;
@@ -21,22 +24,78 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::enrichment::{enrich_response_frame, enriched_capture_json};
 use crate::ets::parse_group_address;
-use crate::ipc::{IpcClient, IpcMessage};
+use crate::ipc::{IpcClient, IpcMessage, ReadOutcome};
 use crate::operations::{OperationOrigin, OperationRequest, prepare};
-use crate::service::LiveCapture;
+use crate::service::{LiveCapture, LiveRoutingLoss};
 use crate::storage::CaptureStore;
 
 const SEARCH_SCAN_LIMIT: u32 = 10_000;
+const TOOL_CALLS_PER_MINUTE: usize = 120;
+const BUS_CALLS_PER_MINUTE: usize = 12;
+const DISCOVERY_CALLS_PER_MINUTE: usize = 6;
+
+#[derive(Default)]
+struct RateState {
+    all: VecDeque<Instant>,
+    bus: VecDeque<Instant>,
+    discovery: VecDeque<Instant>,
+}
+
+#[derive(Clone, Copy)]
+enum ToolKind {
+    Local,
+    Bus,
+    Discovery,
+}
+
+impl RateState {
+    fn check(&mut self, kind: ToolKind, now: Instant) -> Result<(), &'static str> {
+        let window = Duration::from_secs(60);
+        for queue in [&mut self.all, &mut self.bus, &mut self.discovery] {
+            while queue
+                .front()
+                .is_some_and(|time| now.duration_since(*time) >= window)
+            {
+                queue.pop_front();
+            }
+        }
+        if self.all.len() >= TOOL_CALLS_PER_MINUTE {
+            return Err("MCP tool rate limit exceeded (120 calls per minute)");
+        }
+        match kind {
+            ToolKind::Bus if self.bus.len() >= BUS_CALLS_PER_MINUTE => {
+                return Err("KNX bus-operation rate limit exceeded (12 calls per minute)");
+            }
+            ToolKind::Discovery if self.discovery.len() >= DISCOVERY_CALLS_PER_MINUTE => {
+                return Err("KNX discovery rate limit exceeded (6 calls per minute)");
+            }
+            _ => {}
+        }
+        self.all.push_back(now);
+        match kind {
+            ToolKind::Local => {}
+            ToolKind::Bus => self.bus.push_back(now),
+            ToolKind::Discovery => self.discovery.push_back(now),
+        }
+        Ok(())
+    }
+}
 
 /// Serve MCP tools until the stdio client disconnects.
 ///
 /// # Errors
 ///
 /// Returns a missing database or protocol transport failure.
-pub async fn run(database: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(
+    database: PathBuf,
+    allowed_write_addresses: Vec<u16>,
+) -> Result<(), Box<dyn std::error::Error>> {
     CaptureStore::open_existing(&database)?;
-    let service = McpServer::new(database).serve(stdio()).await?;
+    let service = McpServer::with_write_addresses(database, allowed_write_addresses)
+        .serve(stdio())
+        .await?;
     service.waiting().await?;
     Ok(())
 }
@@ -46,22 +105,71 @@ pub async fn run(database: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
 pub struct McpServer {
     tool_router: ToolRouter<Self>,
     database: PathBuf,
+    rate: Arc<Mutex<RateState>>,
+    allowed_write_addresses: BTreeSet<u16>,
 }
 
 impl McpServer {
     /// Construct a local stdio adapter; no listener or bus connection is made.
     #[must_use]
     pub fn new(database: PathBuf) -> Self {
-        Self {
-            tool_router: Self::tools(),
-            database,
+        Self::with_write_addresses(database, [])
+    }
+
+    /// Construct an adapter with an explicit exact-address typed-write allowlist.
+    #[must_use]
+    pub fn with_write_addresses(
+        database: PathBuf,
+        addresses: impl IntoIterator<Item = u16>,
+    ) -> Self {
+        let allowed_write_addresses: BTreeSet<_> = addresses.into_iter().collect();
+        let mut tool_router = Self::tools();
+        if allowed_write_addresses.is_empty() {
+            tool_router.remove_route("knx_typed_write");
         }
+        Self {
+            tool_router,
+            database,
+            rate: Arc::new(Mutex::new(RateState::default())),
+            allowed_write_addresses,
+        }
+    }
+
+    fn check_rate(&self, kind: ToolKind) -> Result<(), CallToolResult> {
+        self.rate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .check(kind, Instant::now())
+            .map_err(tool_error)
     }
 
     async fn operation(&self, request: OperationRequest) -> CallToolResult {
         match IpcClient::operate_as(&self.database, &request, OperationOrigin::McpStdio).await {
             Ok(result @ IpcMessage::OperationResult { .. }) => {
-                structured(json!({ "receipt": result }))
+                let raw = match &result {
+                    IpcMessage::OperationResult {
+                        read: Some(ReadOutcome::Response { raw_cemi }),
+                        ..
+                    } => Some(raw_cemi.clone()),
+                    _ => None,
+                };
+                let response_enrichment = if let Some(raw_cemi) = raw {
+                    let database = self.database.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        let store = CaptureStore::open_existing(&database)
+                            .map_err(|error| error.to_string())?;
+                        enrich_response_frame(&raw_cemi, &store).map_err(|error| error.to_string())
+                    })
+                    .await
+                    {
+                        Ok(Ok(enrichment)) => enrichment,
+                        Ok(Err(error)) => return tool_error(error),
+                        Err(_) => return tool_error("response enrichment worker stopped"),
+                    }
+                } else {
+                    None
+                };
+                structured(json!({ "receipt": result, "response_enrichment": response_enrichment }))
             }
             Ok(IpcMessage::OperationError { reason }) => tool_error(reason),
             Ok(_) => tool_error("unexpected capture owner response"),
@@ -86,6 +194,29 @@ struct SearchParams {
     after: Option<i64>,
     /// Maximum matching results, 1–100; defaults to 50.
     limit: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PageParams {
+    /// Exclusive stream cursor; defaults to zero. Capture and router-loss IDs are independent.
+    after: Option<i64>,
+    /// Maximum results, 1–100; defaults to 50.
+    limit: Option<u32>,
+}
+
+impl PageParams {
+    fn validated(self) -> Result<(i64, NonZeroU32), String> {
+        let after = self.after.unwrap_or(0);
+        if after < 0 {
+            return Err("after must be nonnegative".into());
+        }
+        let limit = self.limit.unwrap_or(50);
+        let limit = NonZeroU32::new(limit)
+            .filter(|limit| limit.get() <= 100)
+            .ok_or("limit must be 1–100")?;
+        Ok((after, limit))
+    }
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -125,9 +256,18 @@ impl WriteParams {
 impl McpServer {
     /// Discover KNXnet/IP gateways on the local network.
     #[tool(
-        description = "Discover KNXnet/IP gateways and return structured addresses and names; multicast may be unavailable on some networks."
+        description = "Discover KNXnet/IP gateways and return structured addresses and names; multicast may be unavailable on some networks.",
+        annotations(
+            title = "Discover KNX gateways",
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn knx_discover(&self) -> CallToolResult {
+        if let Err(error) = self.check_rate(ToolKind::Discovery) {
+            return error;
+        }
         match discovery::discover(Ipv4Addr::UNSPECIFIED).await {
             Ok(gateways) => structured(json!({
                 "gateways": gateways.into_iter().map(|gateway| json!({
@@ -142,9 +282,17 @@ impl McpServer {
 
     /// Read the capture-owner state and active ETS revision.
     #[tool(
-        description = "Read capture-owner connection state and active ETS revision without changing the bus."
+        description = "Read capture-owner connection state and active ETS revision without changing the bus.",
+        annotations(
+            title = "KNX capture status",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn knx_status(&self) -> CallToolResult {
+        if let Err(error) = self.check_rate(ToolKind::Local) {
+            return error;
+        }
         let database = self.database.clone();
         let revision = tokio::task::spawn_blocking(move || {
             CaptureStore::open_existing(&database)?.ets_revision()
@@ -162,14 +310,122 @@ impl McpServer {
         structured(json!({ "capture_owner": owner, "ets_revision": revision }))
     }
 
+    /// Page through retained captures without requiring a text query.
+    #[tool(
+        description = "List retained captures in ID order. Use next_after for the next page; capture and router-loss IDs are independent.",
+        annotations(
+            title = "List KNX captures",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn knx_list_captures(
+        &self,
+        Parameters(params): Parameters<PageParams>,
+    ) -> CallToolResult {
+        if let Err(error) = self.check_rate(ToolKind::Local) {
+            return error;
+        }
+        let (after, limit) = match params.validated() {
+            Ok(value) => value,
+            Err(error) => return tool_error(error),
+        };
+        let database = self.database.clone();
+        match tokio::task::spawn_blocking(move || {
+            let store =
+                CaptureStore::open_existing(&database).map_err(|error| error.to_string())?;
+            let rows = store
+                .read_after(after, limit)
+                .map_err(|error| error.to_string())?;
+            let next_after = rows.last().map_or(after, |row| row.id);
+            let items = rows
+                .into_iter()
+                .map(|row| {
+                    let message = IpcMessage::from(&LiveCapture {
+                        id: Some(row.id),
+                        event: row.event,
+                    });
+                    enriched_capture_json(&message, &store).map_err(|error| error.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok::<_, String>(json!({
+                "items": items,
+                "next_after": next_after,
+                "limit": limit.get(),
+            }))
+        })
+        .await
+        {
+            Ok(Ok(value)) => structured(value),
+            Ok(Err(error)) => tool_error(error),
+            Err(_) => tool_error("capture list worker stopped"),
+        }
+    }
+
+    /// Page through durable router-reported losses, separate from local subscriber lag.
+    #[tool(
+        description = "List router-reported RoutingLostMessage records in ID order. These are not local lag or a bus-wide loss total.",
+        annotations(
+            title = "List KNX router losses",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn knx_list_routing_losses(
+        &self,
+        Parameters(params): Parameters<PageParams>,
+    ) -> CallToolResult {
+        if let Err(error) = self.check_rate(ToolKind::Local) {
+            return error;
+        }
+        let (after, limit) = match params.validated() {
+            Ok(value) => value,
+            Err(error) => return tool_error(error),
+        };
+        let database = self.database.clone();
+        match tokio::task::spawn_blocking(move || {
+            let store = CaptureStore::open_existing(&database)?;
+            let rows = store.read_routing_losses_after(after, limit)?;
+            let next_after = rows.last().map_or(after, |row| row.id);
+            let items: Vec<_> = rows
+                .into_iter()
+                .map(|row| {
+                    IpcMessage::from(&LiveRoutingLoss {
+                        id: Some(row.id),
+                        event: row.event,
+                    })
+                })
+                .collect();
+            Ok::<_, crate::storage::StorageError>(json!({
+                "items": items,
+                "next_after": next_after,
+                "limit": limit.get(),
+            }))
+        })
+        .await
+        {
+            Ok(Ok(value)) => structured(value),
+            Ok(Err(error)) => tool_error(error.to_string()),
+            Err(_) => tool_error("router-loss list worker stopped"),
+        }
+    }
+
     /// Search durable capture history using a bounded scan and cursor.
     #[tool(
-        description = "Search retained captures by text. Returns up to 100 matches and a continuation cursor; each call scans at most 10000 rows."
+        description = "Search retained captures by text. Returns up to 100 matches and a continuation cursor; each call scans at most 10000 rows.",
+        annotations(
+            title = "Search KNX captures",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn knx_search_captures(
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> CallToolResult {
+        if let Err(error) = self.check_rate(ToolKind::Local) {
+            return error;
+        }
         let query = params.query.trim().to_lowercase();
         if query.is_empty() || query.chars().count() > 256 {
             return tool_error("query must contain 1–256 characters");
@@ -194,12 +450,20 @@ impl McpServer {
 
     /// Look up active ETS metadata for one group address.
     #[tool(
-        description = "Look up an imported ETS group-address name, hierarchy and declared DPTs."
+        description = "Look up an imported ETS group-address name, hierarchy and declared DPTs.",
+        annotations(
+            title = "Look up KNX ETS group",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn knx_ets_lookup(
         &self,
         Parameters(params): Parameters<AddressParams>,
     ) -> CallToolResult {
+        if let Err(error) = self.check_rate(ToolKind::Local) {
+            return error;
+        }
         let address = match parse_group_address(&params.address) {
             Ok(address) => address,
             Err(error) => return tool_error(error.to_string()),
@@ -222,9 +486,18 @@ impl McpServer {
 
     /// Send a group read and distinguish its transport receipt from an observed response.
     #[tool(
-        description = "Send a KNX group read through the capture owner; reports a matching response or no response after a bounded timeout."
+        description = "Send a KNX group read through the capture owner; reports a matching response or no response after a bounded timeout.",
+        annotations(
+            title = "Read KNX group",
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn knx_read(&self, Parameters(params): Parameters<ReadParams>) -> CallToolResult {
+        if let Err(error) = self.check_rate(ToolKind::Bus) {
+            return error;
+        }
         let address_raw = match parse_group_address(&params.address) {
             Ok(address) => address.raw(),
             Err(error) => return tool_error(error.to_string()),
@@ -242,12 +515,20 @@ impl McpServer {
 
     /// Prepare the exact DPT-encoded frame without transmitting it.
     #[tool(
-        description = "Preview a DPT-validated typed group write without transmission; this is not a bus action."
+        description = "Preview a DPT-validated typed group write without transmission; this is not a bus action.",
+        annotations(
+            title = "Preview KNX write",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn knx_write_preview(
         &self,
         Parameters(params): Parameters<WriteParams>,
     ) -> CallToolResult {
+        if let Err(error) = self.check_rate(ToolKind::Local) {
+            return error;
+        }
         let request = match params.into_request() {
             Ok(request) => request,
             Err(error) => return tool_error(error),
@@ -280,11 +561,26 @@ impl McpServer {
 
     /// Transmit a typed, DPT-validated group write through the capture owner.
     #[tool(
-        description = "Transmit a DPT-validated typed KNX group write. The receipt confirms a transport send, not actuator state; raw writes are unavailable."
+        description = "Transmit a DPT-validated typed KNX group write. The receipt confirms a transport send, not actuator state; raw writes are unavailable.",
+        annotations(
+            title = "Write KNX group",
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = true
+        )
     )]
     async fn knx_typed_write(&self, Parameters(params): Parameters<WriteParams>) -> CallToolResult {
+        if let Err(error) = self.check_rate(ToolKind::Bus) {
+            return error;
+        }
         match params.into_request() {
-            Ok(request) => self.operation(request).await,
+            Ok(request @ OperationRequest::TypedWrite { address_raw, .. }) => {
+                if !self.allowed_write_addresses.contains(&address_raw) {
+                    return tool_error("MCP typed write is not enabled for this group address");
+                }
+                self.operation(request).await
+            }
+            Ok(_) => unreachable!("write parameters only construct typed writes"),
             Err(error) => tool_error(error),
         }
     }
@@ -327,8 +623,9 @@ fn search_captures(database: &Path, query: &str, after: i64, limit: u32) -> Resu
                 id: Some(row.id),
                 event: row.event,
             });
-            if capture_matches(&message, query) {
-                let value = serde_json::to_value(message).map_err(|error| error.to_string())?;
+            let value =
+                enriched_capture_json(&message, &store).map_err(|error| error.to_string())?;
+            if capture_matches(&message, query) || enrichment_matches(&value, query) {
                 matches.push(value);
                 if matches.len() >= limit as usize {
                     fully_processed = false;
@@ -347,6 +644,28 @@ fn search_captures(database: &Path, query: &str, after: i64, limit: u32) -> Resu
         "scanned": scanned,
         "complete": exhausted,
     }))
+}
+
+fn enrichment_matches(value: &Value, query: &str) -> bool {
+    let enrichment = &value["enrichment"];
+    enrichment["group_name"]
+        .as_str()
+        .is_some_and(|name| name.to_lowercase().contains(query))
+        || enrichment["hierarchy"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item.as_str()
+                    .is_some_and(|name| name.to_lowercase().contains(query))
+            })
+        })
+        || enrichment["dpts"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item.as_str()
+                    .is_some_and(|dpt| dpt.to_lowercase().contains(query))
+            })
+        })
+        || enrichment["value"]
+            .as_str()
+            .is_some_and(|decoded| decoded.to_lowercase().contains(query))
 }
 
 fn capture_matches(message: &IpcMessage, query: &str) -> bool {
@@ -387,24 +706,25 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::{CaptureEndpoint, CaptureEvent};
+    use crate::capture::{CaptureEndpoint, CaptureEvent, RoutingLossEvent};
+    use crate::ets::{CsvEncoding, EtsCatalog, EtsFormat};
     use knx_rs_core::address::{DestinationAddress, IndividualAddress};
     use knx_rs_core::cemi::CemiFrame;
     use knx_rs_core::message::MessageCode;
     use knx_rs_core::types::Priority;
+    use knx_rs_ip::RoutingLostMessage;
 
     #[test]
     fn tool_vocabulary_is_structured_and_has_no_raw_write() {
         let router = McpServer::tools();
-        let names: Vec<_> = router
-            .list_all()
-            .into_iter()
-            .map(|tool| tool.name.to_string())
-            .collect();
-        assert_eq!(names.len(), 7);
+        let tools = router.list_all();
+        let names: Vec<_> = tools.iter().map(|tool| tool.name.to_string()).collect();
+        assert_eq!(names.len(), 9);
         for required in [
             "knx_discover",
             "knx_status",
+            "knx_list_captures",
+            "knx_list_routing_losses",
             "knx_search_captures",
             "knx_ets_lookup",
             "knx_read",
@@ -414,6 +734,156 @@ mod tests {
             assert!(names.contains(&required.to_owned()), "missing {required}");
         }
         assert!(!names.iter().any(|name| name.contains("raw")));
+        let write = tools
+            .iter()
+            .find(|tool| tool.name == "knx_typed_write")
+            .unwrap();
+        let write_annotations = write.annotations.as_ref().unwrap();
+        assert_eq!(write_annotations.read_only_hint, Some(false));
+        assert_eq!(write_annotations.destructive_hint, Some(true));
+        let preview = tools
+            .iter()
+            .find(|tool| tool.name == "knx_write_preview")
+            .unwrap();
+        assert_eq!(
+            preview.annotations.as_ref().unwrap().read_only_hint,
+            Some(true)
+        );
+        let default = McpServer::new(PathBuf::from("unused"));
+        assert_eq!(default.tool_router.list_all().len(), 8);
+        assert!(!default.tool_router.has_route("knx_typed_write"));
+        let allowed = McpServer::with_write_addresses(PathBuf::from("unused"), [0x0a03]);
+        assert!(allowed.tool_router.has_route("knx_typed_write"));
+    }
+
+    #[tokio::test]
+    async fn write_policy_denies_unlisted_addresses_even_if_handler_is_called_directly() {
+        let server = McpServer::with_write_addresses(PathBuf::from("unused"), [0x0a03]);
+        let denied = server
+            .knx_typed_write(Parameters(WriteParams {
+                address: "1/2/4".into(),
+                dpt: Some("1.001".into()),
+                value: "true".into(),
+            }))
+            .await;
+        assert_eq!(denied.is_error, Some(true));
+        assert!(
+            denied.structured_content.unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .contains("not enabled")
+        );
+        let default = McpServer::new(PathBuf::from("unused"));
+        let denied = default
+            .knx_typed_write(Parameters(WriteParams {
+                address: "1/2/3".into(),
+                dpt: Some("1.001".into()),
+                value: "true".into(),
+            }))
+            .await;
+        assert_eq!(denied.is_error, Some(true));
+    }
+
+    #[test]
+    fn rate_limits_bound_bus_and_discovery_without_blocking_local_calls() {
+        let mut state = RateState::default();
+        let now = Instant::now();
+        for _ in 0..BUS_CALLS_PER_MINUTE {
+            assert!(state.check(ToolKind::Bus, now).is_ok());
+        }
+        assert!(state.check(ToolKind::Bus, now).is_err());
+        assert!(state.check(ToolKind::Local, now).is_ok());
+        for _ in 0..DISCOVERY_CALLS_PER_MINUTE {
+            assert!(state.check(ToolKind::Discovery, now).is_ok());
+        }
+        assert!(state.check(ToolKind::Discovery, now).is_err());
+        assert!(
+            state
+                .check(ToolKind::Bus, now + Duration::from_secs(60))
+                .is_ok()
+        );
+        assert!(
+            state
+                .check(ToolKind::Discovery, now + Duration::from_secs(60))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn rate_limit_is_shared_across_server_clones() {
+        let server = McpServer::new(PathBuf::from("unused"));
+        let other = server.clone();
+        for _ in 0..TOOL_CALLS_PER_MINUTE {
+            assert!(server.check_rate(ToolKind::Local).is_ok());
+        }
+        assert!(other.check_rate(ToolKind::Local).is_err());
+    }
+
+    #[tokio::test]
+    async fn independent_capture_and_router_loss_pages_reject_invalid_bounds() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("pages.sqlite");
+        let mut store = CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap();
+        let frame = CemiFrame::new_l_data(
+            MessageCode::LDataInd,
+            IndividualAddress::from_raw(0x1101),
+            DestinationAddress::Group(GroupAddress::from_raw(0x0a01)),
+            Priority::Low,
+            &[0x00, 0x80, 1],
+        );
+        store
+            .insert(&CaptureEvent::received(
+                CaptureEndpoint::Tunnel("127.0.0.1:3671".parse().unwrap()),
+                frame,
+            ))
+            .unwrap();
+        store
+            .insert_routing_loss(&RoutingLossEvent::received(
+                CaptureEndpoint::Router("224.0.23.12:3671".parse().unwrap()),
+                RoutingLostMessage {
+                    source: "192.0.2.2:3671".parse().unwrap(),
+                    device_state: 3,
+                    lost_messages: 7,
+                },
+            ))
+            .unwrap();
+        drop(store);
+        let server = McpServer::new(database);
+        let captures = server
+            .knx_list_captures(Parameters(PageParams {
+                after: None,
+                limit: Some(1),
+            }))
+            .await;
+        assert_eq!(captures.is_error, Some(false));
+        let captures = captures.structured_content.unwrap();
+        assert_eq!(captures["items"][0]["type"], "capture");
+        assert_eq!(captures["next_after"], 1);
+        let losses = server
+            .knx_list_routing_losses(Parameters(PageParams {
+                after: None,
+                limit: Some(1),
+            }))
+            .await;
+        assert_eq!(losses.is_error, Some(false));
+        let losses = losses.structured_content.unwrap();
+        assert_eq!(losses["items"][0]["type"], "routing_lost_message");
+        assert_eq!(losses["items"][0]["lost_messages"], 7);
+        assert_eq!(losses["next_after"], 1);
+        let invalid = server
+            .knx_list_routing_losses(Parameters(PageParams {
+                after: Some(-1),
+                limit: Some(1),
+            }))
+            .await;
+        assert_eq!(invalid.is_error, Some(true));
+        let invalid = server
+            .knx_list_captures(Parameters(PageParams {
+                after: Some(0),
+                limit: Some(101),
+            }))
+            .await;
+        assert_eq!(invalid.is_error, Some(true));
     }
 
     #[test]
@@ -434,6 +904,9 @@ mod tests {
                 .insert(&CaptureEvent::received(endpoint, frame))
                 .unwrap();
         }
+        let xml = br#"<GroupAddress-Export xmlns="http://knx.org/xml/ga-export/01"><GroupRange Name="Lighting"><GroupAddress Name="Desk lamp" Address="1/2/1" DPTs="DPT-1-1" /></GroupRange></GroupAddress-Export>"#;
+        let catalog = EtsCatalog::from_bytes(xml, EtsFormat::GaXml01, CsvEncoding::Utf8).unwrap();
+        store.import_ets(&catalog).unwrap();
         drop(store);
         let first = search_captures(&database, "1/2/", 0, 1).unwrap();
         assert_eq!(first["items"].as_array().unwrap().len(), 1);
@@ -443,6 +916,9 @@ mod tests {
         assert_eq!(second["items"].as_array().unwrap().len(), 2);
         assert_eq!(second["next_after"], 3);
         assert_eq!(second["complete"], true);
+        let named = search_captures(&database, "desk lamp", 0, 10).unwrap();
+        assert_eq!(named["items"].as_array().unwrap().len(), 1);
+        assert_eq!(named["items"][0]["enrichment"]["group_name"], "Desk lamp");
     }
 
     #[tokio::test]

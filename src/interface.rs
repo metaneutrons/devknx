@@ -13,6 +13,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 use devknx::control::{ControlClient, ControlRequest, ControlResponse, RestStatus};
+use devknx::enrichment::{CaptureEnrichment, enrich_capture};
 use devknx::ets::parse_group_address;
 use devknx::ipc::{IpcClient, IpcMessage, WireState};
 use devknx::operations::{OperationRequest, prepare};
@@ -197,6 +198,19 @@ impl MonitorModel {
     }
 
     fn capture(&mut self, message: IpcMessage) {
+        let IpcMessage::Capture { id, .. } = &message else {
+            return;
+        };
+        if id.is_some() && self.rows.iter().any(|row| row.id == *id) {
+            return;
+        }
+        let enrichment = match enrich_capture(&message, &self.store) {
+            Ok(enrichment) => enrichment,
+            Err(error) => {
+                self.notice(format!("Capture enrichment failed: {error}"));
+                CaptureEnrichment::default()
+            }
+        };
         let IpcMessage::Capture {
             id,
             observed_at_ms,
@@ -210,23 +224,9 @@ impl MonitorModel {
         else {
             return;
         };
-        if id.is_some() && self.rows.iter().any(|row| row.id == id) {
-            return;
-        }
         if let Some(id) = id {
             self.last_seen_id = self.last_seen_id.max(id);
         }
-        let group = if destination.contains('/') {
-            parse_group_address(&destination)
-                .ok()
-                .and_then(|address| self.store.ets_group(address).ok().flatten())
-        } else {
-            None
-        };
-        let dpts = group
-            .as_ref()
-            .map_or_else(Vec::new, |group| group.dpts.clone());
-        let value = decode_capture_value(&raw_cemi, &dpts, &service);
         self.rows.push(DisplayCapture {
             id,
             timestamp_ms: observed_at_ms,
@@ -234,9 +234,9 @@ impl MonitorModel {
             source,
             destination,
             service,
-            label: group.as_ref().map(|group| group.name.clone()),
-            value,
-            dpts,
+            label: enrichment.group_name,
+            value: enrichment.value,
+            dpts: enrichment.dpts,
             raw_cemi,
         });
         if self.rows.len() > VISIBLE_CAP {
@@ -615,35 +615,6 @@ pub fn format_time(timestamp_ms: u64) -> String {
             || "—".into(),
             |time| time.format("%H:%M:%S%.3f").to_string(),
         )
-}
-
-fn decode_capture_value(raw_cemi: &str, dpts: &[String], service: &str) -> Option<String> {
-    if service == "Read" {
-        return Some("Read request".into());
-    }
-    if !matches!(service, "Write" | "Response")
-        || dpts.len() != 1
-        || !raw_cemi.len().is_multiple_of(2)
-    {
-        return None;
-    }
-    let bytes = raw_cemi
-        .as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| {
-            std::str::from_utf8(pair)
-                .ok()
-                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
-        })
-        .collect::<Option<Vec<_>>>()?;
-    let frame = knx_rs_core::cemi::CemiFrame::parse(&bytes).ok()?;
-    let apdu = frame.tpdu()?.apdu()?.clone();
-    let dpt = devknx::ets::parse_dpt(&dpts[0]).ok()?;
-    knx_rs_core::dpt::decode(dpt, &apdu.data)
-        .ok()
-        .map(|value| value.to_string())
 }
 
 fn hex(bytes: &[u8]) -> String {

@@ -167,6 +167,12 @@ enum Command {
         /// Existing capture database; its KNX session must already be connected.
         #[command(flatten)]
         selector: CaptureSelector,
+        /// Expose typed writes to this MCP client, restricted to --write-address values.
+        #[arg(long, requires = "write_address")]
+        allow_writes: bool,
+        /// Group address allowed for MCP typed writes; repeat for additional addresses.
+        #[arg(long, value_name = "GA", requires = "allow_writes")]
+        write_address: Vec<String>,
     },
     /// Read the selected capture session's current connection state.
     Status {
@@ -492,7 +498,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .await?;
         }
-        Some(Command::Mcp { selector }) => mcp::run(resolve_capture_selector(selector)?).await?,
+        Some(Command::Mcp {
+            selector,
+            allow_writes: _,
+            write_address,
+        }) => {
+            let allowed = write_address
+                .iter()
+                .map(|address| {
+                    parse_group_address(address).map(knx_rs_core::address::GroupAddress::raw)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            mcp::run(resolve_capture_selector(selector)?, allowed).await?;
+        }
         Some(Command::Status { selector }) => {
             run_ipc_client(&resolve_capture_selector(selector)?, false).await?;
         }
@@ -1068,6 +1086,45 @@ mod tests {
         assert_eq!(cli.color, Some(color::ColorMode::Always));
         assert!(
             Cli::try_parse_from(["devknx", "--color", "never", "--no-color", "discover"]).is_err()
+        );
+    }
+
+    #[test]
+    fn mcp_write_opt_in_requires_an_explicit_group_address() {
+        let base = ["devknx", "mcp", "--database", "capture.sqlite"];
+        assert!(Cli::try_parse_from(base).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "devknx",
+                "mcp",
+                "--database",
+                "capture.sqlite",
+                "--allow-writes",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "devknx",
+                "mcp",
+                "--database",
+                "capture.sqlite",
+                "--write-address",
+                "1/2/3",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "devknx",
+                "mcp",
+                "--database",
+                "capture.sqlite",
+                "--allow-writes",
+                "--write-address",
+                "1/2/3",
+            ])
+            .is_ok()
         );
     }
 

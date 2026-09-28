@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Fabian Schmieder
 
+use std::io::{Read as _, Seek as _};
 use std::num::NonZeroU32;
 use std::path::Path;
-use std::process::{Child, Command, Output, Stdio};
-use std::time::Duration;
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use devknx::ipc::{IpcMessage, WireState};
 use devknx::storage::CaptureStore;
@@ -22,6 +24,21 @@ struct IsolatedCli {
 
 struct ChildGuard(Child);
 
+fn wait_for_cli(mut child: Child, command: &str) -> ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.try_wait().expect("query CLI process") {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            eprintln!("timed out waiting for devknx {command}");
+            let _ = child.kill();
+            return child.wait().expect("reap timed-out CLI process");
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -37,13 +54,33 @@ impl IsolatedCli {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_devknx"))
+        let mut stdout = tempfile::tempfile().expect("temporary CLI stdout");
+        let mut stderr = tempfile::tempfile().expect("temporary CLI stderr");
+        let child = Command::new(env!("CARGO_BIN_EXE_devknx"))
             .args(args)
             .env("HOME", self.directory.path())
             .env("XDG_DATA_HOME", self.directory.path())
             .env("LOCALAPPDATA", self.directory.path())
-            .output()
-            .expect("run isolated devknx CLI")
+            .stdout(Stdio::from(stdout.try_clone().expect("clone CLI stdout")))
+            .stderr(Stdio::from(stderr.try_clone().expect("clone CLI stderr")))
+            .spawn()
+            .expect("run isolated devknx CLI");
+        let status = wait_for_cli(child, &args.join(" "));
+        stdout.rewind().expect("rewind CLI stdout");
+        stderr.rewind().expect("rewind CLI stderr");
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        stdout
+            .read_to_end(&mut stdout_bytes)
+            .expect("read CLI stdout");
+        stderr
+            .read_to_end(&mut stderr_bytes)
+            .expect("read CLI stderr");
+        Output {
+            status,
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
+        }
     }
 
     fn application_data_dir(&self) -> std::path::PathBuf {
@@ -94,7 +131,7 @@ async fn wait_connected(cli: &IsolatedCli, endpoint: &str) {
     .expect("session connected to loopback gateway");
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn foreground_daemon_starts_without_a_knx_session() {
     let cli = IsolatedCli::new();
     let child = Command::new(env!("CARGO_BIN_EXE_devknx"))
@@ -143,7 +180,7 @@ async fn foreground_daemon_starts_without_a_knx_session() {
     .expect("foreground daemon stopped");
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[expect(
     clippy::too_many_lines,
     reason = "one end-to-end multi-session lifecycle scenario"
@@ -316,7 +353,7 @@ async fn daemon_manages_two_isolated_sessions_and_rest_lifecycle() {
     second_gateway.stop().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn endpoint_selected_read_auto_starts_daemon_without_a_manual_connect() {
     let cli = IsolatedCli::new();
     let gateway = DeviceServer::start_at("127.0.0.1:0".parse().unwrap())
@@ -348,7 +385,7 @@ async fn endpoint_selected_read_auto_starts_daemon_without_a_manual_connect() {
     gateway.stop().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_connect_commands_share_one_daemon_and_session() {
     let cli = IsolatedCli::new();
     let gateway = DeviceServer::start_at("127.0.0.1:0".parse().unwrap())
@@ -361,19 +398,18 @@ async fn concurrent_connect_commands_share_one_daemon_and_session() {
             .env("HOME", cli.directory.path())
             .env("XDG_DATA_HOME", cli.directory.path())
             .env("LOCALAPPDATA", cli.directory.path())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .unwrap()
     };
     let first = spawn_connect();
     let second = spawn_connect();
     for child in [first, second] {
-        let output = child.wait_with_output().unwrap();
+        let status = wait_for_cli(child, "connect (concurrent)");
         assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+            status.success(),
+            "concurrent connect process failed: {status}"
         );
     }
     assert_eq!(

@@ -24,5 +24,15 @@
     <string>0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>LSMinimumSystemVersion</key>
+    <string>12.0</string>
+    <key>SUFeedURL</key>
+    <string>https://devknx.metaneutrons.cc/appcast.xml</string>
+    <key>SUPublicEDKey</key>
+    <string>+MmdAm0kxYH9kJQdOMHIOpzexBiZuqXHMWO6rts7qAs=</string>
+    <key>SUEnableAutomaticChecks</key>
+    <true/>
+    <key>SUScheduledCheckInterval</key>
+    <integer>86400</integer>
 </dict>
 </plist>

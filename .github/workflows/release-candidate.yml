@@ -40,7 +40,7 @@ jobs:
         with:
           python-version: '3.13'
       - run: python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
-      - run: bash -n scripts/release/build-deb.sh scripts/build-macos-app.sh
+      - run: bash -n scripts/release/build-deb.sh scripts/release/fetch-sparkle.sh scripts/build-macos-app.sh
 
   package-source:
     name: Package tagged source
@@ -207,7 +207,9 @@ jobs:
           tar -xzf "packages/devknx-$tag-aarch64-apple-darwin.tar.gz" -C unpacked
           "unpacked/devknx-$tag-aarch64-apple-darwin/devknx" --version |
             grep -Fx "devknx $version"
-          DEVKNX_APP_OUTPUT=dist/devknx.app scripts/build-macos-app.sh --no-build
+          bash scripts/release/fetch-sparkle.sh "$RUNNER_TEMP/sparkle"
+          DEVKNX_SPARKLE_FRAMEWORK="$RUNNER_TEMP/sparkle/Sparkle.framework" \
+            DEVKNX_APP_OUTPUT=dist/devknx.app scripts/build-macos-app.sh --no-build
           test -s dist/devknx.app/Contents/Resources/THIRD-PARTY-NOTICES.md
           test -s dist/devknx.app/Contents/Resources/licenses/OFL-1.1.txt
           file dist/devknx.app/Contents/MacOS/devknx | grep -F arm64

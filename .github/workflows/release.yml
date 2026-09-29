@@ -120,8 +120,22 @@ jobs:
       - name: Sign with hardened runtime
         run: |
           set -euo pipefail
+          framework=dist/devknx.app/Contents/Frameworks/Sparkle.framework
+          version="$framework/Versions/B"
+          codesign --force --options runtime --timestamp \
+            --sign "$SIGNING_IDENTITY" --keychain "$SIGNING_KEYCHAIN" \
+            "$version/XPCServices/Installer.xpc"
+          codesign --force --options runtime --timestamp \
+            --preserve-metadata=entitlements \
+            --sign "$SIGNING_IDENTITY" --keychain "$SIGNING_KEYCHAIN" \
+            "$version/XPCServices/Downloader.xpc"
+          for nested in "$version/Autoupdate" "$version/Updater.app" "$framework"; do
+            codesign --force --options runtime --timestamp \
+              --sign "$SIGNING_IDENTITY" --keychain "$SIGNING_KEYCHAIN" "$nested"
+          done
           codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" \
             --keychain "$SIGNING_KEYCHAIN" dist/devknx.app
+          codesign --verify --deep --strict --verbose=2 dist/devknx.app
           codesign --verify --strict --verbose=2 dist/devknx.app
       - name: Notarize, staple and package
         env:
@@ -626,9 +640,45 @@ jobs:
           test "$repos" = '["metaneutrons/apt-archive"]'
           gh api repos/metaneutrons/apt-archive/actions/workflows/publish.yml >/dev/null
 
+  sparkle-preflight:
+    name: Sparkle channel is writable before GitHub staging
+    needs: metadata
+    if: needs.metadata.outputs.prerelease == 'false'
+    runs-on: ubuntu-24.04
+    environment: release-sparkle
+    steps:
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Required signing and bucket secrets exist
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          for name in SPARKLE_ED_PRIVATE_KEY R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY; do
+            [[ -n "${!name:-}" ]] || { echo "::error::missing Sparkle configuration: $name"; exit 1; }
+          done
+          status=$(curl --silent --show-error --output /dev/null \
+            --write-out '%{http_code}' https://devknx.metaneutrons.cc/appcast.xml)
+          [[ "$status" == 200 || "$status" == 404 ]] || {
+            echo "::error::Sparkle host returned HTTP $status"; exit 1; }
+          python3 -m pip install --quiet 'boto3==1.43.105'
+          python3 - <<'PY'
+          import boto3, os
+          from botocore.config import Config
+          client = boto3.client(
+              's3', endpoint_url='https://9122b44fa4c05b23985d6a0b779caa01.r2.cloudflarestorage.com',
+              region_name='auto', aws_access_key_id=os.environ['R2_ACCESS_KEY_ID'],
+              aws_secret_access_key=os.environ['R2_SECRET_ACCESS_KEY'],
+              config=Config(signature_version='s3v4'))
+          client.head_bucket(Bucket='devknx-updates')
+          PY
+
   stage:
     name: Stage and read back the immutable GitHub prerelease
-    needs: [metadata, candidate, channel-qualification, preflight]
+    needs: [metadata, candidate, channel-qualification, preflight, sparkle-preflight]
     if: >-
       !cancelled()
       && needs.metadata.result == 'success'
@@ -636,9 +686,11 @@ jobs:
       && needs.channel-qualification.result == 'success'
       && (
         (needs.metadata.outputs.prerelease == 'true'
-          && needs.preflight.result == 'skipped')
+          && needs.preflight.result == 'skipped'
+          && needs.sparkle-preflight.result == 'skipped')
         || (needs.metadata.outputs.prerelease == 'false'
-          && needs.preflight.result == 'success')
+          && needs.preflight.result == 'success'
+          && needs.sparkle-preflight.result == 'success')
       )
     runs-on: ubuntu-24.04
     permissions:
@@ -866,9 +918,43 @@ jobs:
             sleep 30
           done
 
+  publish-sparkle:
+    name: Publish signed macOS update feed
+    needs: [metadata, stage, publish-homebrew, publish-aur]
+    if: needs.metadata.outputs.prerelease == 'false'
+    runs-on: macos-15
+    environment: release-sparkle
+    concurrency:
+      group: devknx-sparkle-feed
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: notarized-app
+          path: candidate
+      - name: Sign, verify and publish the exact notarized ZIP
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install 'boto3==1.43.105' 'cryptography==50.0.1'
+          bash scripts/release/fetch-sparkle.sh "$RUNNER_TEMP/sparkle"
+          python3 scripts/release/publish-sparkle.py \
+            --archive "candidate/devknx-v${VERSION}-aarch64-apple-darwin.app.zip" \
+            --signer "$RUNNER_TEMP/sparkle/bin/sign_update" --version "$VERSION"
+
   promote:
     name: Promote unchanged prerelease to latest
-    needs: [metadata, stage, publish-homebrew, publish-aur]
+    needs: [metadata, stage, publish-homebrew, publish-aur, publish-sparkle]
     if: needs.metadata.outputs.prerelease == 'false'
     runs-on: ubuntu-24.04
     permissions:

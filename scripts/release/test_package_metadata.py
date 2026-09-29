@@ -39,7 +39,9 @@ class PackageMetadataTests(unittest.TestCase):
             self.assertNotIn("x86_64-apple-darwin", formula)
             cask = (output / "devknx-app.rb").read_text()
             self.assertIn('cask "devknx-app"', cask)
-            self.assertIn("depends_on :macos", cask)
+            self.assertIn("depends_on macos: :monterey", cask)
+            self.assertIn("depends_on arch: :arm64", cask)
+            self.assertIn("auto_updates true", cask)
             self.assertIn("devknx-v0.2.0-x86_64-unknown-linux-gnu",
                           (output / "devknx-bin.PKGBUILD").read_text())
             self.assertIn('_srcdir="devknx-v0.2.0"', (output / "devknx.PKGBUILD").read_text())

@@ -33,6 +33,20 @@ if [[ -e "$bundle" ]]; then
   exit 1
 fi
 mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources/licenses"
+if [[ -n "${DEVKNX_SPARKLE_FRAMEWORK:-}" ]]; then
+  if [[ ! -d "$DEVKNX_SPARKLE_FRAMEWORK" ]]; then
+    echo "Sparkle.framework is missing: $DEVKNX_SPARKLE_FRAMEWORK" >&2
+    exit 1
+  fi
+  mkdir -p "$bundle/Contents/Frameworks"
+  ditto "$DEVKNX_SPARKLE_FRAMEWORK" "$bundle/Contents/Frameworks/Sparkle.framework"
+  license="$(dirname "$DEVKNX_SPARKLE_FRAMEWORK")/Sparkle-LICENSE"
+  if [[ ! -f "$license" ]]; then
+    echo "Sparkle licence is missing: $license" >&2
+    exit 1
+  fi
+  command cp "$license" "$bundle/Contents/Resources/Sparkle-LICENSE"
+fi
 command cp target/release/devknx "$bundle/Contents/MacOS/devknx"
 command cp resources/devknx.icns "$bundle/Contents/Resources/devknx.icns"
 command cp resources/Info.plist "$bundle/Contents/Info.plist"
@@ -40,7 +54,7 @@ command cp LICENSE THIRD-PARTY-NOTICES.md "$bundle/Contents/Resources/"
 command cp licenses/* "$bundle/Contents/Resources/licenses/"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" \
   "$bundle/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${version//./}" \
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $version" \
   "$bundle/Contents/Info.plist"
 plutil -lint "$bundle/Contents/Info.plist"
 "$bundle/Contents/MacOS/devknx" --version

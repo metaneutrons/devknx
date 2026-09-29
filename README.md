@@ -248,8 +248,15 @@ cargo build --locked --no-default-features
 
 On macOS ARM64, `scripts/build-macos-app.sh` (requires `jq`) assembles an **unsigned local**
 `dist/devknx.app`. The release bundle will be signed, notarized, and distributed
-separately. `resources/icon-master.png` is the source for the macOS `.icns`,
-Windows executable `.ico`, and Linux icon sizes. Embedded font licences are
+separately. The app requires macOS 12 or newer and provides a native **Check for
+Updates…** menu item. Sparkle uses a separately signed update archive and the
+feed at [`devknx.metaneutrons.cc/appcast.xml`](https://devknx.metaneutrons.cc/appcast.xml);
+the CLI package remains a separate Homebrew formula. The feed becomes available
+with the first release. The [update and signing procedure](docs/sparkle-updates.md)
+documents the release boundary.
+
+`resources/icon-master.png` is the source for the macOS `.icns`, Windows
+executable `.ico`, and Linux icon sizes. Embedded font licences are
 listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 ## Planned distribution

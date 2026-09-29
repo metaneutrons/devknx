@@ -129,10 +129,9 @@ cask "devknx-app" do
   desc "{DESCRIPTION}"
   homepage "{HOMEPAGE}"
 
-  depends_on macos: :monterey
-  depends_on arch: :arm64
-
   auto_updates true
+  depends_on arch: :arm64
+  depends_on macos: :monterey
 
   app "devknx.app"
 

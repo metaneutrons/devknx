@@ -14,3 +14,8 @@ this source tree and must accompany every distributed GUI binary.
 The four notice texts were copied verbatim from the
 `epaint_default_fonts` 0.36.2 source package. Ordinary Rust dependencies are
 recorded in `Cargo.lock` and checked against `deny.toml`.
+
+The macOS application bundle includes Sparkle 2.10.0. Its complete licence,
+including notices for bundled components, is in
+`devknx.app/Contents/Resources/Sparkle-LICENSE`. The standalone CLI
+archives do not include Sparkle.

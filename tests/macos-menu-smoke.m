@@ -45,6 +45,9 @@ int main(void) {
             expect(submenu(title) != nil, [title UTF8String]);
         }
         expect([submenu(@"devknx") itemWithTitle:@"About devknx"] != nil, "About panel item");
+        NSMenuItem *updates = [submenu(@"devknx") itemWithTitle:@"Check for Updates…"];
+        expect(updates != nil, "update menu item");
+        expect(![updates isEnabled], "updates are disabled outside an app bundle");
         expect([[submenu(@"devknx") itemWithTitle:@"Quit devknx"].keyEquivalent isEqualToString:@"q"], "Quit shortcut");
         for (NSString *title in @[@"Undo", @"Redo", @"Cut", @"Copy", @"Paste", @"Select All"]) {
             expect([submenu(@"Edit") itemWithTitle:title] != nil, [title UTF8String]);

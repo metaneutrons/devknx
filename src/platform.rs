@@ -93,7 +93,7 @@ mod macos {
     }
 }
 
-/// Initialize the native app menu and About panel, if this is macOS.
+/// Initialize the native app menu and About panel, plus the app-bundle updater when available.
 // The non-macOS body is inert; marking this wrapper const would break AppKit.
 #[allow(clippy::missing_const_for_fn)]
 pub fn init_app() {

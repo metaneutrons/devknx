@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Fabian Schmieder
 
 #import <AppKit/AppKit.h>
+#import <dispatch/dispatch.h>
+#import <objc/message.h>
 #import <stdint.h>
 
 // AppKit and the GUI run on the main thread. Rust consumes each request once
@@ -11,6 +13,11 @@ static NSString *app_version = @"0.1.0";
 static NSImage *app_icon = nil;
 static NSMenuItem *color_menu_item = nil;
 static BOOL color_menu_locked = NO;
+// Sparkle is resolved from the app bundle at runtime so command-line builds
+// have no link-time dependency on the updater framework.
+static NSBundle *sparkle_framework_bundle = nil;
+static id sparkle_updater_controller = nil;
+static BOOL sparkle_initialization_attempted = NO;
 
 enum {
     ACTION_OPEN_DATABASE = 1 << 0,
@@ -23,6 +30,55 @@ enum {
     ACTION_CONNECTION_SETTINGS = 1 << 7,
     ACTION_TOGGLE_COLOR = 1 << 8,
 };
+
+static void initialize_sparkle_updater_on_main_thread(void *context) {
+    (void)context;
+    if (sparkle_initialization_attempted) return;
+    sparkle_initialization_attempted = YES;
+
+    NSBundle *main_bundle = [NSBundle mainBundle];
+    if (![[[main_bundle.bundleURL pathExtension] lowercaseString] isEqualToString:@"app"]) return;
+
+    NSString *framework_path = [[main_bundle.bundleURL path]
+        stringByAppendingPathComponent:@"Contents/Frameworks/Sparkle.framework"];
+    NSBundle *framework = [[NSBundle bundleWithPath:framework_path] retain];
+    NSError *load_error = nil;
+    if (!framework || ![framework loadAndReturnError:&load_error]) {
+        NSLog(@"devknx: Sparkle is unavailable; update checks are disabled. %@",
+              load_error ? load_error.localizedDescription : @"");
+        [framework release];
+        return;
+    }
+    sparkle_framework_bundle = framework;
+
+    Class controller_class = NSClassFromString(@"SPUStandardUpdaterController");
+    SEL initializer = NSSelectorFromString(
+        @"initWithStartingUpdater:updaterDelegate:userDriverDelegate:");
+    if (!controller_class || ![controller_class instancesRespondToSelector:initializer]) {
+        NSLog(@"devknx: Sparkle has no compatible standard updater controller.");
+        return;
+    }
+
+    // The initializer returns an owned object. Keep that retain for the full
+    // application lifetime; its action and menu-item validator serve the app menu.
+    typedef id (*UpdaterControllerInitializer)(id, SEL, BOOL, id, id);
+    UpdaterControllerInitializer initialize_controller =
+        (UpdaterControllerInitializer)objc_msgSend;
+    sparkle_updater_controller = initialize_controller(
+        [controller_class alloc], initializer, YES, nil, nil);
+    if (!sparkle_updater_controller) {
+        NSLog(@"devknx: Sparkle could not create its updater controller.");
+    }
+}
+
+static void initialize_sparkle_updater(void) {
+    if ([NSThread isMainThread]) {
+        initialize_sparkle_updater_on_main_thread(NULL);
+    } else {
+        dispatch_sync_f(dispatch_get_main_queue(), NULL,
+                        initialize_sparkle_updater_on_main_thread);
+    }
+}
 
 // The winit view is not an AppKit text view. Deliver standard edit-menu
 // shortcuts back to it as key events so egui's focused text field handles
@@ -71,11 +127,13 @@ static void forward_edit_action(id target, unsigned short key_code,
 - (void)toggleConnection:(id)sender;
 - (void)connectionSettings:(id)sender;
 - (void)toggleColor:(id)sender;
+- (void)checkForUpdates:(id)sender;
 @end
 
 @implementation DevknxMenuHandler
 - (BOOL)validateMenuItem:(NSMenuItem *)item {
     if ([item action] == @selector(toggleColor:)) return !color_menu_locked;
+    if ([item action] == @selector(checkForUpdates:)) return NO;
     return YES;
 }
 - (void)showAbout:(id)sender {
@@ -102,6 +160,7 @@ static void forward_edit_action(id target, unsigned short key_code,
 - (void)toggleConnection:(id)sender { (void)sender; pending_actions |= ACTION_TOGGLE_CONNECTION; }
 - (void)connectionSettings:(id)sender { (void)sender; pending_actions |= ACTION_CONNECTION_SETTINGS; }
 - (void)toggleColor:(id)sender { (void)sender; pending_actions |= ACTION_TOGGLE_COLOR; }
+- (void)checkForUpdates:(id)sender { (void)sender; }
 @end
 
 static DevknxMenuHandler *menu_handler = nil;
@@ -128,8 +187,15 @@ bool devknx_macos_menu_installed(void) {
         if (![[item title] isEqualToString:titles[index]] || ![item submenu]) return false;
     }
     NSMenu *view = [[main itemAtIndex:3] submenu];
+    NSMenu *application = [[main itemAtIndex:0] submenu];
+    NSMenuItem *updates = [application itemWithTitle:@"Check for Updates…"];
+    BOOL update_target_is_valid = sparkle_updater_controller
+        ? [updates target] == sparkle_updater_controller
+        : [updates target] == menu_handler;
     return [[[[main itemAtIndex:0] submenu] itemWithTitle:@"About devknx"] action] == @selector(showAbout:)
-        && [[view itemWithTitle:@"Color"] action] == @selector(toggleColor:);
+        && [[view itemWithTitle:@"Color"] action] == @selector(toggleColor:)
+        && [updates action] == @selector(checkForUpdates:)
+        && update_target_is_valid;
 }
 
 static void add_item(NSMenu *menu, NSString *title, SEL selector, NSString *key,
@@ -160,12 +226,23 @@ void devknx_init_macos_app(const char *version, const uint8_t *icon, size_t icon
         }
         // The process owns the handler for the complete GUI lifetime.
         menu_handler = [DevknxMenuHandler new];
+        // Sparkle must initialize on AppKit's main thread. Development and CLI
+        // invocations outside an .app bundle skip framework loading entirely.
+        initialize_sparkle_updater();
 
         NSMenu *main = [[NSMenu alloc] initWithTitle:@"devknx"];
         [app setMainMenu:main];
         NSMenu *application = add_menu(main, @"devknx");
         add_item(application, @"About devknx", @selector(showAbout:), @"", menu_handler, 0);
         add_item(application, @"Settings…", @selector(connectionSettings:), @",", menu_handler, NSEventModifierFlagCommand);
+        add_item(application, @"Check for Updates…", @selector(checkForUpdates:), @"",
+                 menu_handler, 0);
+        NSMenuItem *updates = [application itemWithTitle:@"Check for Updates…"];
+        if (sparkle_updater_controller) {
+            [updates setTarget:sparkle_updater_controller];
+        } else {
+            [updates setEnabled:NO];
+        }
         [application addItem:[NSMenuItem separatorItem]];
         NSMenu *services = [[NSMenu alloc] initWithTitle:@"Services"];
         NSMenuItem *services_item = [[NSMenuItem alloc] initWithTitle:@"Services" action:nil keyEquivalent:@""];

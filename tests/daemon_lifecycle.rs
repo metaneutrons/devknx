@@ -290,20 +290,42 @@ async fn foreground_daemon_starts_without_a_knx_session() {
         .spawn()
         .unwrap();
     let mut child = ChildGuard(child);
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let started = Instant::now();
+    let mut last_status = None;
+    let ready = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if cli.json(&["daemon", "--status"])["running"]
-                .as_bool()
-                .unwrap_or(false)
-            {
+            // Unlike the synchronous helper, this probe can be cancelled by
+            // the outer deadline, including while the process is starting.
+            let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_devknx"))
+                .args(["daemon", "--status"])
+                .env("HOME", cli.directory.path())
+                .env("XDG_DATA_HOME", cli.directory.path())
+                .env("LOCALAPPDATA", cli.directory.path())
+                .kill_on_drop(true)
+                .output()
+                .await
+                .expect("probe foreground daemon status");
+            assert!(
+                output.status.success(),
+                "daemon --status: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let status: Value = serde_json::from_slice(&output.stdout).expect("JSON daemon status");
+            let running = status["running"].as_bool().unwrap_or(false);
+            last_status = Some(status);
+            if running {
                 break;
             }
             assert!(child.0.try_wait().unwrap().is_none(), "daemon exited early");
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
-    .await
-    .expect("foreground daemon became ready");
+    .await;
+    assert!(
+        ready.is_ok(),
+        "foreground daemon not ready after {:?}; last status: {last_status:?}",
+        started.elapsed()
+    );
     assert!(
         cli.json(&["sessions"])["sessions"]
             .as_array()

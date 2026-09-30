@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import pathlib
 import tempfile
+import tomllib
 import unittest
 
 import package_metadata
@@ -33,6 +34,11 @@ class PackageMetadataTests(unittest.TestCase):
             self.assertIn("depends_on arch: :arm64", formula)
             self.assertIn('depends_on "wayland"', formula)
             self.assertIn('depends_on "mesa"', formula)
+            for library in ("libxcursor", "libxi"):
+                self.assertIn(f'depends_on "{library}"', formula)
+            self.assertIn(
+                "%w[libx11 libxcb libxcursor libxi libxkbcommon mesa wayland]", formula
+            )
             self.assertIn('formula_opt_lib(name)', formula)
             self.assertIn('LD_LIBRARY_PATH:', formula)
             self.assertIn('shell_output("#{bin}/devknx --version")', formula)
@@ -48,6 +54,10 @@ class PackageMetadataTests(unittest.TestCase):
                           (output / "devknx-bin.PKGBUILD").read_text())
             self.assertIn('_srcdir="devknx-v0.2.0"', (output / "devknx.PKGBUILD").read_text())
             self.assertIn("devknx-v0.2.0-source.tar.gz", (output / "devknx.PKGBUILD").read_text())
+            for recipe in ("devknx.PKGBUILD", "devknx-bin.PKGBUILD"):
+                content = (output / recipe).read_text()
+                for library in ("libxcursor", "libxi", "libxkbcommon-x11", "mesa"):
+                    self.assertIn(f"'{library}'", content)
             with self.assertRaisesRegex(ValueError, "refusing to overwrite"):
                 package_metadata.generate("0.2.0", tag, root, output)
 
@@ -58,6 +68,19 @@ class PackageMetadataTests(unittest.TestCase):
                 package_metadata.generate("0.2.0", "v0.3.0", root, root / "out")
             with self.assertRaisesRegex(ValueError, "missing qualified payload"):
                 package_metadata.generate("0.2.0", "v0.2.0", root, root / "out")
+
+    def test_debian_declares_dynamically_loaded_gui_libraries(self) -> None:
+        manifest = pathlib.Path(__file__).resolve().parents[2] / "Cargo.toml"
+        metadata = tomllib.loads(manifest.read_text())["package"]["metadata"]["deb"]
+        dependencies = {item.strip() for item in metadata["depends"].split(",")}
+        self.assertIn("$auto", dependencies)
+        self.assertTrue({
+            "libx11-6", "libx11-xcb1", "libxcursor1", "libxi6", "libxcb1",
+            "libxkbcommon0", "libxkbcommon-x11-0", "libwayland-client0",
+            "libwayland-cursor0", "libwayland-egl1", "libegl1", "libegl-mesa0",
+            "libgl1", "libglx-mesa0", "libgl1-mesa-dri",
+        }.issubset(dependencies))
+        self.assertNotIn("<", metadata["extended-description"])
 
 
 if __name__ == "__main__":

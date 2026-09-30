@@ -1,4 +1,4 @@
-# Initiative plan: devknx (v7)
+# Initiative plan: devknx (v9)
 
 Epic: [devknx initiative](https://github.com/metaneutrons/devknx/issues/3)
 Decision state: product scope agreed with Fabian in September 2026
@@ -54,11 +54,15 @@ occur only at their acceptance stages.
   session leaves the daemon and other sessions running. `monitor` is a client
   of the managed session, not a competing SQLite writer.
 - REST is disabled by default and is enabled, inspected, or disabled through
-  the daemon control plane. One listener is scoped to one explicitly selected
-  connected session; no implicit cross-session aggregation or target switching
-  is allowed. MCP remains an opt-in stdio adapter to a selected capture. The
-  pre-connection `captures.sqlite` may mix gateways and remains available for
-  offline inspection; it is not silently assigned to one endpoint.
+  the daemon control plane. One listener can start without a KNX session or
+  selected endpoint. HTTP lists sessions and starts or stops explicitly named
+  endpoints; each data and operation request selects an endpoint unless a
+  listener default was configured. Disconnecting does not stop REST. No
+  implicit cross-session aggregation or target switching is allowed. MCP remains an opt-in stdio adapter to a selected capture, but
+  exposes session listing, explicit connection, and a database-scoped
+  disconnect even before its selected database exists. The pre-connection
+  `captures.sqlite` may mix gateways and remains available for offline
+  inspection; it is not silently assigned to one endpoint.
 - A capture stores the raw cEMI frame as well as parsed source, destination,
   service, payload, connection, direction, and timestamp. The raw event is not
   rewritten when ETS metadata changes. Enrichment is versioned separately.
@@ -208,16 +212,24 @@ Dependencies: M2 through M5; prerequisite to M6 publication
   daemon. Current-user control IPC is authenticated by OS permissions and
   rejects duplicate owners and malformed or oversized requests.
 - M7-A3: REST has explicit enable, disable, and status controls. It is off by
-  default, bound to one chosen active session, reports the actual listening
-  address only after successful bind, and stops when that session disconnects.
-  Existing token, remote-write and origin-audit rules remain effective;
-  status never discloses a token. The GUI exposes live status in the bottom bar
-  and policy and listener controls in a separate REST API dialog. The TUI offers
-  a confirmed loopback-only toggle. MCP remains explicitly scoped.
+  default, starts independently of endpoints or active KNX sessions, and
+  reports the actual listening address only after successful bind. Authenticated
+  HTTP list, status, connect, and disconnect requests manage explicit sessions;
+  endpoint-scoped data and operations never guess among sessions. A configured
+  endpoint is only a default; disconnect leaves REST available. Existing
+  token, remote-write and origin-audit rules remain effective; status never
+  discloses a token. The GUI exposes live status in the bottom bar and policy
+  and listener controls in a separate REST API dialog. The TUI offers a
+  confirmed loopback-only toggle. MCP lists daemon sessions, connects an
+  explicit endpoint to its selected capture, and disconnects only the session
+  atomically associated with that capture database. It can start before the
+  first capture file exists; typed writes remain separately opted in.
 - M7-A4: Documentation, source-anchored interface coverage, loopback tests,
   and supported-platform CI qualify two sessions, isolation, lifecycle,
-  operation safety, REST controls, daemon startup races, and shutdown. No
-  physical KNX write is required for acceptance.
+  operation safety, REST and MCP connection controls before and after a KNX
+  connection, daemon startup races, and shutdown. Negative cases include
+  invalid endpoints, conflicting database bindings and unauthorized remote
+  control. No physical KNX write is required for acceptance.
 
 ### M8: Automation contract and safety hardening
 
@@ -307,3 +319,9 @@ use. No time or runner-cost estimate has been measured.
   for appropriate CLI calls and a connection lifecycle separate from daemon
   lifetime. M7 makes this a prerequisite of the first release. Release-Please
   PRs remain manual; no merge, tag, or publication is authorized here.
+- 2026-09-30 (v8): Fabian clarified that REST and MCP must control the KNX
+  connection themselves. M7-A3 replaces the earlier active-session requirement
+  for REST enablement and the automatic REST stop on KNX disconnect.
+- 2026-09-30 (v9): REST can start with no default endpoint, list and control
+  explicitly named sessions, and scope every data and operation request to a
+  named endpoint. A configured listener endpoint remains an optional default.

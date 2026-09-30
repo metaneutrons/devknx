@@ -192,7 +192,7 @@ impl App {
                                     || "unknown address".into(),
                                     |bind| bind.to_string()
                                 ),
-                                status.endpoint.as_deref().unwrap_or("unknown endpoint")
+                                status.endpoint.as_deref().unwrap_or("no default endpoint")
                             )
                         } else {
                             "REST disabled".into()
@@ -339,19 +339,28 @@ impl App {
                 return;
             }
         };
+        let database = self.model.database.clone();
         let (sender, receiver) = mpsc::channel();
         self.rest_receiver = Some(receiver);
         self.rest_action_pending = true;
         std::thread::spawn(move || {
             let result = interface::rest_status().and_then(|status| {
                 if status.enabled {
-                    if status.endpoint.as_deref() == Some(endpoint.as_str()) {
+                    if status.endpoint.is_none()
+                        || status.endpoint.as_deref() == Some(endpoint.as_str())
+                    {
                         interface::rest_disable()
                     } else {
                         Err("REST belongs to another KNX session; use the CLI to inspect it".into())
                     }
                 } else {
-                    interface::rest_enable(&endpoint, "127.0.0.1:8765", None, false)
+                    interface::rest_enable(
+                        Some(&endpoint),
+                        Some(database),
+                        "127.0.0.1:8765",
+                        None,
+                        false,
+                    )
                 }
             });
             let _ = sender.send(result);
@@ -713,7 +722,7 @@ impl App {
                 Mode::WriteDpt => format!("DPT (blank = ETS): {}", self.input),
                 Mode::WriteValue => format!("Typed value: {}", self.input),
                 Mode::ConfirmWrite => format!("{} · y transmit / n or Esc cancel", self.preview),
-                Mode::ConfirmRest => "Toggle REST for this KNX session (enable uses loopback)? y confirm / n or Esc cancel".to_owned(),
+                Mode::ConfirmRest => "Toggle REST for the selected KNX endpoint (enable uses loopback)? y confirm / n or Esc cancel".to_owned(),
                 Mode::Export => format!("New CSV file path: {}", self.input),
                 Mode::ConnectionEndpoint => format!("KNXnet/IP endpoint (tunnel://IP:3671 or router://MULTICAST:3671): {}", self.input),
             };

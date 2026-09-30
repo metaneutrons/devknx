@@ -4,12 +4,13 @@ One per-user `devknx daemon` owns zero or more configured KNXnet/IP sessions.
 Starting it alone does not connect to KNX. Each connected session owns one
 SQLite writer and retains a database-scoped capture IPC endpoint. A separate
 current-user control endpoint accepts bounded JSON-line requests: `ping`,
-`list`, `connect`, `disconnect`, `rest_enable`, `rest_disable`, `rest_status`,
+`list`, `connect`, `disconnect`, `disconnect_scoped`, `rest_enable`, `rest_disable`, `rest_status`,
 and `stop`. Connect identifies a canonical endpoint and optional database
-override. Disconnect identifies one endpoint; Stop ends all sessions and the
-daemon. REST status omits its bearer token. CLI offline commands and status
-queries do not auto-start the daemon; endpoint-selected live operations and
-explicit Connect may do so.
+override. Disconnect identifies one endpoint; `disconnect_scoped` atomically
+selects the session by capture database. Stop ends all sessions and the daemon.
+REST status omits its bearer token. CLI offline commands and status queries do
+not auto-start the daemon; endpoint-selected live operations, explicit Connect,
+and explicit REST enable may do so. REST enable alone does not connect to KNX.
 
 `devknx status --endpoint URL` requests one current connection state.
 `devknx follow --endpoint URL` receives that state and subsequent state,
@@ -23,7 +24,10 @@ running after the window or terminal interface closes.
 The client sends `STATUS\n` or `FOLLOW\n` for status or the live stream.
 Legacy per-database `STOP\n` is not enabled for daemon sessions. Session
 lifecycle uses the control endpoint so a stopped session cannot terminate
-other connections or the daemon. This command is not exposed by REST or MCP.
+other connections or the daemon. REST lists and controls explicit endpoints over
+`/v1/sessions`; `/v1/connection` is a shortcut for a listener default. MCP can
+connect an explicit endpoint to its selected database and disconnect only that
+database's active session.
 For one group operation it sends `OPERATE\n` followed by one bounded JSON line
 containing a tagged `read`, `typed_write`, or `raw_write` intent. Pre-encoded
 frames are not accepted: the connection owner resolves ETS metadata, validates

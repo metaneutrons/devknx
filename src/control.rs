@@ -50,8 +50,13 @@ pub enum ControlRequest {
     Disconnect {
         endpoint: String,
     },
+    DisconnectScoped {
+        database: PathBuf,
+    },
     RestEnable {
-        endpoint: String,
+        endpoint: Option<String>,
+        #[serde(default)]
+        database: Option<PathBuf>,
         bind: SocketAddr,
         token: Option<String>,
         allow_remote_writes: bool,
@@ -552,7 +557,8 @@ mod tests {
     #[test]
     fn control_protocol_is_tagged_and_rest_status_has_no_token_field() {
         let request = ControlRequest::RestEnable {
-            endpoint: "tunnel://192.0.2.1:3671".into(),
+            endpoint: Some("tunnel://192.0.2.1:3671".into()),
+            database: None,
             bind: "127.0.0.1:8765".parse().unwrap(),
             token: Some("test-secret-token".into()),
             allow_remote_writes: false,

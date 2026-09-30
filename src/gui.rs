@@ -476,14 +476,13 @@ impl MonitorApp {
         if self.rest_receiver.is_some() || self.offline_capture {
             return;
         }
-        let endpoint = match self.settings.endpoint() {
-            Ok(endpoint) => endpoint,
-            Err(error) => {
-                self.error = Some(error);
-                return;
-            }
-        };
+        let endpoint = self.settings.endpoint().ok();
         let bind = self.rest_bind.trim().to_owned();
+        let database = endpoint.as_ref().and_then(|_| {
+            self.primary_database
+                .clone()
+                .or_else(|| self.database_override.clone())
+        });
         let token_text = std::mem::take(&mut self.rest_token);
         let token = (!token_text.is_empty()).then_some(token_text);
         let allow_remote_writes = self.rest_allow_remote_writes;
@@ -493,7 +492,8 @@ impl MonitorApp {
         self.rest_action_error = None;
         std::thread::spawn(move || {
             let _ = sender.send(interface::rest_enable(
-                &endpoint,
+                endpoint.as_deref(),
+                database,
                 &bind,
                 token,
                 allow_remote_writes,
@@ -572,6 +572,25 @@ impl MonitorApp {
 
     fn process_background(&mut self) {
         self.process_rest_background();
+        if self.model.is_none()
+            && !self.offline_capture
+            && let Ok(endpoint) = self.settings.endpoint()
+            && let Ok(database) = self
+                .database_override
+                .clone()
+                .map_or_else(|| paths::database_for_endpoint(&endpoint), Ok)
+            && database.exists()
+        {
+            match interface::save_settings(&database, &self.settings) {
+                Ok(()) => {
+                    self.primary_database = Some(database.clone());
+                    self.attach(&database, false);
+                }
+                Err(error) => {
+                    self.error = Some(format!("Could not save connection settings: {error}"));
+                }
+            }
+        }
         if let Some(receiver) = &self.gateway_receiver {
             match receiver.try_recv() {
                 Ok(Ok(gateways)) => {
@@ -896,8 +915,8 @@ impl MonitorApp {
                                 )
                             ));
                             ui.label(format!(
-                                "Serving {}",
-                                status.endpoint.as_deref().unwrap_or("unknown KNX connection")
+                                "Selected endpoint: {}",
+                                status.endpoint.as_deref().unwrap_or("none; supply endpoint per request")
                             ));
                             ui.small(if status.allow_remote_writes {
                                 "Remote typed writes enabled"
@@ -910,7 +929,12 @@ impl MonitorApp {
                     } else {
                         ui.label("Checking REST status…");
                     }
-                    ui.small("The REST listener is a daemon service for one active KNX connection. Disconnecting that connection stops it.");
+                    ui.small("REST starts without a KNX connection. Use /v1/sessions to list, connect, and disconnect endpoints.");
+                    ui.small("If an endpoint is selected here, /v1/connection and endpoint-free data requests use it as the default.");
+                    let target_endpoint = self.settings.endpoint();
+                    if let Ok(endpoint) = &target_endpoint {
+                        ui.small(format!("Selected endpoint: {endpoint}"));
+                    }
                     ui.separator();
                     let active = self.rest_status.as_ref().is_some_and(|status| status.enabled);
                     ui.add_enabled_ui(!active, |ui| {
@@ -929,15 +953,13 @@ impl MonitorApp {
                         ui.small("Stop REST before changing its settings.");
                     }
                     ui.small("REST uses plain HTTP. Expose it only on a trusted network or behind a TLS proxy.");
-                    let connected = !self.offline_capture
-                        && self.model.as_ref().is_some_and(|model| model.owner_available);
                     let status_known = self.rest_status.is_some() && self.rest_error.is_none();
-                    if !connected && !active {
-                        ui.small("Connect to a KNX gateway before starting REST.");
+                    if self.offline_capture && !active {
+                        ui.small("Return to Live Capture before starting REST.");
                     }
                     ui.horizontal(|ui| {
                         enable = ui.add_enabled(
-                            connected && status_known && !active && self.rest_receiver.is_none(),
+                            !self.offline_capture && status_known && !active && self.rest_receiver.is_none(),
                             egui::Button::new("Start REST"),
                         ).clicked();
                         disable = ui.add_enabled(
@@ -1381,7 +1403,9 @@ impl MonitorApp {
             .is_some_and(|smoke| smoke.pin_to_top);
         let mut scroll = egui::ScrollArea::vertical()
             .id_salt("captures")
-            .auto_shrink([false, false])
+            // Keep the table full-width, but end it after the last capture
+            // instead of rendering empty viewport rows when history is short.
+            .auto_shrink([false, true])
             .stick_to_bottom(!pin_to_top)
             .max_height((ui.available_height() - 85.0).max(100.0));
         if pin_to_top {

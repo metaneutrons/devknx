@@ -116,6 +116,9 @@ enum Command {
         status: bool,
         #[arg(long)]
         endpoint: Option<String>,
+        /// Override the capture database associated with the REST target.
+        #[arg(long)]
+        database: Option<PathBuf>,
         #[arg(long, default_value = "127.0.0.1:8765")]
         bind: SocketAddr,
         #[arg(long)]
@@ -404,12 +407,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             disable,
             status: _,
             endpoint,
+            database,
             bind,
             token_env,
             allow_remote_writes,
         }) => {
             if !enable
                 && (endpoint.is_some()
+                    || database.is_some()
                     || token_env.is_some()
                     || allow_remote_writes
                     || bind != "127.0.0.1:8765".parse::<SocketAddr>()?)
@@ -421,13 +426,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into());
             }
             let request = if enable {
-                let endpoint = endpoint.ok_or_else(|| {
-                    io::Error::new(
+                let endpoint = endpoint
+                    .map(|endpoint| paths::canonical_endpoint(&endpoint))
+                    .transpose()
+                    .map_err(io::Error::other)?;
+                if endpoint.is_none() && database.is_some() {
+                    return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "rest --enable requires --endpoint",
+                        "rest --database requires --endpoint",
                     )
-                })?;
-                let endpoint = paths::canonical_endpoint(&endpoint).map_err(io::Error::other)?;
+                    .into());
+                }
+                let database = database.map(std::path::absolute).transpose()?;
                 let token = token_env
                     .map(|name| {
                         std::env::var(name).map_err(|_| {
@@ -440,6 +450,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .transpose()?;
                 ControlRequest::RestEnable {
                     endpoint,
+                    database,
                     bind,
                     token,
                     allow_remote_writes,
@@ -449,7 +460,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 ControlRequest::RestStatus
             };
-            print_control_response(&ControlClient::request_existing(request).await?)?;
+            let response = if enable {
+                ControlClient::request(request).await?
+            } else {
+                ControlClient::request_existing(request).await?
+            };
+            print_control_response(&response)?;
         }
         Some(Command::Monitor {
             endpoint,
@@ -491,7 +507,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .transpose()?;
             api::run(ApiConfig {
-                database,
+                database: Some(database),
+                endpoint: None,
+                managed: false,
                 bind,
                 token,
                 allow_remote_writes,
@@ -503,13 +521,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             allow_writes: _,
             write_address,
         }) => {
+            let selected_endpoint = selector
+                .endpoint
+                .as_deref()
+                .map(paths::canonical_endpoint)
+                .transpose()
+                .map_err(io::Error::other)?;
             let allowed = write_address
                 .iter()
                 .map(|address| {
                     parse_group_address(address).map(knx_rs_core::address::GroupAddress::raw)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            mcp::run(resolve_capture_selector(selector)?, allowed).await?;
+            mcp::run(
+                resolve_capture_selector(selector)?,
+                selected_endpoint,
+                allowed,
+            )
+            .await?;
         }
         Some(Command::Status { selector }) => {
             run_ipc_client(&resolve_capture_selector(selector)?, false).await?;
@@ -759,6 +788,7 @@ async fn connect_session(
     max_events: NonZeroU32,
 ) -> io::Result<ControlResponse> {
     let endpoint = paths::canonical_endpoint(endpoint).map_err(io::Error::other)?;
+    let database = database.map(std::path::absolute).transpose()?;
     ControlClient::ensure_daemon().await?;
     ControlClient::request_existing(ControlRequest::Connect {
         endpoint,

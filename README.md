@@ -116,13 +116,17 @@ if needed; `--database` alone never guesses an endpoint or starts a session.
 connection as a write target.
 
 The daemon owns one opt-in REST listener, bound to `127.0.0.1:8765` by
-default and scoped to one connected endpoint. The GUI controls it in
-its own REST API dialog, opened from the live status in the bottom bar.
+default. It can start before any KNX session. `GET`, `POST`, and `DELETE` on
+`/v1/sessions` list, connect, and disconnect explicit endpoints. Data and
+operations require an endpoint unless a listener default was selected. The GUI
+controls the listener in its own REST API dialog, opened from the live status
+in the bottom bar.
 The TUI's `a` key toggles a loopback listener after confirmation. The CLI
 also exposes the bind address, bearer token and remote-write policy. See the
 [REST API guide](docs/rest.md) for versioned routes,
 SSE resume, authentication and remote-write policy.
-The MCP adapter is a separate local stdio process and hides typed writes by
+The MCP adapter is a separate local stdio process with explicit session list,
+connect, and selected-database disconnect tools. It hides typed writes by
 default. See the [MCP guide](docs/mcp.md) for tool names, structured results,
 bounded search and exact-address write opt-in.
 

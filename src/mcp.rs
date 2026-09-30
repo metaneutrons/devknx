@@ -24,14 +24,17 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::control::{ControlClient, ControlRequest, ControlResponse, SessionInfo};
 use crate::enrichment::{enrich_response_frame, enriched_capture_json};
 use crate::ets::parse_group_address;
 use crate::ipc::{IpcClient, IpcMessage, ReadOutcome};
 use crate::operations::{OperationOrigin, OperationRequest, prepare};
+use crate::paths;
 use crate::service::{LiveCapture, LiveRoutingLoss};
 use crate::storage::CaptureStore;
 
 const SEARCH_SCAN_LIMIT: u32 = 10_000;
+const DEFAULT_SESSION_MAX_EVENTS: u32 = 100_000;
 const TOOL_CALLS_PER_MINUTE: usize = 120;
 const BUS_CALLS_PER_MINUTE: usize = 12;
 const DISCOVERY_CALLS_PER_MINUTE: usize = 6;
@@ -87,15 +90,15 @@ impl RateState {
 ///
 /// # Errors
 ///
-/// Returns a missing database or protocol transport failure.
+/// Returns a protocol transport failure.
 pub async fn run(
     database: PathBuf,
+    selected_endpoint: Option<String>,
     allowed_write_addresses: Vec<u16>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    CaptureStore::open_existing(&database)?;
-    let service = McpServer::with_write_addresses(database, allowed_write_addresses)
-        .serve(stdio())
-        .await?;
+    let mut adapter = McpServer::with_write_addresses(database, allowed_write_addresses);
+    adapter.selected_endpoint = selected_endpoint;
+    let service = adapter.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
 }
@@ -105,6 +108,7 @@ pub async fn run(
 pub struct McpServer {
     tool_router: ToolRouter<Self>,
     database: PathBuf,
+    selected_endpoint: Option<String>,
     rate: Arc<Mutex<RateState>>,
     allowed_write_addresses: BTreeSet<u16>,
 }
@@ -130,6 +134,7 @@ impl McpServer {
         Self {
             tool_router,
             database,
+            selected_endpoint: None,
             rate: Arc::new(Mutex::new(RateState::default())),
             allowed_write_addresses,
         }
@@ -183,6 +188,13 @@ impl McpServer {
 struct AddressParams {
     /// KNX group address in three-level, two-level, decimal or ETS hex notation.
     address: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ConnectParams {
+    /// Explicit KNXnet/IP tunnel or router endpoint URL.
+    endpoint: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -280,6 +292,132 @@ impl McpServer {
         }
     }
 
+    /// List every session configured in the current-user capture daemon.
+    #[tool(
+        description = "List all capture-daemon sessions, including an empty list when no daemon is running.",
+        annotations(
+            title = "List KNX sessions",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn knx_sessions(&self) -> CallToolResult {
+        if let Err(error) = self.check_rate(ToolKind::Local) {
+            return error;
+        }
+        match ControlClient::request_existing(ControlRequest::List).await {
+            Ok(ControlResponse::Sessions { sessions }) => {
+                structured(json!({ "sessions": sessions }))
+            }
+            Ok(ControlResponse::Error { reason }) => tool_error(reason),
+            Ok(_) => tool_error("unexpected capture daemon response"),
+            Err(error) if daemon_unavailable(&error) => structured(json!({ "sessions": [] })),
+            Err(_) => tool_error("cannot list capture daemon sessions"),
+        }
+    }
+
+    /// Connect an explicit KNXnet/IP endpoint using this server's selected database.
+    #[tool(
+        description = "Connect the explicit KNXnet/IP endpoint using this MCP server's selected capture database and a requested retention limit of 100000 events.",
+        annotations(
+            title = "Connect KNX session",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn knx_connect(&self, Parameters(params): Parameters<ConnectParams>) -> CallToolResult {
+        if let Err(error) = self.check_rate(ToolKind::Bus) {
+            return error;
+        }
+        let endpoint = match paths::canonical_endpoint(&params.endpoint) {
+            Ok(endpoint) => endpoint,
+            Err(error) => return tool_error(format!("invalid endpoint: {error}")),
+        };
+        if self
+            .selected_endpoint
+            .as_ref()
+            .is_some_and(|selected| selected != &endpoint)
+        {
+            return tool_error("endpoint differs from this MCP server's --endpoint selector");
+        }
+        let database = match normalize_database_path(&self.database) {
+            Ok(database) => database,
+            Err(error) => return tool_error(error),
+        };
+        match ControlClient::request(ControlRequest::Connect {
+            endpoint,
+            database: Some(database),
+            max_events: DEFAULT_SESSION_MAX_EVENTS,
+        })
+        .await
+        {
+            Ok(ControlResponse::Session { session }) => structured(json!({
+                "session": session,
+                "requested_max_events": DEFAULT_SESSION_MAX_EVENTS,
+            })),
+            Ok(ControlResponse::Error { reason }) => tool_error(reason),
+            Ok(_) => tool_error("unexpected capture daemon response"),
+            Err(_) => tool_error("cannot connect capture daemon session"),
+        }
+    }
+
+    /// Disconnect only the daemon session using this server's selected database.
+    #[tool(
+        description = "Disconnect only the daemon session currently associated with this MCP server's selected capture database; returns disconnected=false when none is associated.",
+        annotations(
+            title = "Disconnect KNX session",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn knx_disconnect(&self) -> CallToolResult {
+        if let Err(error) = self.check_rate(ToolKind::Bus) {
+            return error;
+        }
+        let database = match normalize_database_path(&self.database) {
+            Ok(database) => database,
+            Err(error) => return tool_error(error),
+        };
+        if !database.exists() {
+            return structured(json!({ "disconnected": false, "session": null }));
+        }
+        let sessions = match ControlClient::request_existing(ControlRequest::List).await {
+            Ok(ControlResponse::Sessions { sessions }) => sessions,
+            Ok(ControlResponse::Error { reason }) => return tool_error(reason),
+            Ok(_) => return tool_error("unexpected capture daemon response"),
+            Err(error) if daemon_unavailable(&error) => {
+                return structured(json!({ "disconnected": false, "session": null }));
+            }
+            Err(_) => return tool_error("cannot list capture daemon sessions"),
+        };
+        let session = match session_for_database(&sessions, &database) {
+            Ok(Some(session)) => session,
+            Ok(None) => return structured(json!({ "disconnected": false, "session": null })),
+            Err(error) => return tool_error(error),
+        };
+        if self
+            .selected_endpoint
+            .as_ref()
+            .is_some_and(|selected| selected != &session.endpoint)
+        {
+            return tool_error("selected capture is bound to a different KNX endpoint");
+        }
+        match ControlClient::request_existing(ControlRequest::DisconnectScoped { database }).await {
+            Ok(ControlResponse::Disconnected) => structured(json!({
+                "disconnected": true,
+                "session": session,
+            })),
+            Ok(ControlResponse::Error { reason }) => tool_error(reason),
+            Ok(_) => tool_error("unexpected capture daemon response"),
+            Err(_) => tool_error("cannot disconnect capture daemon session"),
+        }
+    }
+
     /// Read the capture-owner state and active ETS revision.
     #[tool(
         description = "Read capture-owner connection state and active ETS revision without changing the bus.",
@@ -295,7 +433,11 @@ impl McpServer {
         }
         let database = self.database.clone();
         let revision = tokio::task::spawn_blocking(move || {
-            CaptureStore::open_existing(&database)?.ets_revision()
+            if database.exists() {
+                CaptureStore::open_existing(&database)?.ets_revision()
+            } else {
+                Ok(None)
+            }
         })
         .await;
         let Ok(Ok(revision)) = revision else {
@@ -694,6 +836,112 @@ fn tool_error(message: impl Into<String>) -> CallToolResult {
     CallToolResult::structured_error(json!({ "error": message.into() }))
 }
 
+fn daemon_unavailable(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::AddrNotAvailable
+    )
+}
+
+fn normalize_database_path(path: &Path) -> Result<PathBuf, &'static str> {
+    if path == Path::new(":memory:") {
+        return Err("selected capture database must be file-backed");
+    }
+    let name = path
+        .file_name()
+        .ok_or("selected capture database path is invalid")?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let absolute_parent = if parent.is_absolute() {
+        parent.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|_| "selected capture database directory is unavailable")?
+            .join(parent)
+    };
+    let normalized_parent = match std::fs::canonicalize(&absolute_parent) {
+        Ok(parent) => parent,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => absolute_parent,
+        Err(_) => return Err("selected capture database directory is unavailable"),
+    };
+    Ok(normalized_parent.join(name))
+}
+
+#[cfg(any(test, not(unix)))]
+fn normalize_existing_database_path(path: &Path) -> Result<PathBuf, &'static str> {
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|_| "selected capture database is unavailable")?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("selected capture database must be a regular file");
+    }
+    let name = path
+        .file_name()
+        .ok_or("selected capture database path is invalid")?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = std::fs::canonicalize(parent)
+        .map_err(|_| "selected capture database directory is unavailable")?;
+    Ok(parent.join(name))
+}
+
+#[derive(PartialEq, Eq)]
+enum DatabaseIdentity {
+    #[cfg(unix)]
+    File { device: u64, inode: u64 },
+    #[cfg(not(unix))]
+    Path(PathBuf),
+}
+
+fn database_identity(path: &Path) -> Result<Option<DatabaseIdentity>, &'static str> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("cannot inspect capture database identity"),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Ok(None);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(Some(DatabaseIdentity::File {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }))
+    }
+    #[cfg(not(unix))]
+    {
+        normalize_existing_database_path(path)
+            .map(DatabaseIdentity::Path)
+            .map(Some)
+    }
+}
+
+fn session_for_database(
+    sessions: &[SessionInfo],
+    database: &Path,
+) -> Result<Option<SessionInfo>, &'static str> {
+    let Some(identity) = database_identity(database)? else {
+        return Err("selected capture database is unavailable");
+    };
+    let mut matching = None;
+    for session in sessions {
+        if database_identity(&session.database)?.as_ref() == Some(&identity) {
+            if matching.is_some() {
+                return Err("multiple daemon sessions use the selected capture database");
+            }
+            matching = Some(session.clone());
+        }
+    }
+    Ok(matching)
+}
+
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut result = String::with_capacity(bytes.len() * 2);
@@ -719,9 +967,12 @@ mod tests {
         let router = McpServer::tools();
         let tools = router.list_all();
         let names: Vec<_> = tools.iter().map(|tool| tool.name.to_string()).collect();
-        assert_eq!(names.len(), 9);
+        assert_eq!(names.len(), 12);
         for required in [
             "knx_discover",
+            "knx_sessions",
+            "knx_connect",
+            "knx_disconnect",
             "knx_status",
             "knx_list_captures",
             "knx_list_routing_losses",
@@ -749,11 +1000,116 @@ mod tests {
             preview.annotations.as_ref().unwrap().read_only_hint,
             Some(true)
         );
+        let sessions = tools
+            .iter()
+            .find(|tool| tool.name == "knx_sessions")
+            .unwrap();
+        assert_eq!(
+            sessions.annotations.as_ref().unwrap().read_only_hint,
+            Some(true)
+        );
+        let connect = tools
+            .iter()
+            .find(|tool| tool.name == "knx_connect")
+            .unwrap();
+        let connect_annotations = connect.annotations.as_ref().unwrap();
+        assert_eq!(connect_annotations.read_only_hint, Some(false));
+        assert_eq!(connect_annotations.destructive_hint, Some(false));
+        let connect_schema = Value::Object(connect.input_schema.as_ref().clone());
+        assert_eq!(connect_schema["required"][0], "endpoint");
+        let disconnect = tools
+            .iter()
+            .find(|tool| tool.name == "knx_disconnect")
+            .unwrap();
+        assert_eq!(
+            disconnect.annotations.as_ref().unwrap().read_only_hint,
+            Some(false)
+        );
         let default = McpServer::new(PathBuf::from("unused"));
-        assert_eq!(default.tool_router.list_all().len(), 8);
+        assert_eq!(default.tool_router.list_all().len(), 11);
         assert!(!default.tool_router.has_route("knx_typed_write"));
         let allowed = McpServer::with_write_addresses(PathBuf::from("unused"), [0x0a03]);
         assert!(allowed.tool_router.has_route("knx_typed_write"));
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_invalid_endpoint_before_daemon_access() {
+        let server = McpServer::new(PathBuf::from("unused"));
+        let result = server
+            .knx_connect(Parameters(ConnectParams {
+                endpoint: "http://example.invalid".into(),
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result.structured_content.unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("invalid endpoint:")
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_an_endpoint_different_from_the_process_selector() {
+        let mut server = McpServer::new(PathBuf::from("unused"));
+        server.selected_endpoint = Some("tunnel://192.0.2.1:3671".into());
+        let result = server
+            .knx_connect(Parameters(ConnectParams {
+                endpoint: "tunnel://192.0.2.2:3671".into(),
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result.structured_content.unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .contains("--endpoint selector")
+        );
+    }
+
+    #[test]
+    fn disconnect_scoping_matches_normalized_database_identity_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.sqlite");
+        let second = directory.path().join("second.sqlite");
+        let third = directory.path().join("third.sqlite");
+        std::fs::create_dir(directory.path().join("nested")).unwrap();
+        drop(CaptureStore::open(&first, NonZeroU32::new(10).unwrap()).unwrap());
+        drop(CaptureStore::open(&second, NonZeroU32::new(10).unwrap()).unwrap());
+        drop(CaptureStore::open(&third, NonZeroU32::new(10).unwrap()).unwrap());
+        let sessions = vec![
+            SessionInfo {
+                endpoint: "tunnel://192.0.2.1:3671".into(),
+                database: first.clone(),
+            },
+            SessionInfo {
+                endpoint: "tunnel://192.0.2.2:3671".into(),
+                database: second,
+            },
+        ];
+        let normalized_spelling = directory.path().join("nested/../first.sqlite");
+        assert_eq!(
+            session_for_database(&sessions, &normalized_spelling)
+                .unwrap()
+                .unwrap()
+                .endpoint,
+            "tunnel://192.0.2.1:3671"
+        );
+        #[cfg(unix)]
+        {
+            let alias = directory.path().join("first-alias.sqlite");
+            std::fs::hard_link(&first, &alias).unwrap();
+            assert_eq!(
+                session_for_database(&sessions, &alias)
+                    .unwrap()
+                    .unwrap()
+                    .endpoint,
+                "tunnel://192.0.2.1:3671"
+            );
+        }
+        assert_eq!(session_for_database(&sessions, &third).unwrap(), None);
+        assert!(session_for_database(&sessions, &directory.path().join("missing.sqlite")).is_err());
+        assert!(normalize_existing_database_path(&first).is_ok());
     }
 
     #[tokio::test]

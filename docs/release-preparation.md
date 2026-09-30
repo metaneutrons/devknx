@@ -5,9 +5,8 @@ on packaging pull requests and can also be dispatched manually. Its token has
 read-only repository access. It creates no tag, GitHub Release, package-channel
 update, signature, or notarization submission.
 
-Release Please uses the single-crate Rust strategy and a 0.0.0 bootstrap
-manifest to propose 0.1.0 as the first version. The source crate remains at
-0.1.0 until that proposal is merged. Release Please synchronizes
+Release Please uses the single-crate Rust strategy. A 0.0.0 bootstrap
+manifest proposed 0.1.0 as the first version. Release Please synchronizes
 `Cargo.toml`, `Cargo.lock`, the manifest, and `CHANGELOG.md`. The proposal
 must remain unmerged until the release is separately authorized. The
 Release-Please PR is reviewed and merged manually; auto-merge must remain off.
@@ -55,17 +54,46 @@ signing or object-store key: after promotion it dispatches the central
 and arm64. A failed APT read-back leaves the previous index in service; it
 cannot roll back a GitHub release already promoted.
 
-GitHub has two isolated environments. `release-please` accepts only
+GitHub has three isolated environments. `release-please` accepts only
 `main` and holds the shared Release Please App key; the workflow requests an
 installation token limited to `devknx` with only Contents and Pull Requests
 write access. The App key itself can mint tokens for other repositories in its
 existing installations, so its custody remains security-critical. `release`
 accepts only `v*` tags and holds Apple signing/notary credentials, the AUR SSH key, and
-the dedicated Homebrew and central-archive App keys. The first stable release
+the dedicated Homebrew and central-archive App keys. `release-sparkle` accepts
+only `v*` tags and holds the app-specific Sparkle key and bucket-scoped R2
+credentials. The first stable release
 and the subsequent KnxMonitor deprecation require Fabian's separate release
-instruction. The pipeline cannot be claimed end-to-end qualified until a tag
-run has actually completed; static checks and PR packaging runs cover only
-the non-publishing path. Visual inspection of the app is also still pending.
+instruction. Static checks and PR packaging runs cover only the non-publishing
+path. Local macOS visual checks cover the connection workflow, capture layout,
+and ETS import; they do not establish full cross-platform visual qualification.
+
+## Debian installation qualification
+
+Candidate pull requests and the production release use the same
+`scripts/release/qualify-deb.sh` installer on amd64 and arm64. It checks package
+identity and architecture before installation, then the installed revision,
+executable version, and every bundled licence notice. Minimal Ubuntu images
+exclude most of `/usr/share/doc` by default. The installer passes a narrowly
+scoped dpkg path inclusion for `/usr/share/doc/devknx/*`, so those checks inspect
+the package's documentation rather than the container's stripping policy.
+
+The first production attempt exposed this image-policy mismatch before public
+staging; the package itself contained the notices. PR #54 moved the actual
+installation check into candidate qualification as well. Local Ubuntu 24.04,
+Debian 12 and Debian 13 probes passed; an isolated package with its OFL notice
+removed was rejected even though its binary installed and ran.
+
+## First-version tag exception
+
+On 2026-09-30, Fabian explicitly authorized a one-off exception for the
+unpublished first version. The failed attempt had not uploaded release assets
+or published any package channel. After PR #54 passed CI and candidate
+qualification, `v0.1.0` was corrected from `b674299` to
+`d0a0c1308d6258a1e7cbfe7b799aa72458996a7a` and dispatched again. The tag
+ruleset excluded only that exact ref during the correction; its complete
+original protection was restored immediately afterward. This is not permission
+to move published or future release tags.
 
 Local packaging probes:
 

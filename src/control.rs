@@ -126,8 +126,8 @@ impl ControlReply {
         let stopping = matches!(response, ControlResponse::Stopped);
         let _ = self.response.send(response);
         if stopping {
-            // The transport has bounded I/O and drops the sender on failure,
-            // so a disconnected client cannot prevent daemon shutdown.
+            // The transport signals completion after its bounded write attempt.
+            // Dropping the sender also releases a wait if its task is cancelled.
             let _ = self.written.await;
         }
     }
@@ -647,6 +647,32 @@ mod tests {
         assert_eq!(received.await.unwrap(), ControlResponse::Pong);
         assert!(reply.is_finished(), "ordinary control call blocked on I/O");
         reply.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_reply_finishes_when_transport_write_times_out() {
+        let (mut client, stream) = tokio::io::duplex(1);
+        let (calls_tx, mut calls_rx) = mpsc::channel(1);
+        let transport = tokio::spawn(handle_client(stream, calls_tx));
+        client
+            .write_all(&encode_frame(&ControlRequest::Stop).unwrap())
+            .await
+            .unwrap();
+        let call = calls_rx.recv().await.unwrap();
+        let reply = tokio::spawn(
+            call.into_request_and_reply()
+                .1
+                .respond(ControlResponse::Stopped),
+        );
+        // Keep the client open without reading: the one-byte pipe stays full.
+        let error = tokio::time::timeout(IO_TIMEOUT + Duration::from_secs(1), transport)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        reply.await.unwrap();
+        drop(client);
     }
 
     #[tokio::test]

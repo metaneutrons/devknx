@@ -94,8 +94,68 @@ qualification, `v0.1.0` was corrected from `b674299` to
 attempt exposed a daemon shutdown race during the x86_64 AUR source tests,
 again before any public staging. PR #57 orders the stop confirmation before
 runtime shutdown, with regressions for complete frames, ordinary responses,
-disconnects and transport timeouts. The final source must pass qualification
-before any assets or package channels are published.
+disconnects and transport timeouts. After all ten platform-CI checks passed,
+PR #57 was manually merged and the still-empty draft was corrected to
+`72022cca994314493649d202b5c52f3061c9a28d`. Release qualification run
+`36784513104` built that exact source but was canceled before staging when a
+clean Debian GUI launch exposed undeclared dynamically loaded libraries.
+The draft still contained no assets. The dependency correction covers Debian,
+Homebrew on Linux and both AUR recipes, and adds actual installed GUI startup
+under Xvfb to their qualification steps. PR #59 passed all ten platform-CI
+checks and all sixteen candidate-packaging jobs, including actual installed
+GUI startup on both Debian architectures. It was manually merged as
+`2164c30cb475136e95984caf545e3f5c12e48d22`; the still-empty draft and tag were
+corrected to that commit, with the original tag protection restored and
+compared immediately afterward. Production run `36787753693` passed signed
+and notarized payload qualification, installed Debian GUI tests and both AUR
+binary GUI tests, but all three Homebrew audits rejected a generated Ruby line
+of 119 characters against the 118-character limit. It was canceled before
+staging, with the draft still empty. PR #61 only wraps that library list and
+adds a regression assertion; the assertion rejects the old line, and the
+corrected formula and cask pass actual local Homebrew style checks. The final
+source must pass the complete production qualification before any assets or
+package channels are published. After the complete platform CI and candidate
+packaging passed, PR #61 was manually merged as
+`2b597b6cc6994882c5142032c95d8bfe741d8d00`. The sole CI retry addressed an
+observed GitHub HTTP 500 while downloading Lefthook, before any lint checks;
+all platform tests passed on the first attempt. The empty first-version draft
+and tag were corrected to that source with the exact original tag ruleset
+restored immediately afterward. Production run `36790588300` passed all nine
+package-installation lanes, including installed GUI startup, and staged the
+unchanged 42-asset prerelease on 2026-09-30 at 23:43 UTC. Independent downloads
+passed the exact inventory and checksum checks. From that point onward the
+first-version exception was closed: neither the tag nor any payload can move.
+The Homebrew tap's initial publication check incorrectly included Intel macOS,
+which devknx deliberately does not support; the correction changes only the
+tap's qualification matrix, not the signed release definitions or payloads.
+
+## Published 0.1.0 acceptance
+
+Production run [36790588300](https://github.com/metaneutrons/devknx/actions/runs/36790588300)
+completed successfully against that immutable source. Homebrew tap PR #48
+corrected the architecture matrix, and package PR #47 passed the supported
+macOS lane before merging. Only failed jobs of the same release run were
+resumed; already staged payloads and signatures were not replaced.
+
+The unchanged 42-asset [v0.1.0 release](https://github.com/metaneutrons/devknx/releases/tag/v0.1.0)
+is stable and latest. Public downloads pass the exact inventory and checksums,
+all fifteen cosign signatures, and all sixteen GitHub attestations pinned to
+the source commit and tag. An isolated one-byte source-archive corruption is
+rejected by both signature and attestation verification.
+
+Public Homebrew formula/cask and both AUR recipes are byte-identical to the
+signed definitions. Both AUR indexes report 0.1.0-1. The macOS app passes
+strict signing, stapled-ticket and Gatekeeper checks. Its public Sparkle feed
+advertises 0.1.0 for ARM64 and macOS 12; the R2 app ZIP matches the GitHub ZIP,
+its Ed25519 signature verifies with the embedded public key, and a corrupted
+copy is rejected. Sparkle helpers are universal binaries, but the application
+itself remains ARM64-only.
+
+The central archive's [publish run 36793289719](https://github.com/metaneutrons/apt-archive/actions/runs/36793289719)
+completed successfully. Production APT client readback passed for amd64 and
+arm64 with authenticated indexes and matching package payloads. Release
+acceptance does not claim Windows Authenticode signing, KNX-USB support,
+live-hardware typed-write qualification, or full cross-platform visual checks.
 
 The tag ruleset excludes only the exact unpublished first-version ref during
 each correction; its complete original protection is restored immediately

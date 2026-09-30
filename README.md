@@ -76,7 +76,7 @@ The formula puts `devknx` on `PATH`; the cask installs `devknx.app` in
 
 ### Linux: APT and AUR
 
-For Debian/Ubuntu, follow the fingerprint-checked setup instructions on
+For Debian 12 or newer and Ubuntu 24.04 or newer, follow the fingerprint-checked setup instructions on
 [`deb.metaneutrons.cc`](https://deb.metaneutrons.cc/index.html) to add the shared,
 signed archive, then install:
 
@@ -89,6 +89,10 @@ For Arch Linux, use [`devknx-bin`](https://aur.archlinux.org/packages/devknx-bin
 for prebuilt binaries or [`devknx`](https://aur.archlinux.org/packages/devknx)
 to build from source. Linux musl archives are headless; GNU/glibc packages
 include the GUI.
+
+APT, AUR and Homebrew install the GUI's runtime libraries automatically.
+The GNU/glibc tar archives do not install system dependencies; prefer a package
+manager for desktop use. Use a musl archive for a standalone headless CLI.
 
 ### Windows
 

@@ -1356,7 +1356,7 @@ impl MonitorApp {
 
     #[expect(
         clippy::too_many_lines,
-        reason = "virtualized table, compact layout and details share the same capture selection"
+        reason = "virtualized table and compact layout share the same capture selection"
     )]
     fn render_captures(&mut self, ui: &mut egui::Ui) -> Option<f32> {
         let Some(model) = &mut self.model else {
@@ -1379,17 +1379,28 @@ impl MonitorApp {
         });
         ui.separator();
         let compact = ui.available_width() < 950.0;
-        if compact {
-            ui.monospace(format!(
-                "{:<12} {:<9} {:<11} {:<14} {}",
-                "Time", "Direction", "Destination", "Value", "ETS group"
-            ));
+        let heading = if compact {
+            format!(
+                "{:<12} {:<9} {:<11} {:<14} {:<14} {}",
+                "Time", "Direction", "Destination", "Value", "DPT", "ETS group"
+            )
         } else {
-            ui.monospace(format!(
-                "{:<12} {:<9} {:<9} {:<11} {:<19} {:<14} {}",
-                "Time", "Direction", "Source", "Destination", "Service", "Value", "ETS group"
-            ));
-        }
+            format!(
+                "{:<12} {:<9} {:<9} {:<11} {:<19} {:<14} {:<14} {}",
+                "Time",
+                "Direction",
+                "Source",
+                "Destination",
+                "Service",
+                "Value",
+                "DPT",
+                "ETS group"
+            )
+        };
+        ui.horizontal(|ui| {
+            ui.add_space(ui.spacing().button_padding.x);
+            ui.monospace(heading);
+        });
         ui.separator();
         let visible: Vec<_> = model
             .rows
@@ -1403,34 +1414,39 @@ impl MonitorApp {
             .is_some_and(|smoke| smoke.pin_to_top);
         let mut scroll = egui::ScrollArea::vertical()
             .id_salt("captures")
-            // Keep the table full-width, but end it after the last capture
-            // instead of rendering empty viewport rows when history is short.
             .auto_shrink([false, true])
-            .stick_to_bottom(!pin_to_top)
-            .max_height((ui.available_height() - 85.0).max(100.0));
+            .stick_to_bottom(!pin_to_top);
         if pin_to_top {
             scroll = scroll.vertical_scroll_offset(0.0);
         }
-        let output = scroll.show_rows(ui, 23.0, visible.len(), |ui, range| {
+        // The virtualizer and every rendered widget must use the same height.
+        // Truncation prevents long ETS labels from creating taller rows.
+        let row_height = ui.spacing().interact_size.y.max(2.0_f32.mul_add(
+            ui.spacing().button_padding.y,
+            ui.text_style_height(&egui::TextStyle::Monospace),
+        ));
+        let output = scroll.show_rows(ui, row_height, visible.len(), |ui, range| {
             for row in &visible[range] {
                 let text = if compact {
                     format!(
-                        "{:<12} {:<9} {:<11} {:<14} {}",
+                        "{:<12} {:<9} {:<11} {:<14} {:<14} {}",
                         interface::format_time(row.timestamp_ms),
                         row.direction,
                         row.destination,
-                        row.value.as_deref().unwrap_or("—"),
+                        row.value_text(),
+                        row.dpt_text(),
                         row.label.as_deref().unwrap_or("")
                     )
                 } else {
                     format!(
-                        "{:<12} {:<9} {:<9} {:<11} {:<19} {:<14} {}",
+                        "{:<12} {:<9} {:<9} {:<11} {:<19} {:<14} {:<14} {}",
                         interface::format_time(row.timestamp_ms),
                         row.direction,
                         row.source,
                         row.destination,
                         row.service,
-                        row.value.as_deref().unwrap_or("—"),
+                        row.value_text(),
+                        row.dpt_text(),
                         row.label.as_deref().unwrap_or("")
                     )
                 };
@@ -1447,7 +1463,24 @@ impl MonitorApp {
                 } else {
                     rich
                 };
-                if ui.selectable_label(is_selected, rich).clicked() {
+                let response = ui.add_sized(
+                    [ui.available_width(), row_height],
+                    egui::Button::selectable(is_selected, (rich, egui::Atom::grow())).truncate(),
+                );
+                let payload_hint = if row.value.is_some() {
+                    "Value interpreted using the declared DPT, or a read request without a payload."
+                } else {
+                    "Undecoded payload shown as hexadecimal bytes; no DPT was guessed."
+                };
+                let response = response.on_hover_text(format!(
+                    "ETS DPT declarations: {}\n{payload_hint}",
+                    if row.dpts.is_empty() {
+                        "none".into()
+                    } else {
+                        row.dpts.join(", ")
+                    }
+                ));
+                if response.clicked() {
                     selected = Some((*row).clone());
                 }
             }
@@ -1455,7 +1488,10 @@ impl MonitorApp {
         if let Some(row) = selected {
             self.selected = Some(row);
         }
-        ui.separator();
+        Some(output.state.offset.y)
+    }
+
+    fn render_capture_details(&self, ui: &mut egui::Ui) {
         if let Some(row) = &self.selected {
             ui.add(
                 egui::Label::new(
@@ -1467,7 +1503,7 @@ impl MonitorApp {
                         row.service,
                         row.label.as_deref().unwrap_or("no ETS label"),
                         row.dpts.join(", "),
-                        row.value.as_deref().unwrap_or("unknown"),
+                        row.value_text(),
                         row.raw_cemi
                     ))
                     .monospace(),
@@ -1477,10 +1513,17 @@ impl MonitorApp {
         } else {
             ui.small(format!(
                 "{} visible · Select a capture for raw cEMI and DPT details",
-                visible.len()
+                self.model.as_ref().map_or(0, |model| model
+                    .rows
+                    .iter()
+                    .filter(|row| row.matches(&model.filter))
+                    .count())
             ));
         }
-        Some(output.state.offset.y)
+        if let Some(notice) = self.model.as_ref().and_then(|model| model.notices.last()) {
+            ui.separator();
+            ui.label(notice);
+        }
     }
 
     fn render_status(&mut self, ui: &mut egui::Ui) {
@@ -1573,27 +1616,30 @@ impl eframe::App for MonitorApp {
                     .inner_margin(5.0),
             )
             .show(ui, |ui| self.render_status(ui));
+        let show_captures = self.model.as_ref().is_some_and(|model| {
+            self.offline_capture || !model.rows.is_empty() || model.owner_available
+        });
+        if show_captures {
+            egui::Panel::bottom("capture-details").show(ui, |ui| self.render_capture_details(ui));
+        }
         let mut scroll_offset = None;
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(error) = &self.error {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
                 ui.separator();
             }
-            if !self.offline_capture
-                && self
-                    .model
-                    .as_ref()
-                    .is_none_or(|model| model.rows.is_empty() && !model.owner_available)
-            {
-                self.render_empty(ui);
-            } else if self.model.is_some() {
+            if show_captures {
                 scroll_offset = self.render_captures(ui);
+            } else if !self.offline_capture {
+                self.render_empty(ui);
             } else {
                 ui.label(
                     "Capture storage could not be opened. Use Open… to choose an existing file.",
                 );
             }
-            if let Some(notice) = self.model.as_ref().and_then(|model| model.notices.last()) {
+            if !show_captures
+                && let Some(notice) = self.model.as_ref().and_then(|model| model.notices.last())
+            {
                 ui.separator();
                 ui.label(notice);
             }
@@ -1690,6 +1736,91 @@ mod tests {
                 value: None,
                 raw_cemi: "2900".into(),
             });
+        }
+    }
+
+    #[test]
+    fn virtualized_captures_fill_the_viewport_after_scroll_and_resize() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("capture.sqlite");
+        drop(CaptureStore::open(&database, NonZeroU32::new(2_000).unwrap()).unwrap());
+        let mut model = MonitorModel::open(database).unwrap();
+        append_rows(&mut model, 1, 1_004);
+        for row in &mut model.rows {
+            row.dpts = vec!["DPT-1-1".into()];
+            if row.id.unwrap() % 2 == 1 {
+                row.label = Some("Long ETS room and lighting circuit description ".repeat(10));
+            }
+        }
+        let mut app = MonitorApp {
+            model: Some(model),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let mut time = 0.0;
+        for size in [
+            egui::vec2(1_300.0, 900.0),
+            egui::vec2(650.0, 420.0),
+            egui::vec2(1_100.0, 700.0),
+        ] {
+            for frame in 0..8 {
+                time += 0.1;
+                let mut input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    time: Some(time),
+                    ..Default::default()
+                };
+                if frame == 1 || frame == 4 {
+                    input.events = vec![
+                        egui::Event::PointerMoved(egui::pos2(200.0, 200.0)),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(0.0, if frame == 1 { 240.0 } else { -240.0 }),
+                            modifiers: egui::Modifiers::NONE,
+                            phase: egui::TouchPhase::Move,
+                        },
+                    ];
+                }
+                let output = ctx.run_ui(input, |ui| {
+                    app.render_captures(ui);
+                });
+                if frame == 3 || frame == 7 {
+                    let (last_row_bottom, viewport_bottom) = output
+                        .shapes
+                        .iter()
+                        .filter_map(|clipped| {
+                            let egui::Shape::Text(text) = &clipped.shape else {
+                                return None;
+                            };
+                            if !text.galley.text().contains("1/1/1")
+                                || text.pos.y > clipped.clip_rect.bottom()
+                            {
+                                return None;
+                            }
+                            assert_eq!(text.galley.rows.len(), 1, "capture rows must not wrap");
+                            assert!(text.pos.x <= 8.0, "capture text must be left-aligned");
+                            assert!(
+                                text.galley.text().contains("1.001"),
+                                "DPT must remain visible"
+                            );
+                            Some((
+                                text.pos.y + text.galley.rect.bottom(),
+                                clipped.clip_rect.bottom(),
+                            ))
+                        })
+                        .max_by(|left, right| left.0.total_cmp(&right.0))
+                        .expect("capture rows were painted");
+                    assert!(
+                        viewport_bottom - last_row_bottom <= 30.0,
+                        "empty capture rows at {size:?}: last row ends at {last_row_bottom}, viewport ends at {viewport_bottom}"
+                    );
+                    assert!(
+                        size.y - viewport_bottom <= 8.0,
+                        "table must use available height"
+                    );
+                }
+                output.drop_without_applying_deltas();
+            }
         }
     }
 

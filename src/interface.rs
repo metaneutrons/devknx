@@ -3,6 +3,7 @@
 
 //! Shared, non-visual model for the terminal and desktop monitors.
 
+use std::borrow::Cow;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU32;
@@ -13,8 +14,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 use devknx::control::{ControlClient, ControlRequest, ControlResponse, RestStatus};
-use devknx::enrichment::{CaptureEnrichment, enrich_capture};
-use devknx::ets::parse_group_address;
+use devknx::enrichment::{CaptureEnrichment, enrich_capture, raw_group_value};
+use devknx::ets::{parse_dpt, parse_group_address};
 use devknx::ipc::{IpcClient, IpcMessage, WireState};
 use devknx::operations::{OperationRequest, prepare};
 use devknx::paths;
@@ -42,6 +43,27 @@ pub struct DisplayCapture {
 }
 
 impl DisplayCapture {
+    /// Prefer the declared-DPT value, otherwise show clearly untyped data.
+    pub fn value_text(&self) -> Cow<'_, str> {
+        self.value.as_deref().map_or_else(
+            || {
+                raw_group_value(&self.raw_cemi).map_or(Cow::Borrowed("—"), |data| {
+                    Cow::Owned(format!("0x{}", hex(&data)))
+                })
+            },
+            Cow::Borrowed,
+        )
+    }
+
+    /// A compact declared-DPT indicator, without choosing among candidates.
+    pub fn dpt_text(&self) -> Cow<'_, str> {
+        match self.dpts.as_slice() {
+            [] => Cow::Borrowed("—"),
+            [dpt] => parse_dpt(dpt).map_or(Cow::Borrowed(dpt), |dpt| Cow::Owned(dpt.to_string())),
+            dpts => Cow::Owned(format!("ambiguous ({})", dpts.len())),
+        }
+    }
+
     pub fn matches(&self, query: &str) -> bool {
         let query = query.trim().to_lowercase();
         query.is_empty()
@@ -794,6 +816,18 @@ mod tests {
         assert!(row.matches("kitchen"));
         assert!(row.matches("2900"));
         assert!(!row.matches("bedroom"));
+        assert_eq!(row.value_text(), "true");
+        assert_eq!(row.dpt_text(), "1.001");
+        let mut raw = row;
+        raw.value = None;
+        raw.raw_cemi = "2900bce0112b29000300800c56".into();
+        assert_eq!(raw.value_text(), "0x0c56");
+        raw.dpts.push("DPT-5-1".into());
+        assert_eq!(raw.dpt_text(), "ambiguous (2)");
+        raw.dpts.clear();
+        assert_eq!(raw.dpt_text(), "—");
+        raw.raw_cemi = "2900".into();
+        assert_eq!(raw.value_text(), "—");
     }
 
     #[test]

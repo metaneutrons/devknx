@@ -692,9 +692,9 @@ impl App {
             let start = selected.saturating_sub(capacity.saturating_sub(1));
             let end = (start + capacity).min(visible.len());
             let items: Vec<ListItem> = visible[start..end].iter().enumerate().map(|(index, row)| {
-                let text = format!("{} {:8} {:8} {:9} {:15} {:10} {}",
+                let text = format!("{} {:8} {:8} {:9} {:15} {:10} {:14} {}",
                     interface::format_time(row.timestamp_ms), row.direction, row.source, row.destination,
-                    row.service, row.value.as_deref().unwrap_or("—"), row.label.as_deref().unwrap_or(""));
+                    row.service, row.value_text(), row.dpt_text(), row.label.as_deref().unwrap_or(""));
                 let style = if start + index == selected {
                     if self.color_enabled { Style::default().fg(Color::Black).bg(Color::Cyan) }
                     else { Style::default().add_modifier(Modifier::REVERSED) }
@@ -712,7 +712,7 @@ impl App {
                 || "No capture selected".to_owned(),
                 |row| format!("{} · {} · DPT [{}] · value {} · raw cEMI {}", row.destination,
                     row.label.as_deref().unwrap_or("no ETS label"), row.dpts.join(", "),
-                    row.value.as_deref().unwrap_or("unknown"), row.raw_cemi));
+                    row.value_text(), row.raw_cemi));
             frame.render_widget(Paragraph::new(detail).block(Block::default().title(" Details ").borders(Borders::ALL)), areas[2]);
             let prompt = match self.mode {
                 Mode::Normal => "c connect/disconnect · s endpoint · a REST · d discover · / filter · r read · w write · e export · h reload · F8 color · q quit".to_owned(),

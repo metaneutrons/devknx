@@ -17,12 +17,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
+use interprocess::local_socket::tokio::Stream;
+#[cfg(unix)]
 use interprocess::local_socket::{GenericFilePath, ToFsName};
 #[cfg(windows)]
 use interprocess::local_socket::{GenericNamespaced, ToNsName};
 use interprocess::local_socket::{
     ListenerOptions,
-    tokio::{Listener, Stream, prelude::*},
+    tokio::{Listener, prelude::*},
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};

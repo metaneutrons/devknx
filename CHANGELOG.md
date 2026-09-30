@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/metaneutrons/devknx/compare/v0.1.0...v0.1.1) (2026-09-30)
+
+
+### Bug Fixes
+
+* deliver daemon stop confirmation before runtime shutdown ([#57](https://github.com/metaneutrons/devknx/issues/57)) ([72022cc](https://github.com/metaneutrons/devknx/commit/72022cca994314493649d202b5c52f3061c9a28d))
+
 ## 0.1.0 (2026-09-30)
 
 

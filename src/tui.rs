@@ -692,9 +692,9 @@ impl App {
             let start = selected.saturating_sub(capacity.saturating_sub(1));
             let end = (start + capacity).min(visible.len());
             let items: Vec<ListItem> = visible[start..end].iter().enumerate().map(|(index, row)| {
-                let text = format!("{} {:8} {:8} {:9} {:15} {:10} {}",
+                let text = format!("{} {:8} {:8} {:9} {:15} {:10} {:14} {}",
                     interface::format_time(row.timestamp_ms), row.direction, row.source, row.destination,
-                    row.service, row.value_text(), row.label.as_deref().unwrap_or(""));
+                    row.service, row.value_text(), row.dpt_text(), row.label.as_deref().unwrap_or(""));
                 let style = if start + index == selected {
                     if self.color_enabled { Style::default().fg(Color::Black).bg(Color::Cyan) }
                     else { Style::default().add_modifier(Modifier::REVERSED) }

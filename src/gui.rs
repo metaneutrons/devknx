@@ -1381,13 +1381,20 @@ impl MonitorApp {
         let compact = ui.available_width() < 950.0;
         let heading = if compact {
             format!(
-                "{:<12} {:<9} {:<11} {:<14} {}",
-                "Time", "Direction", "Destination", "Value", "ETS group"
+                "{:<12} {:<9} {:<11} {:<14} {:<14} {}",
+                "Time", "Direction", "Destination", "Value", "DPT", "ETS group"
             )
         } else {
             format!(
-                "{:<12} {:<9} {:<9} {:<11} {:<19} {:<14} {}",
-                "Time", "Direction", "Source", "Destination", "Service", "Value", "ETS group"
+                "{:<12} {:<9} {:<9} {:<11} {:<19} {:<14} {:<14} {}",
+                "Time",
+                "Direction",
+                "Source",
+                "Destination",
+                "Service",
+                "Value",
+                "DPT",
+                "ETS group"
             )
         };
         ui.horizontal(|ui| {
@@ -1422,22 +1429,24 @@ impl MonitorApp {
             for row in &visible[range] {
                 let text = if compact {
                     format!(
-                        "{:<12} {:<9} {:<11} {:<14} {}",
+                        "{:<12} {:<9} {:<11} {:<14} {:<14} {}",
                         interface::format_time(row.timestamp_ms),
                         row.direction,
                         row.destination,
                         row.value_text(),
+                        row.dpt_text(),
                         row.label.as_deref().unwrap_or("")
                     )
                 } else {
                     format!(
-                        "{:<12} {:<9} {:<9} {:<11} {:<19} {:<14} {}",
+                        "{:<12} {:<9} {:<9} {:<11} {:<19} {:<14} {:<14} {}",
                         interface::format_time(row.timestamp_ms),
                         row.direction,
                         row.source,
                         row.destination,
                         row.service,
                         row.value_text(),
+                        row.dpt_text(),
                         row.label.as_deref().unwrap_or("")
                     )
                 };
@@ -1454,14 +1463,24 @@ impl MonitorApp {
                 } else {
                     rich
                 };
-                if ui
-                    .add_sized(
-                        [ui.available_width(), row_height],
-                        egui::Button::selectable(is_selected, (rich, egui::Atom::grow()))
-                            .truncate(),
-                    )
-                    .clicked()
-                {
+                let response = ui.add_sized(
+                    [ui.available_width(), row_height],
+                    egui::Button::selectable(is_selected, (rich, egui::Atom::grow())).truncate(),
+                );
+                let payload_hint = if row.value.is_some() {
+                    "Value interpreted using the declared DPT, or a read request without a payload."
+                } else {
+                    "Undecoded payload shown as hexadecimal bytes; no DPT was guessed."
+                };
+                let response = response.on_hover_text(format!(
+                    "ETS DPT declarations: {}\n{payload_hint}",
+                    if row.dpts.is_empty() {
+                        "none".into()
+                    } else {
+                        row.dpts.join(", ")
+                    }
+                ));
+                if response.clicked() {
                     selected = Some((*row).clone());
                 }
             }
@@ -1728,6 +1747,7 @@ mod tests {
         let mut model = MonitorModel::open(database).unwrap();
         append_rows(&mut model, 1, 1_004);
         for row in &mut model.rows {
+            row.dpts = vec!["DPT-1-1".into()];
             if row.id.unwrap() % 2 == 1 {
                 row.label = Some("Long ETS room and lighting circuit description ".repeat(10));
             }
@@ -1779,6 +1799,10 @@ mod tests {
                             }
                             assert_eq!(text.galley.rows.len(), 1, "capture rows must not wrap");
                             assert!(text.pos.x <= 8.0, "capture text must be left-aligned");
+                            assert!(
+                                text.galley.text().contains("1.001"),
+                                "DPT must remain visible"
+                            );
                             Some((
                                 text.pos.y + text.galley.rect.bottom(),
                                 clipped.clip_rect.bottom(),

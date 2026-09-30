@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use devknx::control::{ControlClient, ControlRequest, ControlResponse, RestStatus};
 use devknx::enrichment::{CaptureEnrichment, enrich_capture, raw_group_value};
-use devknx::ets::parse_group_address;
+use devknx::ets::{parse_dpt, parse_group_address};
 use devknx::ipc::{IpcClient, IpcMessage, WireState};
 use devknx::operations::{OperationRequest, prepare};
 use devknx::paths;
@@ -48,11 +48,20 @@ impl DisplayCapture {
         self.value.as_deref().map_or_else(
             || {
                 raw_group_value(&self.raw_cemi).map_or(Cow::Borrowed("—"), |data| {
-                    Cow::Owned(format!("raw 0x{}", hex(&data)))
+                    Cow::Owned(format!("0x{}", hex(&data)))
                 })
             },
             Cow::Borrowed,
         )
+    }
+
+    /// A compact declared-DPT indicator, without choosing among candidates.
+    pub fn dpt_text(&self) -> Cow<'_, str> {
+        match self.dpts.as_slice() {
+            [] => Cow::Borrowed("—"),
+            [dpt] => parse_dpt(dpt).map_or(Cow::Borrowed(dpt), |dpt| Cow::Owned(dpt.to_string())),
+            dpts => Cow::Owned(format!("ambiguous ({})", dpts.len())),
+        }
     }
 
     pub fn matches(&self, query: &str) -> bool {
@@ -808,10 +817,15 @@ mod tests {
         assert!(row.matches("2900"));
         assert!(!row.matches("bedroom"));
         assert_eq!(row.value_text(), "true");
+        assert_eq!(row.dpt_text(), "1.001");
         let mut raw = row;
         raw.value = None;
         raw.raw_cemi = "2900bce0112b29000300800c56".into();
-        assert_eq!(raw.value_text(), "raw 0x0c56");
+        assert_eq!(raw.value_text(), "0x0c56");
+        raw.dpts.push("DPT-5-1".into());
+        assert_eq!(raw.dpt_text(), "ambiguous (2)");
+        raw.dpts.clear();
+        assert_eq!(raw.dpt_text(), "—");
         raw.raw_cemi = "2900".into();
         assert_eq!(raw.value_text(), "—");
     }

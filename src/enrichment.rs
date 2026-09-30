@@ -166,6 +166,23 @@ pub fn enriched_capture_json(
     Ok(value)
 }
 
+/// Extract the untyped data bytes from a group-value write or response.
+///
+/// Short values are returned without the APCI bits. Read requests, other
+/// services and malformed frames have no group-value payload.
+#[must_use]
+pub fn raw_group_value(raw_cemi: &str) -> Option<Vec<u8>> {
+    let bytes = decode_hex(raw_cemi)?;
+    let frame = CemiFrame::parse(&bytes).ok()?;
+    let tpdu = frame.tpdu()?;
+    let apdu = tpdu.apdu()?;
+    matches!(
+        apdu.apdu_type,
+        ApduType::GroupValueWrite | ApduType::GroupValueResponse
+    )
+    .then(|| apdu.data.clone())
+}
+
 fn decode_capture_value(raw_cemi: &str, dpts: &[String], service: &str) -> Option<String> {
     if service == "Read" {
         return Some("Read request".into());
@@ -253,6 +270,23 @@ mod tests {
             service: service.into(),
             raw_cemi,
         }
+    }
+
+    #[test]
+    fn raw_group_values_preserve_payload_without_guessing_a_dpt() {
+        for (data, expected) in [
+            (vec![0, 0x81], Some(vec![1])),
+            (vec![0, 0x80, 0x0c, 0x56], Some(vec![0x0c, 0x56])),
+            (vec![0, 0x40, 0xff], Some(vec![0xff])),
+            (vec![0, 0], None),
+        ] {
+            let IpcMessage::Capture { raw_cemi, .. } = capture("1/2/3", "Write", &data) else {
+                unreachable!()
+            };
+            assert_eq!(raw_group_value(&raw_cemi), expected);
+        }
+        assert_eq!(raw_group_value("2900"), None);
+        assert_eq!(raw_group_value("zz"), None);
     }
 
     #[test]

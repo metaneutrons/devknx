@@ -3,6 +3,7 @@
 
 //! Shared, non-visual model for the terminal and desktop monitors.
 
+use std::borrow::Cow;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU32;
@@ -13,7 +14,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 use devknx::control::{ControlClient, ControlRequest, ControlResponse, RestStatus};
-use devknx::enrichment::{CaptureEnrichment, enrich_capture};
+use devknx::enrichment::{CaptureEnrichment, enrich_capture, raw_group_value};
 use devknx::ets::parse_group_address;
 use devknx::ipc::{IpcClient, IpcMessage, WireState};
 use devknx::operations::{OperationRequest, prepare};
@@ -42,6 +43,18 @@ pub struct DisplayCapture {
 }
 
 impl DisplayCapture {
+    /// Prefer the declared-DPT value, otherwise show clearly untyped data.
+    pub fn value_text(&self) -> Cow<'_, str> {
+        self.value.as_deref().map_or_else(
+            || {
+                raw_group_value(&self.raw_cemi).map_or(Cow::Borrowed("—"), |data| {
+                    Cow::Owned(format!("raw 0x{}", hex(&data)))
+                })
+            },
+            Cow::Borrowed,
+        )
+    }
+
     pub fn matches(&self, query: &str) -> bool {
         let query = query.trim().to_lowercase();
         query.is_empty()
@@ -794,6 +807,13 @@ mod tests {
         assert!(row.matches("kitchen"));
         assert!(row.matches("2900"));
         assert!(!row.matches("bedroom"));
+        assert_eq!(row.value_text(), "true");
+        let mut raw = row;
+        raw.value = None;
+        raw.raw_cemi = "2900bce0112b29000300800c56".into();
+        assert_eq!(raw.value_text(), "raw 0x0c56");
+        raw.raw_cemi = "2900".into();
+        assert_eq!(raw.value_text(), "—");
     }
 
     #[test]

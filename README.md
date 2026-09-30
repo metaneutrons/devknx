@@ -132,8 +132,10 @@ bounded search and exact-address write opt-in.
 
 The GUI shows a bounded live/history view with readable local timestamps,
 ETS names and unambiguous DPT-decoded values, a text filter, raw cEMI details,
-read and prepared typed-write dialogs, and non-overwriting CSV export. Its
-separate toolbar exposes connection and capture actions; capture storage is
+read and prepared typed-write dialogs, and non-overwriting CSV export.
+GUI and TUI show group-value payloads as `raw 0x…` when no unambiguous decoded
+value is available; they never guess a DPT from the payload length.
+The GUI's separate toolbar exposes connection and capture actions; capture storage is
 explained under Settings rather than presented as the KNX connection. Its macOS
 app has native application, File, Edit, View, Operation, Window and Help menus.
 The TUI offers `c` connect/disconnect, `s` endpoint settings, `a` REST loopback control, `/` filter,

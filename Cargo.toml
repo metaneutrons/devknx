@@ -52,6 +52,7 @@ ratatui = { version = "0.30", optional = true }
 rfd = { version = "0.17.2", optional = true, default-features = false, features = ["xdg-portal"] }
 rmcp = { version = "3.4", default-features = false, features = ["server", "macros", "transport-io", "schemars"] }
 rusqlite = { version = "0.40", features = ["backup", "bundled"] }
+same-file = { version = "1.0.6", optional = true }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -62,8 +63,8 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-
 
 [features]
 default = ["gui", "tui"]
-gui = ["dep:eframe", "dep:image", "dep:chrono", "dep:rfd"]
-tui = ["dep:ratatui", "dep:crossterm", "dep:chrono"]
+gui = ["dep:eframe", "dep:image", "dep:chrono", "dep:rfd", "dep:same-file"]
+tui = ["dep:ratatui", "dep:crossterm", "dep:chrono", "dep:same-file"]
 full = ["gui", "tui"]
 
 [target.'cfg(not(windows))'.dependencies]

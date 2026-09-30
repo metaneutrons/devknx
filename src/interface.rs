@@ -66,6 +66,7 @@ impl DisplayCapture {
 
     pub fn matches(&self, query: &str) -> bool {
         let query = query.trim().to_lowercase();
+        let dpt = self.dpt_text();
         query.is_empty()
             || [
                 self.direction.as_str(),
@@ -74,6 +75,7 @@ impl DisplayCapture {
                 self.service.as_str(),
                 self.label.as_deref().unwrap_or(""),
                 self.value.as_deref().unwrap_or(""),
+                dpt.as_ref(),
                 self.raw_cemi.as_str(),
             ]
             .iter()
@@ -126,6 +128,36 @@ impl MonitorModel {
                 id: Some(stored.id),
                 event: stored.event,
             }));
+        }
+        Ok(())
+    }
+
+    /// Reinterpret all loaded rows without losing older pages, raw data or view state.
+    pub fn refresh_ets(&mut self) -> Result<(), String> {
+        let enrichments = self
+            .rows
+            .iter()
+            .map(|row| {
+                enrich_capture(
+                    &IpcMessage::Capture {
+                        id: row.id,
+                        observed_at_ms: row.timestamp_ms,
+                        endpoint: String::new(),
+                        direction: row.direction.clone(),
+                        source: row.source.clone(),
+                        destination: row.destination.clone(),
+                        service: row.service.clone(),
+                        raw_cemi: row.raw_cemi.clone(),
+                    },
+                    &self.store,
+                )
+                .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (row, enrichment) in self.rows.iter_mut().zip(enrichments) {
+            row.label = enrichment.group_name;
+            row.dpts = enrichment.dpts;
+            row.value = enrichment.value;
         }
         Ok(())
     }
@@ -815,6 +847,7 @@ mod tests {
         };
         assert!(row.matches("kitchen"));
         assert!(row.matches("2900"));
+        assert!(row.matches("1.001"));
         assert!(!row.matches("bedroom"));
         assert_eq!(row.value_text(), "true");
         assert_eq!(row.dpt_text(), "1.001");
@@ -930,6 +963,73 @@ mod tests {
         assert_eq!(load_settings(&first).unwrap(), first_settings);
         assert_eq!(load_settings(&second).unwrap(), second_settings);
         assert!(!directory.path().join("connection.json").exists());
+    }
+
+    #[test]
+    fn ets_refresh_preserves_older_pages_raw_history_and_view_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("capture.sqlite");
+        let mut writer = CaptureStore::open(&database, NonZeroU32::new(2_000).unwrap()).unwrap();
+        let frame = CemiFrame::new_l_data(
+            MessageCode::LDataInd,
+            IndividualAddress::from_raw(0x1101),
+            DestinationAddress::Group(GroupAddress::from_raw(0x0a03)),
+            Priority::Low,
+            &[0, 0x81],
+        );
+        for _ in 0..1_100 {
+            writer
+                .insert(&CaptureEvent::received(
+                    CaptureEndpoint::Tunnel("192.0.2.1:3671".parse().unwrap()),
+                    frame.clone(),
+                ))
+                .unwrap();
+        }
+        drop(writer);
+        let mut model = MonitorModel::open(database.clone()).unwrap();
+        assert_eq!(model.rows.len(), 1_000);
+        assert_eq!(model.load_older().unwrap(), 100);
+        model.filter = "Desk".into();
+        model.router_lost_messages = 7;
+        let before: Vec<_> = model
+            .rows
+            .iter()
+            .map(|row| (row.id, row.raw_cemi.clone()))
+            .collect();
+        let catalog = EtsCatalog::from_bytes(
+            br#"<GroupAddress-Export xmlns="http://knx.org/xml/ga-export/01"><GroupRange Name="Lights"><GroupAddress Name="Desk" Address="1/2/3" DPTs="DPST-1-1" /></GroupRange></GroupAddress-Export>"#,
+            EtsFormat::GaXml01, CsvEncoding::Utf8,
+        ).unwrap();
+        let mut importer = CaptureStore::open_for_ets_import(&database).unwrap();
+        importer.import_ets(&catalog).unwrap();
+        drop(importer);
+        model.refresh_ets().unwrap();
+        assert_eq!(model.rows.len(), 1_100);
+        assert_eq!(model.filter, "Desk");
+        assert_eq!(model.router_lost_messages, 7);
+        assert_eq!(
+            before,
+            model
+                .rows
+                .iter()
+                .map(|row| (row.id, row.raw_cemi.clone()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            model
+                .rows
+                .iter()
+                .all(|row| row.label.as_deref() == Some("Desk")
+                    && row.dpt_text() == "1.001"
+                    && row.value_text() == "true")
+        );
+        assert_eq!(
+            CaptureStore::open_existing(&database)
+                .unwrap()
+                .export_csv(&mut Vec::new(), 0)
+                .unwrap(),
+            1_100
+        );
     }
 
     #[test]

@@ -25,6 +25,8 @@ pub enum MenuAction {
     ConnectionSettings = 128,
     /// Toggle semantic color in the capture view.
     ToggleColor = 256,
+    /// Preview and import an ETS group-address export.
+    ImportEts = 512,
 }
 
 impl MenuAction {
@@ -40,6 +42,7 @@ impl MenuAction {
         Self::ToggleConnection,
         Self::ConnectionSettings,
         Self::ToggleColor,
+        Self::ImportEts,
     ];
 }
 
@@ -151,6 +154,7 @@ mod tests {
             (MenuAction::ToggleConnection, "toggleConnection:"),
             (MenuAction::ConnectionSettings, "connectionSettings:"),
             (MenuAction::ToggleColor, "toggleColor:"),
+            (MenuAction::ImportEts, "importEts:"),
         ] {
             assert!(MenuAction::ALL.contains(&action));
             assert!(native.contains(&format!("@selector({selector})")));

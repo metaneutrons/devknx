@@ -54,6 +54,7 @@ int main(void) {
         }
         check_action(@"File", @"Open Capture…", @"o", 1);
         check_action(@"File", @"Export CSV…", @"e", 2);
+        check_action(@"File", @"Import ETS Group Addresses…", @"i", 512);
         check_action(@"View", @"Discover Gateways", @"d", 4);
         check_action(@"View", @"Filter Captures", @"f", 8);
         check_action(@"Operation", @"Read Group Value…", @"r", 16);

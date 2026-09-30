@@ -167,6 +167,10 @@ pub const CLI: &[Declaration] = &[
 /// Terminal control anchors in `src/tui.rs`.
 pub const TUI: &[Declaration] = &[
     Declaration {
+        capability: Capability::EtsImport,
+        source_anchor: "ets_import::commit",
+    },
+    Declaration {
         capability: Capability::ColorDisplay,
         source_anchor: "KeyCode::F(8)",
     },
@@ -230,6 +234,10 @@ pub const TUI: &[Declaration] = &[
 
 /// Desktop control anchors in `src/gui.rs`.
 pub const GUI: &[Declaration] = &[
+    Declaration {
+        capability: Capability::EtsImport,
+        source_anchor: "ets_import::commit",
+    },
     Declaration {
         capability: Capability::ColorDisplay,
         source_anchor: "Checkbox::new(&mut self.color_enabled, \"Color\")",
@@ -305,7 +313,7 @@ const M4: &str = "https://github.com/metaneutrons/devknx/issues/7";
 const M5: &str = "https://github.com/metaneutrons/devknx/issues/8";
 const M7: &str = "https://github.com/metaneutrons/devknx/issues/40";
 
-/// Explicit exceptions. Import and backup require exclusive database ownership;
+/// Explicit exceptions. Backup requires exclusive database ownership;
 /// raw sending and audit inspection remain expert CLI controls in this slice.
 pub const GAPS: &[Gap] = &[
     Gap {
@@ -354,18 +362,6 @@ pub const GAPS: &[Gap] = &[
         capability: Capability::RouterLossHistory,
         missing_on: Surface::Gui,
         reason: "Live router diagnostics appear as notices; durable history is CLI-only",
-        target_issue: M4,
-    },
-    Gap {
-        capability: Capability::EtsImport,
-        missing_on: Surface::Tui,
-        reason: "Import requires the service to stop and an exclusive writer lease",
-        target_issue: M4,
-    },
-    Gap {
-        capability: Capability::EtsImport,
-        missing_on: Surface::Gui,
-        reason: "Import requires the service to stop and an exclusive writer lease",
         target_issue: M4,
     },
     Gap {
@@ -552,6 +548,28 @@ mod tests {
             .is_err()
         );
         assert!(audit([CLI_SOURCE, TUI_SOURCE, GUI_SOURCE], &GAPS[1..]).is_err());
+        assert!(
+            audit(
+                [
+                    CLI_SOURCE,
+                    &TUI_SOURCE.replace("ets_import::commit", "ets_import::removed"),
+                    GUI_SOURCE
+                ],
+                GAPS
+            )
+            .is_err()
+        );
+        assert!(
+            audit(
+                [
+                    CLI_SOURCE,
+                    TUI_SOURCE,
+                    &GUI_SOURCE.replace("ets_import::commit", "ets_import::removed")
+                ],
+                GAPS
+            )
+            .is_err()
+        );
         let mut stale = GAPS.to_vec();
         stale.push(Gap {
             capability: Capability::GatewayDiscovery,

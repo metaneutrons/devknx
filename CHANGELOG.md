@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/metaneutrons/devknx/compare/v0.1.0...v0.1.1) (2026-09-30)
+
+
+### Bug Fixes
+
+* declare and qualify installed GUI runtime dependencies ([#59](https://github.com/metaneutrons/devknx/issues/59)) ([2164c30](https://github.com/metaneutrons/devknx/commit/2164c30cb475136e95984caf545e3f5c12e48d22))
+
 ## 0.1.0 (2026-09-30)
 
 

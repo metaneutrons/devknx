@@ -93,9 +93,16 @@ include the GUI.
 ### Windows
 
 Extract the x86_64 or ARM64 ZIP from [GitHub Releases](https://github.com/metaneutrons/devknx/releases/latest).
-Run `devknx.exe gui` for the desktop UI or `devknx.exe tui --endpoint
-tunnel://YOUR_GATEWAY:3671` for the terminal UI. Add the executable's directory
-to `PATH` if you want to use it from any terminal.
+Open PowerShell in the extracted version-and-target folder containing
+`devknx.exe`, then start the desktop or terminal UI:
+
+```powershell
+.\devknx.exe gui
+.\devknx.exe tui --endpoint tunnel://YOUR_GATEWAY:3671
+```
+
+Add the executable's directory to `PATH` if you want to use `devknx` from any
+terminal without the current-directory prefix.
 
 Windows binaries are not Authenticode-signed. SmartScreen may warn on first
 launch; verify the release's checksum, cosign bundle, and provenance before

@@ -90,10 +90,16 @@ On 2026-09-30, Fabian explicitly authorized a one-off exception for the
 unpublished first version. The failed attempt had not uploaded release assets
 or published any package channel. After PR #54 passed CI and candidate
 qualification, `v0.1.0` was corrected from `b674299` to
-`d0a0c1308d6258a1e7cbfe7b799aa72458996a7a` and dispatched again. The tag
-ruleset excluded only that exact ref during the correction; its complete
-original protection was restored immediately afterward. This is not permission
-to move published or future release tags.
+`d0a0c1308d6258a1e7cbfe7b799aa72458996a7a` and dispatched again. That second
+attempt exposed a daemon shutdown race during the x86_64 AUR source tests,
+again before any public staging. PR #57 orders the stop confirmation before
+runtime shutdown, with regressions for complete frames, ordinary responses,
+disconnects and transport timeouts. The final source must pass qualification
+before any assets or package channels are published.
+
+The tag ruleset excludes only the exact unpublished first-version ref during
+each correction; its complete original protection is restored immediately
+afterward. This is not permission to move published or future release tags.
 
 Local packaging probes:
 

@@ -19,23 +19,23 @@
 > [!IMPORTANT]
 > **Early development.** There is no stable release yet. The daemon can run without a KNX connection. GUI and TUI connect only when requested. Group writes can affect a live installation; qualify them on an isolated test network first.
 
-## What devknx is building
+## What devknx does
 
 devknx combines the KNX protocol implementation in the
 [`knx-rs` crate family](https://github.com/metaneutrons/knx-rs) with a
-persistent local capture service. A single typed operation model will serve
+persistent local capture service. A single typed operation model serves
 every interface, so a DPT validation rule cannot silently differ between a
 desktop button and an API call.
 
 | Capability | Current state |
 | --- | --- |
 | KNXnet/IP gateway discovery | CLI, TUI, and native GUI available |
-| KNXnet/IP tunneling and routing capture | Experimental CLI stream with bounded reconnect and endpoint-specific SQLite persistence |
+| KNXnet/IP tunneling and routing capture | Daemon-owned sessions shared by CLI, TUI, GUI, REST, and MCP, with bounded reconnect and endpoint-specific SQLite persistence |
 | Independent capture process | One per-user daemon with explicit endpoint sessions, current-user control IPC, and endpoint-scoped capture streams |
 | Durable telegram history | Experimental SQLite history with ID cursor and retention cap; interactive views filter the loaded window and export the full retained history |
 | ETS group-address CSV and XML import | CLI import and preview-confirmed TUI/GUI import; all surfaces use active ETS labels and DPT declarations |
 | DPT-validated read, write preview, and write | Experimental CLI/TUI/GUI operations through the single capture owner; loopback-qualified, not yet hardware-qualified |
-| Terminal UI and native desktop UI | Experimental; the connection workflow and toolbar have been revised after visual feedback and require renewed visual qualification |
+| Terminal UI and native desktop UI | Connection settings, full-height capture table, DPT details, ETS import, read/write previews, and export; local macOS visual checks and automated UI tests, not full cross-platform visual qualification |
 | Local REST and MCP interfaces | Experimental daemon-controlled REST listener and structured MCP stdio tools; both use the same DPT-validated operation path |
 
 ETS group-address metadata is stored in separate revisions without changing
@@ -57,21 +57,26 @@ Install [Rust via rustup](https://rustup.rs/), then run:
 ```sh
 git clone https://github.com/metaneutrons/devknx.git
 cd devknx
-cargo run --locked -- discover
-cargo run --locked -- monitor tunnel://192.0.2.1:3671
-cargo run --locked -- monitor router://224.0.23.12:3671
+cargo build --locked
 cargo run --locked -- gui
+# Alternatively, start the terminal UI with your gateway address:
 cargo run --locked -- tui --endpoint tunnel://192.0.2.1:3671
 ```
 
-Gateway discovery sends KNXnet/IP multicast on the local network. Network
-equipment and host firewall rules can affect the result. For normal interactive
-use, launch the GUI and select a connection, or start the TUI with an explicit
+The addresses in this README are examples; substitute your own network addresses.
+For CLI examples below, use `./target/debug/devknx` or install the development
+binary with `cargo install --locked --path .`.
+
+## GUI and TUI
+
+Launch the GUI and select a connection, or start the TUI with an explicit
 `--endpoint`. Neither creates an unassigned global capture database.
 In the GUI, choose Tunneling or Routing on the start screen, enter the
 unicast gateway IP or multicast group and UDP port, then select Connect.
 Settings… uses the same connection form. Gateway discovery is optional for a
-manually entered tunnel address. In the TUI,
+manually entered tunnel address. Discovery sends KNXnet/IP multicast on the
+local network; network equipment and firewall rules can affect the result.
+In the TUI,
 press `s` to change the endpoint, then `c` to connect or disconnect. A running
 capture service remains active when an interactive window closes; use
 Disconnect or `c` to stop it. An explicit `--database` fixes the capture path
@@ -81,6 +86,79 @@ The GUI opens its own capture history automatically. Use **Open…** (or
 the system file dialog; **Live capture** returns to the active history. A
 pre-connection `captures.sqlite` is offered as a previous capture, not
 automatically attributed to a gateway.
+
+The capture table includes source and destination addresses, service, value,
+DPT, and ETS group name. A value is decoded only when a supported, unambiguous
+DPT is known. Otherwise, group-write and response payloads appear as `0x…`:
+these are the group-value bytes, not the entire raw cEMI frame. A read request
+has no value payload. Missing or unsupported DPTs are never guessed from byte
+length; multiple declarations are marked as ambiguous. Select a row for raw
+cEMI and complete DPT details.
+
+| Action | GUI | TUI |
+| --- | --- | --- |
+| Connect or disconnect | Connection toolbar | `c` |
+| Connection settings | Settings… | `s` |
+| REST listener settings | REST status in the bottom bar | `a` (confirmed loopback toggle) |
+| Filter loaded captures | Filter field | `/` |
+| Read / preview a typed write | Read… / Write… | `r` / `w` |
+| Import ETS group addresses | Import ETS…; `Cmd-I` on macOS | `i` |
+| Export retained history | Export… | `e` |
+| Reload / load older history | Reload history / Older history | `h` / `PgUp` |
+| Toggle capture colors | Color checkbox; View → Color on macOS | `F8` |
+
+The TUI also offers `d` for gateway discovery, `j`/`k` for scrolling, and `q`
+to quit. The macOS app has native application, File, Edit, View, Operation,
+Window, and Help menus. Typed writes require a preview followed by a separate
+send action in both interfaces.
+
+On attach, the interactive views load the latest 1,000 rows and can page
+backward into older retained history. They keep up to 5,000 rows in memory;
+the text filter narrows that window, not the entire database. CSV export covers
+the complete retained history. Expert raw sending, backup, and durable audit
+inspection remain CLI commands; the [capability registry](src/capabilities.rs)
+records these explicit differences.
+
+### Import ETS group addresses
+
+First select the target capture by saving its connection settings or opening
+a saved capture. Choose **Import ETS…** in the GUI toolbar or **File → Import
+ETS Group Addresses…** on macOS (`Cmd-I`). Pick a CSV or XML export, select
+the format and CSV encoding, then choose **Preview import**. The preview shows
+the target capture, address/DPT counts, and sample entries. **Replace ETS
+catalogue** is a separate confirmation; canceling changes nothing.
+
+In the TUI, press `i`, enter the export path, choose `c` for CSV or `x` for XML,
+and choose `u` for UTF-8 or `l` for legacy Latin-1 CSV. Review the preview, then
+press `y` to confirm or `Esc` to cancel. XML must be UTF-8.
+
+Disconnect the selected capture session before confirming. The GUI's
+**Disconnect session** action or `c` in the TUI preview stops only that session;
+the daemon and REST listener remain running. A successful import creates a new
+metadata revision without changing raw history. Loaded telegrams immediately
+gain the new names, DPT declarations, and decodable values while retaining the
+current filter and selection.
+
+Standard four-column ETS CSV contains names and addresses, **but no DPTs**.
+Importing it improves labels, not typed decoding. GA Export 01 XML and the
+extended nine-column KnxMonitor CSV can supply DPT declarations. Full `.knxproj`
+projects are not supported. For CLI import, supported typed DPTs, and validation
+limits, see the [ETS import guide](docs/ets-import.md).
+
+### Restrained, optional colors
+
+Capture colors are enabled by default; GUI and TUI remember their display
+preference independently of the selected database. Human-readable CLI output
+uses `--color auto|always|never` or `--no-color`; `auto` is on for terminals and
+off for pipes. `NO_COLOR` disables automatic coloring; explicit `--color always`
+overrides it. A command-line color override locks the interactive switch for
+that process.
+
+Sent telegrams use one restrained accent, router losses are red, and local
+subscriber lag is amber. Textual labels remain present without color. JSON
+lines, CSV, SQLite, REST, and MCP payloads are never colorized.
+
+## Daemon, CLI, REST, and MCP
 
 For headless use, `daemon` runs without connecting to KNX until a session is
 requested. `connect` and endpoint-selected live operations start it on demand.
@@ -99,9 +177,9 @@ devknx follow --endpoint tunnel://192.0.2.1:3671
 devknx rest --enable --endpoint tunnel://192.0.2.1:3671
 devknx rest --status
 devknx mcp --endpoint tunnel://192.0.2.1:3671
-devknx write-preview --endpoint tunnel://192.0.2.1:3671 1/2/3 true
+devknx write-preview --endpoint tunnel://192.0.2.1:3671 --dpt 1.001 1/2/3 true
 devknx read --endpoint tunnel://192.0.2.1:3671 1/2/3
-devknx write --endpoint tunnel://192.0.2.1:3671 1/2/3 true
+devknx write --endpoint tunnel://192.0.2.1:3671 --dpt 1.001 1/2/3 true
 devknx rest --disable
 devknx disconnect tunnel://192.0.2.1:3671
 devknx daemon --stop
@@ -114,6 +192,9 @@ if needed; `--database` alone never guesses an endpoint or starts a session.
 `history`, `export`, `write-preview`, and `daemon --status` do not connect.
 `write-preview` does not transmit. The CLI never uses the GUI's remembered
 connection as a write target.
+The explicit `--dpt 1.001` is an example, not a type inferred for the address;
+use the actual device's DPT. It may be omitted when ETS supplies an unambiguous,
+supported declaration.
 
 The daemon owns one opt-in REST listener, bound to `127.0.0.1:8765` by
 default. It can start before any KNX session. `GET`, `POST`, and `DELETE` on
@@ -130,43 +211,9 @@ connect, and selected-database disconnect tools. It hides typed writes by
 default. See the [MCP guide](docs/mcp.md) for tool names, structured results,
 bounded search and exact-address write opt-in.
 
-The GUI shows a bounded live/history view with readable local timestamps,
-ETS names and unambiguous DPT-decoded values, a text filter, raw cEMI details,
-read and prepared typed-write dialogs, preview-confirmed ETS CSV/XML import,
-and non-overwriting CSV export.
-GUI and TUI include a DPT column and show group-value payloads as `0x…` when no
-unambiguous decoded value is available; they never guess a DPT from the payload
-length. Multiple ETS DPT declarations are marked as ambiguous, with the complete
-declarations available in capture details (and the GUI row tooltip).
-The GUI's separate toolbar exposes connection and capture actions; capture storage is
-explained under Settings rather than presented as the KNX connection. Its macOS
-app has native application, File, Edit, View, Operation, Window and Help menus.
-The TUI offers `c` connect/disconnect, `s` endpoint settings, `a` REST loopback control, `/` filter,
-`r` read, `w` prepared typed write, `i` ETS import, `e` export, `h` reload, `PgUp` older history, `d` discovery,
-`j`/`k` scroll, `F8` toggle capture colors and `q` quit.
-The GUI has a Color checkbox in its toolbar. Both interactive views remember
-that display preference independently of the selected capture database.
-Human-readable CLI output uses `--color auto|always|never` or `--no-color`;
-`auto` is on for terminals and off for pipes. `NO_COLOR` disables automatic
-coloring; explicit `--color always` overrides it. A command-line color override
-locks the interactive switch for that process. Sent telegrams use one restrained
-accent, router losses are red and local subscriber lag is amber. The textual
-labels remain present without color. JSON lines, CSV, SQLite, REST and MCP
-payloads are never colorized.
-In both interfaces, a typed write is previewed before a separate send action.
-Use **Import ETS…** in the GUI toolbar (or File menu on macOS) and `i` in the
-TUI to load group-address CSV or XML. Both show the selected capture, metadata
-summary and sample addresses before replacement. Disconnect that capture session
-to confirm the import; the daemon and REST listener can remain running.
-Loaded telegrams immediately gain the new names and declared DPTs. Standard ETS
-four-column CSV contains no DPTs; see the [ETS import guide](docs/ets-import.md).
-Expert raw sending, backup and durable audit inspection remain CLI
-commands. The [capability registry](src/capabilities.rs) records these explicit
-differences. On attach the interactive views load the latest 1,000 rows and
-can page backward into older retained history. They keep up to 5,000 rows in
-memory; a text filter narrows that window, not
-the entire database. `history --after ... --limit ... --filter ...` filters one
-bounded CLI page. CSV export still covers the complete retained capture history.
+`history --after ... --limit ... --filter ...` filters one bounded CLI page.
+
+### Capture and loss diagnostics
 
 `monitor` attaches to a managed session and prints one line per cEMI frame, including a millisecond
 timestamp, endpoint, source and destination addresses, group-value service,
@@ -179,7 +226,6 @@ frames. It includes the reporting router, device state, and count of routing
 frames the router says it lost. A slow local subscriber is reported separately
 as application-event lag; a connection interruption has no inferred loss count.
 None is a general KNX bus-loss total.
-The endpoints above are examples; substitute your own network addresses.
 Passive receive, restart, local IPC, and SQLite backup have been exercised
 against a real KNXnet/IP tunnel on macOS ARM64 and a physical multicast router
 on Linux x86_64. The observed bus traffic contained group writes, not reads or
@@ -187,11 +233,14 @@ responses. No real router loss report has been observed in the qualification
 window; parser and integration tests exercise the diagnostic path. See the
 [M2 evidence and limits](https://github.com/metaneutrons/devknx/issues/5).
 
-`connect`, `monitor`, GUI Connect, and TUI Connect create a versioned SQLite
-capture store for the selected endpoint. By default, its private per-user path
-encodes the canonical mode, IP address, and port; `--database` overrides it.
-Each
-committed telegram receives a monotonic ID; the default retention limit is
+## Storage and operation safety
+
+`connect` and `monitor` create a versioned SQLite capture store for the selected
+endpoint. Selecting a connection in the GUI or TUI also prepares its store;
+preparing storage does not connect to KNX. By default, the private per-user path
+in the operating system's application-data directory encodes the canonical
+mode, IP address, and port; `--database` overrides it. Each committed telegram
+receives a monotonic ID; the default retention limit is
 100,000 frames and can be changed with `--max-events`. `history` reads an
 existing store using an exclusive `--after` ID and a bounded page size.
 `export` streams CSV up to the highest ID present when export begins. `backup`
@@ -226,12 +275,11 @@ and reconnect after an owner restart.
 The [local IPC protocol](docs/local-ipc.md) is documented for development
 clients; it is not yet a stable external API.
 
-ETS imports are bounded, validated, and all-or-nothing; they create a new
-metadata revision without modifying raw captures. Standard four-column ETS
-CSV 3/1 has no DPT declaration or description. GA Export 01 XML can include
-both, and all declared DPTs are retained rather than selecting the first.
-See [ETS import and safety rules](docs/ets-import.md). Disconnect the selected
-session before an import: its single-writer lease also protects metadata updates.
+ETS imports are bounded, validated, and all-or-nothing. Previous metadata
+revisions remain intact, and all declared DPTs are retained rather than selecting
+the first. Disconnect the selected session before an import: its single-writer
+lease also protects metadata updates. See the [ETS import and safety
+rules](docs/ets-import.md).
 
 `write-preview` performs no network action. `write` resolves ETS declarations
 again inside the capture owner before sending; an absent or ambiguous DPT needs

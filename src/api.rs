@@ -4,7 +4,7 @@
 //! Versioned HTTP adapter over durable history and the sole KNX connection owner.
 
 use std::borrow::Cow;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use async_stream::stream;
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header, uri::Authority};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header, uri::Authority};
 use axum::middleware::{self, Next};
 use axum::response::{
     IntoResponse, Response,
@@ -30,10 +30,12 @@ use serde_json::{Value, json};
 use subtle::ConstantTimeEq as _;
 use tokio::sync::Semaphore;
 
+use crate::control::{ControlClient, ControlRequest, ControlResponse, SessionInfo};
 use crate::enrichment::{enrich_response_frame, enriched_capture_json};
 use crate::ets::parse_group_address;
 use crate::ipc::{IpcClient, IpcMessage, ReadOutcome};
 use crate::operations::{OperationOrigin, OperationRequest, prepare};
+use crate::paths;
 use crate::service::{LiveCapture, LiveRoutingLoss};
 use crate::storage::CaptureStore;
 
@@ -76,7 +78,11 @@ impl ApiRate {
 #[derive(Clone, Debug)]
 pub struct ApiConfig {
     /// Existing capture database; the API does not become a second writer.
-    pub database: PathBuf,
+    pub database: Option<PathBuf>,
+    /// Optional default target for daemon-managed REST.
+    pub endpoint: Option<String>,
+    /// False only for the legacy database-scoped foreground API.
+    pub managed: bool,
     /// Listener address. Loopback is the safe default at the CLI boundary.
     pub bind: SocketAddr,
     /// Secret loaded from an environment variable, never a CLI argument.
@@ -123,6 +129,7 @@ impl ApiConfig {
 #[derive(Clone)]
 struct ApiState {
     config: ApiConfig,
+    known_databases: Arc<Mutex<HashMap<String, PathBuf>>>,
     rate: Arc<Mutex<ApiRate>>,
     sse_slots: Arc<Semaphore>,
 }
@@ -184,12 +191,23 @@ impl ApiServer {
     ///
     /// # Errors
     ///
-    /// Returns invalid configuration, missing database or listener failures.
+    /// Returns invalid configuration, missing legacy database or listener failures.
     pub async fn bind(
         mut config: ApiConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         config.validate()?;
-        CaptureStore::open_existing(&config.database)?;
+        if let Some(database) = config.database.as_deref() {
+            if database.exists() {
+                let store = CaptureStore::open_existing(database)?;
+                if let Some(endpoint) = config.endpoint.as_deref() {
+                    store.validate_endpoint(endpoint)?;
+                }
+            } else if !config.managed {
+                CaptureStore::open_existing(database)?;
+            }
+        } else if !config.managed || config.endpoint.is_some() {
+            return Err("REST configuration requires a capture database".into());
+        }
         let listener = tokio::net::TcpListener::bind(config.bind).await?;
         config.bind = listener.local_addr()?;
         Ok(Self { listener, config })
@@ -239,13 +257,30 @@ pub async fn run(config: ApiConfig) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn router(config: ApiConfig) -> Router {
+    let mut known_databases = HashMap::new();
+    if let (Some(endpoint), Some(database)) = (&config.endpoint, &config.database) {
+        known_databases.insert(endpoint.clone(), database.clone());
+    }
     let state = ApiState {
         config,
+        known_databases: Arc::new(Mutex::new(known_databases)),
         rate: Arc::new(Mutex::new(ApiRate::default())),
         sse_slots: Arc::new(Semaphore::new(MAX_SSE_CLIENTS)),
     };
     Router::new()
         .route("/v1/health", get(health))
+        .route(
+            "/v1/connection",
+            get(connection)
+                .post(connect_connection)
+                .delete(disconnect_connection),
+        )
+        .route(
+            "/v1/sessions",
+            get(sessions)
+                .post(connect_session)
+                .delete(disconnect_session),
+        )
         .route("/v1/captures", get(captures))
         .route("/v1/events", get(events))
         .route("/v1/routing-losses", get(routing_losses))
@@ -273,7 +308,8 @@ async fn rate_limit(
     let bus = matches!(
         request.uri().path(),
         "/v1/operations/read" | "/v1/operations/typed-write"
-    );
+    ) || (matches!(request.uri().path(), "/v1/connection" | "/v1/sessions")
+        && request.method() != Method::GET);
     state
         .rate
         .lock()
@@ -342,15 +378,18 @@ async fn authorize(
 
 async fn health(State(state): State<ApiState>) -> ApiResult<Json<Value>> {
     let database = state.config.database.clone();
-    let revision =
-        tokio::task::spawn_blocking(move || CaptureStore::open_existing(&database)?.ets_revision())
-            .await
-            .map_err(|_| internal_error())?
-            .map_err(|_| internal_error())?;
+    let revision = tokio::task::spawn_blocking(move || match database {
+        Some(database) if database.exists() => {
+            CaptureStore::open_existing(&database)?.ets_revision()
+        }
+        _ => Ok(None),
+    })
+    .await
+    .map_err(|_| internal_error())?
+    .map_err(|_| internal_error())?;
     let owner = tokio::time::timeout(Duration::from_secs(2), async {
-        let mut client = IpcClient::connect(&state.config.database, false)
-            .await
-            .ok()?;
+        let database = state.config.database.as_deref()?;
+        let mut client = IpcClient::connect(database, false).await.ok()?;
         client.next().await.ok().flatten()
     })
     .await
@@ -358,13 +397,224 @@ async fn health(State(state): State<ApiState>) -> ApiResult<Json<Value>> {
     Ok(Json(json!({
         "api": "ready",
         "capture_owner": owner,
+        "target_endpoint": state.config.endpoint.as_deref(),
         "ets_revision": revision,
         "writes_allowed": state.config.writes_allowed(),
     })))
 }
 
+fn managed_endpoint(state: &ApiState, endpoint: Option<&str>) -> ApiResult<String> {
+    if !state.config.managed {
+        return Err(ApiError::static_message(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "connection control requires the daemon-managed REST listener",
+        ));
+    }
+    let endpoint =
+        endpoint
+            .or(state.config.endpoint.as_deref())
+            .ok_or(ApiError::static_message(
+                StatusCode::BAD_REQUEST,
+                "explicit endpoint is required",
+            ))?;
+    paths::canonical_endpoint(endpoint)
+        .map_err(|reason| ApiError::dynamic(StatusCode::BAD_REQUEST, reason))
+}
+
+async fn listed_sessions() -> ApiResult<Vec<SessionInfo>> {
+    let response = ControlClient::request_existing(ControlRequest::List)
+        .await
+        .map_err(|_| {
+            ApiError::static_message(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "daemon control unavailable",
+            )
+        })?;
+    let ControlResponse::Sessions { sessions } = response else {
+        return Err(ApiError::static_message(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon control unavailable",
+        ));
+    };
+    Ok(sessions)
+}
+
+async fn database_for(state: &ApiState, endpoint: Option<&str>) -> ApiResult<PathBuf> {
+    if !state.config.managed {
+        if endpoint.is_some() {
+            return Err(ApiError::static_message(
+                StatusCode::BAD_REQUEST,
+                "endpoint selection is unavailable for the foreground API",
+            ));
+        }
+        return state.config.database.clone().ok_or_else(internal_error);
+    }
+    let endpoint = managed_endpoint(state, endpoint)?;
+    if let Some(session) = listed_sessions()
+        .await?
+        .into_iter()
+        .find(|session| session.endpoint == endpoint)
+    {
+        state
+            .known_databases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(endpoint, session.database.clone());
+        return Ok(session.database);
+    }
+    if let Some(database) = state
+        .known_databases
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&endpoint)
+    {
+        return Ok(database.clone());
+    }
+    paths::database_for_endpoint(&endpoint)
+        .map_err(|reason| ApiError::dynamic(StatusCode::BAD_REQUEST, reason))
+}
+
+#[derive(Deserialize)]
+struct EndpointQuery {
+    endpoint: Option<String>,
+}
+
+async fn connection(
+    State(state): State<ApiState>,
+    query: Result<Query<EndpointQuery>, QueryRejection>,
+) -> ApiResult<Json<Value>> {
+    let Query(query) = query.map_err(|error| query_extractor_error(&error))?;
+    let endpoint = managed_endpoint(&state, query.endpoint.as_deref())?;
+    let sessions = listed_sessions().await?;
+    let session_active = sessions.iter().any(|session| session.endpoint == endpoint);
+    let owner = if session_active {
+        let database = database_for(&state, Some(&endpoint)).await?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut client = IpcClient::connect(&database, false).await.ok()?;
+            client.next().await.ok().flatten()
+        })
+        .await
+        .unwrap_or_default()
+    } else {
+        None
+    };
+    Ok(Json(json!({
+        "endpoint": endpoint,
+        "session_active": session_active,
+        "capture_owner": owner,
+    })))
+}
+
+async fn connect_connection(State(state): State<ApiState>) -> ApiResult<Json<Value>> {
+    let endpoint = managed_endpoint(&state, None)?;
+    connect_endpoint(&state, endpoint, 100_000).await
+}
+
+async fn connect_endpoint(
+    state: &ApiState,
+    endpoint: String,
+    max_events: u32,
+) -> ApiResult<Json<Value>> {
+    let database = database_for(state, Some(&endpoint)).await?;
+    let response = ControlClient::request_existing(ControlRequest::Connect {
+        endpoint: endpoint.clone(),
+        database: Some(database),
+        max_events,
+    })
+    .await
+    .map_err(|_| {
+        ApiError::static_message(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon control unavailable",
+        )
+    })?;
+    match response {
+        ControlResponse::Session { session } => {
+            state
+                .known_databases
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(endpoint, session.database.clone());
+            Ok(Json(json!({ "session": session })))
+        }
+        ControlResponse::Error { reason } => Err(ApiError::dynamic(StatusCode::CONFLICT, reason)),
+        _ => Err(ApiError::static_message(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unexpected daemon response",
+        )),
+    }
+}
+
+async fn disconnect_connection(State(state): State<ApiState>) -> ApiResult<Json<Value>> {
+    let endpoint = managed_endpoint(&state, None)?;
+    disconnect_endpoint(endpoint).await
+}
+
+async fn disconnect_endpoint(endpoint: String) -> ApiResult<Json<Value>> {
+    let response = ControlClient::request_existing(ControlRequest::Disconnect { endpoint })
+        .await
+        .map_err(|_| {
+            ApiError::static_message(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "daemon control unavailable",
+            )
+        })?;
+    match response {
+        ControlResponse::Disconnected => Ok(Json(json!({ "disconnected": true }))),
+        ControlResponse::Error { reason } => Err(ApiError::dynamic(StatusCode::CONFLICT, reason)),
+        _ => Err(ApiError::static_message(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unexpected daemon response",
+        )),
+    }
+}
+
+async fn sessions(State(state): State<ApiState>) -> ApiResult<Json<Value>> {
+    if !state.config.managed {
+        return Err(ApiError::static_message(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "session control requires the daemon-managed REST listener",
+        ));
+    }
+    Ok(Json(json!({ "sessions": listed_sessions().await? })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectInput {
+    endpoint: String,
+    #[serde(default = "default_max_events")]
+    max_events: u32,
+}
+
+const fn default_max_events() -> u32 {
+    100_000
+}
+
+async fn connect_session(
+    State(state): State<ApiState>,
+    input: Result<Json<ConnectInput>, JsonRejection>,
+) -> ApiResult<Json<Value>> {
+    let Json(input) = input.map_err(|error| json_extractor_error(&error))?;
+    let endpoint = managed_endpoint(&state, Some(&input.endpoint))?;
+    connect_endpoint(&state, endpoint, input.max_events).await
+}
+
+async fn disconnect_session(
+    State(state): State<ApiState>,
+    query: Result<Query<EndpointQuery>, QueryRejection>,
+) -> ApiResult<Json<Value>> {
+    let Query(query) = query.map_err(|error| query_extractor_error(&error))?;
+    let endpoint = query.endpoint.as_deref().ok_or(ApiError::static_message(
+        StatusCode::BAD_REQUEST,
+        "explicit endpoint is required",
+    ))?;
+    disconnect_endpoint(managed_endpoint(&state, Some(endpoint))?).await
+}
+
 #[derive(Deserialize)]
 struct PageQuery {
+    endpoint: Option<String>,
     #[serde(default)]
     after: i64,
     limit: Option<u32>,
@@ -406,7 +656,14 @@ async fn captures(
     let Query(query) = query.map_err(|error| query_extractor_error(&error))?;
     let limit_nonzero = page_bounds(&query)?;
     let limit = limit_nonzero.get();
-    let database = state.config.database.clone();
+    let database = database_for(&state, query.endpoint.as_deref()).await?;
+    if !database.exists() {
+        return Ok(Json(CapturePage {
+            items: Vec::new(),
+            next_after: query.after,
+            limit,
+        }));
+    }
     let (items, next_after) = tokio::task::spawn_blocking(move || {
         let store = CaptureStore::open_existing(&database).map_err(|error| error.to_string())?;
         let rows = store
@@ -438,7 +695,14 @@ async fn routing_losses(
 ) -> ApiResult<Json<RoutingLossPage>> {
     let Query(query) = query.map_err(|error| query_extractor_error(&error))?;
     let limit_nonzero = page_bounds(&query)?;
-    let database = state.config.database.clone();
+    let database = database_for(&state, query.endpoint.as_deref()).await?;
+    if !database.exists() {
+        return Ok(Json(RoutingLossPage {
+            items: Vec::new(),
+            next_after: query.after,
+            limit: limit_nonzero.get(),
+        }));
+    }
     let rows = tokio::task::spawn_blocking(move || {
         CaptureStore::open_existing(&database)?
             .read_routing_losses_after(query.after, limit_nonzero)
@@ -471,11 +735,20 @@ fn routing_loss_message(row: crate::storage::StoredRoutingLoss) -> IpcMessage {
 async fn ets_lookup(
     State(state): State<ApiState>,
     path: Result<Path<String>, PathRejection>,
+    query: Result<Query<EndpointQuery>, QueryRejection>,
 ) -> ApiResult<Json<Value>> {
     let Path(address) = path.map_err(|error| path_extractor_error(&error))?;
+    let Query(query) = query.map_err(|error| query_extractor_error(&error))?;
     let address = parse_group_address(&address)
         .map_err(|_| ApiError::static_message(StatusCode::BAD_REQUEST, "invalid group address"))?;
-    let database = state.config.database.clone();
+    let database = database_for(&state, query.endpoint.as_deref()).await?;
+    if !database.exists() {
+        return Ok(Json(json!({
+            "revision": null,
+            "address_raw": address.raw(),
+            "group": null,
+        })));
+    }
     let (revision, group) = tokio::task::spawn_blocking(move || {
         let store = CaptureStore::open_existing(&database)?;
         Ok::<_, crate::storage::StorageError>((store.ets_revision()?, store.ets_group(address)?))
@@ -491,6 +764,7 @@ async fn ets_lookup(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TypedInput {
+    endpoint: Option<String>,
     address: String,
     dpt: Option<String>,
     value: String,
@@ -516,11 +790,11 @@ async fn write_preview(
     input: Result<Json<TypedInput>, JsonRejection>,
 ) -> ApiResult<Json<Value>> {
     let Json(input) = input.map_err(|error| json_extractor_error(&error))?;
+    let database = database_for(&state, input.endpoint.as_deref()).await?;
     let request = input.request()?;
     let OperationRequest::TypedWrite { address_raw, .. } = request else {
         unreachable!("typed input only constructs typed writes")
     };
-    let database = state.config.database.clone();
     let prepared = tokio::task::spawn_blocking(move || {
         let store = CaptureStore::open_existing(&database).map_err(|_| internal_error())?;
         let group = store
@@ -550,13 +824,15 @@ async fn typed_write(
         ));
     }
     let Json(input) = input.map_err(|error| json_extractor_error(&error))?;
+    let database = database_for(&state, input.endpoint.as_deref()).await?;
     let request = input.request()?;
-    operate(&state, request).await
+    operate(&state, &database, request).await
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReadInput {
+    endpoint: Option<String>,
     address: String,
     #[serde(default = "default_read_timeout")]
     timeout_ms: u32,
@@ -571,6 +847,7 @@ async fn read(
     input: Result<Json<ReadInput>, JsonRejection>,
 ) -> ApiResult<Json<Value>> {
     let Json(input) = input.map_err(|error| json_extractor_error(&error))?;
+    let database = database_for(&state, input.endpoint.as_deref()).await?;
     let address_raw = parse_group_address(&input.address)
         .map_err(|_| ApiError::static_message(StatusCode::BAD_REQUEST, "invalid group address"))?
         .raw();
@@ -582,6 +859,7 @@ async fn read(
     }
     operate(
         &state,
+        &database,
         OperationRequest::Read {
             address_raw,
             timeout_ms: input.timeout_ms,
@@ -590,8 +868,12 @@ async fn read(
     .await
 }
 
-async fn operate(state: &ApiState, request: OperationRequest) -> ApiResult<Json<Value>> {
-    let result = IpcClient::operate_as(&state.config.database, &request, state.config.origin())
+async fn operate(
+    state: &ApiState,
+    database: &std::path::Path,
+    request: OperationRequest,
+) -> ApiResult<Json<Value>> {
+    let result = IpcClient::operate_as(database, &request, state.config.origin())
         .await
         .map_err(|_| {
             ApiError::static_message(StatusCode::SERVICE_UNAVAILABLE, "capture owner unavailable")
@@ -603,7 +885,7 @@ async fn operate(state: &ApiState, request: OperationRequest) -> ApiResult<Json<
                 _ => None,
             };
             let enrichment = if let Some(raw_cemi) = response_raw {
-                let database = state.config.database.clone();
+                let database = database.to_path_buf();
                 tokio::task::spawn_blocking(move || {
                     let store = CaptureStore::open_existing(&database)
                         .map_err(|error| error.to_string())?;
@@ -634,6 +916,7 @@ async fn operate(state: &ApiState, request: OperationRequest) -> ApiResult<Json<
 
 #[derive(Deserialize)]
 struct EventQuery {
+    endpoint: Option<String>,
     after: Option<i64>,
 }
 
@@ -647,12 +930,16 @@ async fn events(
     let permit = state.sse_slots.clone().try_acquire_owned().map_err(|_| {
         ApiError::static_message(StatusCode::TOO_MANY_REQUESTS, "too many active SSE clients")
     })?;
-    let database = state.config.database;
+    let database = database_for(&state, query.endpoint.as_deref()).await?;
     let event_stream = stream! {
         let _permit = permit;
         let mut cursor = cursor;
         let mut live = IpcClient::connect(&database, true).await.ok();
         loop {
+            if !database.exists() {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
             let path = database.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let store = CaptureStore::open_existing(&path).map_err(|error| error.to_string())?;
@@ -730,12 +1017,16 @@ async fn routing_loss_events(
     let permit = state.sse_slots.clone().try_acquire_owned().map_err(|_| {
         ApiError::static_message(StatusCode::TOO_MANY_REQUESTS, "too many active SSE clients")
     })?;
-    let database = state.config.database;
+    let database = database_for(&state, query.endpoint.as_deref()).await?;
     let event_stream = stream! {
         let _permit = permit;
         let mut cursor = cursor;
         let mut live = IpcClient::connect(&database, true).await.ok();
         loop {
+            if !database.exists() {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
             let path = database.clone();
             let result = tokio::task::spawn_blocking(move || {
                 CaptureStore::open_existing(&path)?.read_routing_losses_after(cursor, NonZeroU32::new(100).expect("nonzero"))
@@ -806,9 +1097,19 @@ async fn wait_for_live(
 async fn openapi(State(state): State<ApiState>) -> Json<Value> {
     let mut document = json!({
         "openapi": "3.1.0",
-        "info": { "title": "devknx REST API", "version": env!("CARGO_PKG_VERSION"), "description": "Bearer authentication is required when a token is configured and always for non-loopback bindings. Remote typed writes additionally require explicit enablement. Raw writes are not exposed." },
+        "info": { "title": "devknx REST API", "version": env!("CARGO_PKG_VERSION"), "description": "The daemon-managed listener starts without a KNX session. GET/POST/DELETE /v1/sessions control explicit endpoints. Data requests require an endpoint unless a listener default was selected. Bearer authentication is required when a token is configured and always for non-loopback bindings. Remote typed writes additionally require explicit enablement. Raw writes are not exposed." },
         "paths": {
             "/v1/health": { "get": { "operationId": "health", "responses": { "200": { "description": "API and capture owner state", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Health" } } } } } } },
+            "/v1/connection": {
+                "get": { "operationId": "connectionStatus", "responses": { "200": { "description": "Selected KNX session and owner state", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Connection" } } } } } },
+                "post": { "operationId": "connectKnx", "responses": { "200": { "description": "Selected KNX session started or already active", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ConnectionStart" } } } } } },
+                "delete": { "operationId": "disconnectKnx", "responses": { "200": { "description": "Selected KNX session stopped; REST remains available", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ConnectionStop" } } } } } }
+            },
+            "/v1/sessions": {
+                "get": { "operationId": "listSessions", "responses": { "200": { "description": "Active KNX sessions", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Sessions" } } } } } },
+                "post": { "operationId": "startSession", "requestBody": { "$ref": "#/components/requestBodies/Connect" }, "responses": { "200": { "description": "Explicit KNX session started or already active", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ConnectionStart" } } } } } },
+                "delete": { "operationId": "stopSession", "parameters": [{ "name": "endpoint", "in": "query", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "Explicit KNX session stopped; REST remains available", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ConnectionStop" } } } } } }
+            },
             "/v1/captures": { "get": { "operationId": "listCaptures", "parameters": [
                 { "name": "after", "in": "query", "schema": { "type": "integer", "minimum": 0 } },
                 { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000 } }
@@ -863,9 +1164,27 @@ async fn openapi(State(state): State<ApiState>) -> Json<Value> {
                     "items": { "type": "array", "items": { "$ref": "#/components/schemas/RoutingLoss" } },
                     "next_after": { "type": "integer", "minimum": 0 }, "limit": { "type": "integer", "minimum": 1, "maximum": 1000 }
                 } },
-                "Health": { "type": "object", "required": ["api", "capture_owner", "ets_revision", "writes_allowed"], "properties": {
+                "Health": { "type": "object", "required": ["api", "capture_owner", "target_endpoint", "ets_revision", "writes_allowed"], "properties": {
                     "api": { "const": "ready" }, "capture_owner": { "type": ["object", "null"] },
+                    "target_endpoint": { "type": ["string", "null"] },
                     "ets_revision": { "type": ["integer", "null"] }, "writes_allowed": { "type": "boolean" }
+                } },
+                "Connection": { "type": "object", "required": ["endpoint", "session_active", "capture_owner"], "properties": {
+                    "endpoint": { "type": "string" }, "session_active": { "type": "boolean" },
+                    "capture_owner": { "type": ["object", "null"] }
+                } },
+                "Sessions": { "type": "object", "required": ["sessions"], "properties": {
+                    "sessions": { "type": "array", "items": { "type": "object", "required": ["endpoint", "database"], "properties": {
+                        "endpoint": { "type": "string" }, "database": { "type": "string" }
+                    } } }
+                } },
+                "ConnectionStart": { "type": "object", "required": ["session"], "properties": {
+                    "session": { "type": "object", "required": ["endpoint", "database"], "properties": {
+                        "endpoint": { "type": "string" }, "database": { "type": "string" }
+                    } }
+                } },
+                "ConnectionStop": { "type": "object", "required": ["disconnected"], "properties": {
+                    "disconnected": { "const": true }
                 } },
                 "EtsLookup": { "type": "object", "required": ["revision", "address_raw", "group"], "properties": {
                     "revision": { "type": ["integer", "null"] }, "address_raw": { "type": "integer", "minimum": 0, "maximum": 65535 },
@@ -887,14 +1206,37 @@ async fn openapi(State(state): State<ApiState>) -> Json<Value> {
             },
             "requestBodies": {
                 "TypedWrite": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["address", "value"], "properties": {
-                    "address": { "type": "string" }, "dpt": { "type": "string" }, "value": { "type": "string" }
+                    "endpoint": { "type": "string", "description": "Required unless a listener default endpoint was selected" }, "address": { "type": "string" }, "dpt": { "type": "string" }, "value": { "type": "string" }
                 } } } } },
                 "Read": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["address"], "properties": {
-                    "address": { "type": "string" }, "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 30000 }
+                    "endpoint": { "type": "string", "description": "Required unless a listener default endpoint was selected" }, "address": { "type": "string" }, "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 30000 }
+                } } } } },
+                "Connect": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["endpoint"], "properties": {
+                    "endpoint": { "type": "string" }, "max_events": { "type": "integer", "minimum": 1, "default": 100_000 }
                 } } } } }
             }
         }
     });
+    if let Some(paths) = document.get_mut("paths").and_then(Value::as_object_mut) {
+        for path in [
+            "/v1/captures",
+            "/v1/events",
+            "/v1/routing-losses",
+            "/v1/routing-loss-events",
+            "/v1/ets/{address}",
+            "/v1/connection",
+        ] {
+            if let Some(parameters) = paths
+                .get_mut(path)
+                .and_then(|item| item.get_mut("get"))
+                .and_then(|get| get.as_object_mut())
+                .map(|get| get.entry("parameters").or_insert_with(|| json!([])))
+                .and_then(Value::as_array_mut)
+            {
+                parameters.push(json!({ "name": "endpoint", "in": "query", "required": false, "description": "Required when the listener has no default endpoint", "schema": { "type": "string" } }));
+            }
+        }
+    }
     if let Some(paths) = document.get_mut("paths").and_then(Value::as_object_mut) {
         for path_item in paths.values_mut() {
             let Some(operations) = path_item.as_object_mut() else {
@@ -976,7 +1318,9 @@ mod tests {
 
     fn config(database: PathBuf) -> ApiConfig {
         ApiConfig {
-            database,
+            database: Some(database),
+            endpoint: None,
+            managed: false,
             bind: "127.0.0.1:8765".parse().unwrap(),
             token: None,
             allow_remote_writes: false,
@@ -1176,6 +1520,19 @@ mod tests {
         let schema: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(schema["openapi"], "3.1.0");
         assert!(schema["paths"]["/v1/events"].is_object());
+        assert_eq!(
+            schema["paths"]["/v1/sessions"]["post"]["operationId"],
+            "startSession"
+        );
+        assert_eq!(
+            schema["paths"]["/v1/sessions"]["delete"]["operationId"],
+            "stopSession"
+        );
+        assert_eq!(
+            schema["components"]["requestBodies"]["Read"]["content"]["application/json"]["schema"]
+                ["properties"]["endpoint"]["type"],
+            "string"
+        );
         let response = request(
             app.clone(),
             Method::GET,
@@ -1348,6 +1705,8 @@ mod tests {
         config.token = Some("s".repeat(32));
         config.validate().unwrap();
         let app = router(config);
+        let unauthorized_session = request(app.clone(), Method::GET, "/v1/sessions", None).await;
+        assert_api_error(unauthorized_session, StatusCode::UNAUTHORIZED).await;
         let input = json!({ "address": "1/2/3", "dpt": "1.001", "value": "true" });
         let request = Request::builder()
             .method(Method::POST)

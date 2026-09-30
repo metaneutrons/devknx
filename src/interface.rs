@@ -464,6 +464,7 @@ fn ensure_private_directory(path: &Path) -> Result<(), String> {
 
 pub fn connect_owner(database: &Path, endpoint: &str) -> Result<String, String> {
     let endpoint = paths::canonical_endpoint(endpoint)?;
+    let database = std::path::absolute(database).map_err(|error| error.to_string())?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -474,7 +475,7 @@ pub fn connect_owner(database: &Path, endpoint: &str) -> Result<String, String> 
             .map_err(|error| error.to_string())?;
         match ControlClient::request_existing(ControlRequest::Connect {
             endpoint: endpoint.clone(),
-            database: Some(database.to_path_buf()),
+            database: Some(database),
             max_events: 100_000,
         })
         .await
@@ -530,6 +531,13 @@ fn control_request(request: ControlRequest) -> io::Result<ControlResponse> {
     runtime.block_on(ControlClient::request_existing(request))
 }
 
+fn control_request_start(request: ControlRequest) -> io::Result<ControlResponse> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(ControlClient::request(request))
+}
+
 pub fn rest_status() -> Result<RestStatus, String> {
     match control_request(ControlRequest::RestStatus) {
         Ok(ControlResponse::Rest { status }) => Ok(status),
@@ -553,17 +561,26 @@ pub fn rest_status() -> Result<RestStatus, String> {
 }
 
 pub fn rest_enable(
-    endpoint: &str,
+    endpoint: Option<&str>,
+    database: Option<PathBuf>,
     bind: &str,
     token: Option<String>,
     allow_remote_writes: bool,
 ) -> Result<RestStatus, String> {
-    let endpoint = paths::canonical_endpoint(endpoint)?;
+    let endpoint = endpoint.map(paths::canonical_endpoint).transpose()?;
+    if endpoint.is_none() && database.is_some() {
+        return Err("REST database override requires an endpoint".into());
+    }
+    let database = database
+        .map(std::path::absolute)
+        .transpose()
+        .map_err(|error| error.to_string())?;
     let bind: SocketAddr = bind
         .parse()
         .map_err(|_| "Enter a valid REST listen address".to_owned())?;
-    match control_request(ControlRequest::RestEnable {
+    match control_request_start(ControlRequest::RestEnable {
         endpoint,
+        database,
         bind,
         token,
         allow_remote_writes,

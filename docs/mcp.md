@@ -1,6 +1,7 @@
 # MCP stdio server (experimental)
 
-Start the local MCP server for a KNXnet/IP endpoint's existing capture. An
+Start the local MCP server for a KNXnet/IP endpoint's capture. The database
+may be created later by `knx_connect`. An
 explicit `--database PATH` also works when the owner uses a custom path:
 
 ```sh
@@ -23,12 +24,15 @@ Configure that command in the MCP client. Standard output is reserved for
 JSON-RPC; status messages and protocol errors do not become informal output
 on that channel. The process exits when its stdio client disconnects.
 
-The server exposes eight tools by default and a ninth only with an explicit
+The server exposes eleven tools by default and a twelfth only with an explicit
 write allowlist. Each has a JSON input schema and a structured JSON result:
 
 | Tool | Result |
 | --- | --- |
 | `knx_discover` | KNXnet/IP gateway addresses, names and raw individual addresses |
+| `knx_sessions` | All sessions configured in the current-user daemon, or an empty list when it is not running |
+| `knx_connect` | Session created for an explicit endpoint and this MCP server's selected database |
+| `knx_disconnect` | Disconnect result for the session associated with this MCP server's selected database only |
 | `knx_status` | Capture-owner connection state and active ETS revision |
 | `knx_list_captures` | Unfiltered retained capture page and continuation cursor |
 | `knx_list_routing_losses` | Separate cursor page of router-reported lost routing frames |
@@ -55,6 +59,22 @@ is guessed when a group is unknown or has multiple declarations.
 Read receipts similarly include `response_enrichment` only when a matching
 response frame is observed; otherwise the field is `null`.
 
+Session management uses the database selected when the MCP server starts.
+`knx_sessions` lists daemon sessions without starting the daemon. `knx_connect`
+requires an explicit endpoint, starts the daemon when needed, and assigns the
+selected database while requesting a retention limit of 100000 events. With
+`mcp --endpoint URL`, the tool endpoint must match that selector; with
+`mcp --database PATH`, any explicit endpoint can be bound to the selected file.
+`knx_disconnect`
+disconnects only the active session for that selected database; it does not
+accept an endpoint that could select another session. For example:
+
+```text
+knx_sessions: {}
+knx_connect: {"endpoint":"tunnel://192.0.2.1:3671"}
+knx_disconnect: {}
+```
+
 The stdio process and the capture owner communicate over current-user local
 IPC. Read and typed-write tools use the same operation preparation,
 transmission and durable audit path as CLI and REST. A typed write with no
@@ -66,8 +86,9 @@ the intended group address, DPT and value before sending. Starting a writable
 MCP process grants its connected client a live bus capability for the listed
 addresses; use a separate read-only configuration when that is not intended.
 
-Tool metadata distinguishes local read-only queries from KNX bus reads,
-discovery and potentially destructive writes. One stdio session is limited to
-120 tool calls, 12 bus operations and six discovery calls in any rolling minute;
+Tool metadata marks session management as state changing and distinguishes
+local read-only queries from KNX bus reads, discovery and potentially
+destructive writes. One stdio session is limited to 120 tool calls, 12 bus
+operations and six discovery calls in any rolling minute;
 the limits are shared across concurrent requests within that session. A
 limit error does not transmit a KNX frame.

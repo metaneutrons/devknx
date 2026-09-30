@@ -103,6 +103,7 @@ struct ActiveSession {
 
 struct ActiveRest {
     status: RestStatus,
+    database: Option<PathBuf>,
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<Result<(), Box<dyn Error + Send + Sync>>>,
 }
@@ -146,17 +147,43 @@ impl DaemonSessions {
                 self.disconnect(&endpoint).await;
                 ControlResponse::Disconnected
             }
+            ControlRequest::DisconnectScoped { database } => {
+                let database = match resolve_database_path(&database) {
+                    Ok(database) => database,
+                    Err(error) => {
+                        return ControlResponse::Error {
+                            reason: format!("invalid capture database path: {error}"),
+                        };
+                    }
+                };
+                let identity = match database_identity(&database) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        return ControlResponse::Error {
+                            reason: format!("invalid capture database path: {error}"),
+                        };
+                    }
+                };
+                let Some(endpoint) = self.by_database.get(&identity).cloned() else {
+                    return ControlResponse::Error {
+                        reason: "no active session for selected capture database".to_owned(),
+                    };
+                };
+                self.disconnect(&endpoint).await;
+                ControlResponse::Disconnected
+            }
             ControlRequest::Stop => {
                 self.stop_all().await;
                 ControlResponse::Stopped
             }
             ControlRequest::RestEnable {
                 endpoint,
+                database,
                 bind,
                 token,
                 allow_remote_writes,
             } => {
-                self.enable_rest(endpoint, bind, token, allow_remote_writes)
+                self.enable_rest(endpoint, database, bind, token, allow_remote_writes)
                     .await
             }
             ControlRequest::RestDisable => {
@@ -201,9 +228,16 @@ impl DaemonSessions {
 
         let requested_database = match database {
             Some(database) => database,
-            None => match paths::database_for_endpoint(&endpoint) {
-                Ok(database) => database,
-                Err(reason) => return ControlResponse::Error { reason },
+            None => match self
+                .rest
+                .as_ref()
+                .filter(|rest| rest.status.endpoint.as_deref() == Some(endpoint.as_str()))
+            {
+                Some(rest) => rest.database.clone().expect("selected REST has a database"),
+                None => match paths::database_for_endpoint(&endpoint) {
+                    Ok(database) => database,
+                    Err(reason) => return ControlResponse::Error { reason },
+                },
             },
         };
         let database = match resolve_database_path(&requested_database) {
@@ -214,6 +248,15 @@ impl DaemonSessions {
                 };
             }
         };
+        if self.rest.as_ref().is_some_and(|rest| {
+            rest.status.endpoint.as_deref() == Some(endpoint.as_str())
+                && rest.database.as_ref() != Some(&database)
+        }) {
+            return ControlResponse::Error {
+                reason: "REST is configured for this endpoint with a different capture database"
+                    .to_owned(),
+            };
+        }
         let before_open = match database_identity(&database) {
             Ok(identity) => identity,
             Err(error) => {
@@ -303,13 +346,6 @@ impl DaemonSessions {
     }
 
     async fn disconnect(&mut self, endpoint: &str) {
-        if self
-            .rest
-            .as_ref()
-            .is_some_and(|rest| rest.status.endpoint.as_deref() == Some(endpoint))
-        {
-            self.disable_rest().await;
-        }
         if let Some(mut session) = self.by_endpoint.remove(endpoint) {
             self.by_database.remove(&session.database_identity);
             if let Some(shutdown) = session.shutdown.take() {
@@ -321,7 +357,8 @@ impl DaemonSessions {
 
     async fn enable_rest(
         &mut self,
-        endpoint: String,
+        endpoint: Option<String>,
+        database: Option<PathBuf>,
         bind: std::net::SocketAddr,
         token: Option<String>,
         allow_remote_writes: bool,
@@ -331,17 +368,54 @@ impl DaemonSessions {
                 reason: "a REST listener is already active".to_owned(),
             };
         }
-        let endpoint = match paths::canonical_endpoint(&endpoint) {
-            Ok(endpoint) => endpoint,
-            Err(reason) => return ControlResponse::Error { reason },
+        let endpoint = match endpoint {
+            Some(endpoint) => match paths::canonical_endpoint(&endpoint) {
+                Ok(endpoint) => Some(endpoint),
+                Err(reason) => return ControlResponse::Error { reason },
+            },
+            None => None,
         };
-        let Some(session) = self.by_endpoint.get(&endpoint) else {
+        if endpoint.is_none() && database.is_some() {
             return ControlResponse::Error {
-                reason: format!("endpoint {endpoint} is not connected"),
+                reason: "REST database override requires an endpoint".to_owned(),
             };
+        }
+        let database = if let Some(endpoint) = endpoint.as_deref() {
+            let requested = match database {
+                Some(database) => database,
+                None => match self.by_endpoint.get(endpoint) {
+                    Some(session) => session.info.database.clone(),
+                    None => match paths::database_for_endpoint(endpoint) {
+                        Ok(database) => database,
+                        Err(reason) => return ControlResponse::Error { reason },
+                    },
+                },
+            };
+            let resolved = match resolve_database_path(&requested) {
+                Ok(database) => database,
+                Err(error) => {
+                    return ControlResponse::Error {
+                        reason: format!("invalid capture database path: {error}"),
+                    };
+                }
+            };
+            if self
+                .by_endpoint
+                .get(endpoint)
+                .is_some_and(|session| session.info.database != resolved)
+            {
+                return ControlResponse::Error {
+                    reason: "endpoint is connected with a different capture database".to_owned(),
+                };
+            }
+            Some(resolved)
+        } else {
+            None
         };
         let server = match ApiServer::bind(ApiConfig {
-            database: session.info.database.clone(),
+            database: database.clone(),
+            endpoint: endpoint.clone(),
+            managed: true,
             bind,
             token,
             allow_remote_writes,
@@ -362,12 +436,13 @@ impl DaemonSessions {
         }));
         let status = RestStatus {
             enabled: true,
-            endpoint: Some(endpoint),
+            endpoint,
             bind: Some(address),
             allow_remote_writes,
         };
         self.rest = Some(ActiveRest {
             status: status.clone(),
+            database,
             shutdown: Some(shutdown),
             task,
         });

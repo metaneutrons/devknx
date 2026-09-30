@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Fabian Schmieder
 
 use std::io::{Read as _, Seek as _};
+use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
@@ -131,6 +132,150 @@ async fn wait_connected(cli: &IsolatedCli, endpoint: &str) {
     .expect("session connected to loopback gateway");
 }
 
+async fn http_json(address: SocketAddr, method: &str, path: &str) -> (u16, Value) {
+    http_json_body(address, method, path, None).await
+}
+
+async fn http_json_body(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (u16, Value) {
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect to REST listener");
+    let body = body.map_or_else(String::new, |value| value.to_string());
+    stream
+        .write_all(
+            format!(
+                "{method} {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("send REST request");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read REST reply");
+    let separator = response
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .expect("REST reply headers");
+    let status = String::from_utf8_lossy(&response[..separator])
+        .split_whitespace()
+        .nth(1)
+        .expect("REST status code")
+        .parse()
+        .expect("numeric REST status");
+    let body = serde_json::from_slice(&response[separator + 4..]).expect("JSON REST reply");
+    (status, body)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rest_without_default_endpoint_controls_isolated_sessions() {
+    let cli = IsolatedCli::new();
+    let first_gateway = DeviceServer::start_at("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let second_gateway = DeviceServer::start_at("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let first = format!("tunnel://{}", first_gateway.local_addr());
+    let second = format!("tunnel://{}", second_gateway.local_addr());
+    let enabled = cli.json(&["rest", "--enable", "--bind", "127.0.0.1:0"]);
+    assert!(enabled["status"]["endpoint"].is_null());
+    let address: SocketAddr = enabled["status"]["bind"].as_str().unwrap().parse().unwrap();
+    let (code, empty) = http_json(address, "GET", "/v1/sessions").await;
+    assert_eq!(code, 200);
+    assert!(empty["sessions"].as_array().unwrap().is_empty());
+    let (code, missing) = http_json(address, "GET", "/v1/captures").await;
+    assert_eq!(code, 400);
+    assert_eq!(missing["error"], "explicit endpoint is required");
+    let (code, missing) = http_json_body(
+        address,
+        "POST",
+        "/v1/operations/read",
+        Some(serde_json::json!({"address":"1/2/3"})),
+    )
+    .await;
+    assert_eq!(code, 400);
+    assert_eq!(missing["error"], "explicit endpoint is required");
+    let (code, started_first) = http_json_body(
+        address,
+        "POST",
+        "/v1/sessions",
+        Some(serde_json::json!({"endpoint":first})),
+    )
+    .await;
+    assert_eq!(code, 200);
+    assert_eq!(started_first["session"]["endpoint"], first);
+    let (code, started_second) = http_json_body(
+        address,
+        "POST",
+        "/v1/sessions",
+        Some(serde_json::json!({"endpoint":second})),
+    )
+    .await;
+    assert_eq!(code, 200);
+    assert_ne!(
+        started_first["session"]["database"],
+        started_second["session"]["database"]
+    );
+    wait_connected(&cli, &first).await;
+    wait_connected(&cli, &second).await;
+    first_gateway
+        .send_frame(CemiFrame::new_l_data(
+            MessageCode::LDataInd,
+            IndividualAddress::from_raw(0x1101),
+            DestinationAddress::Group(GroupAddress::from_raw(0x0801)),
+            Priority::Low,
+            &[0x00, 0x40, 0x2a],
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (code, page) =
+                http_json(address, "GET", &format!("/v1/captures?endpoint={first}")).await;
+            assert_eq!(code, 200);
+            if !page["items"].as_array().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("first session capture visible through REST");
+    let (code, listed) = http_json(address, "GET", "/v1/sessions").await;
+    assert_eq!(code, 200);
+    assert_eq!(listed["sessions"].as_array().unwrap().len(), 2);
+    let (code, first_page) =
+        http_json(address, "GET", &format!("/v1/captures?endpoint={first}")).await;
+    assert_eq!(code, 200);
+    assert_eq!(first_page["items"].as_array().unwrap().len(), 1);
+    assert_eq!(first_page["items"][0]["endpoint"], first);
+    let (code, second_page) =
+        http_json(address, "GET", &format!("/v1/captures?endpoint={second}")).await;
+    assert_eq!(code, 200);
+    assert!(second_page["items"].as_array().unwrap().is_empty());
+    let (code, stopped) =
+        http_json(address, "DELETE", &format!("/v1/sessions?endpoint={first}")).await;
+    assert_eq!(code, 200);
+    assert_eq!(stopped["disconnected"], true);
+    assert_eq!(cli.json(&["rest", "--status"])["status"]["enabled"], true);
+    let (code, listed) = http_json(address, "GET", "/v1/sessions").await;
+    assert_eq!(code, 200);
+    assert_eq!(listed["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["sessions"][0]["endpoint"], second);
+    cli.json(&["rest", "--disable"]);
+    first_gateway.stop().await;
+    second_gateway.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn foreground_daemon_starts_without_a_knx_session() {
     let cli = IsolatedCli::new();
@@ -178,6 +323,81 @@ async fn foreground_daemon_starts_without_a_knx_session() {
     })
     .await
     .expect("foreground daemon stopped");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rest_starts_offline_and_controls_its_selected_knx_session() {
+    let cli = IsolatedCli::new();
+    let gateway = DeviceServer::start_at("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let endpoint = format!("tunnel://{}", gateway.local_addr());
+    let database = cli.directory.path().join("selected.sqlite");
+    let database_text = database.to_str().unwrap();
+    let enabled = cli.json(&[
+        "rest",
+        "--enable",
+        "--endpoint",
+        &endpoint,
+        "--database",
+        database_text,
+        "--bind",
+        "127.0.0.1:0",
+    ]);
+    let address: SocketAddr = enabled["status"]["bind"].as_str().unwrap().parse().unwrap();
+    assert_eq!(enabled["status"]["endpoint"], endpoint);
+    assert!(
+        !database.exists(),
+        "REST started a capture without a Connect request"
+    );
+    assert!(
+        cli.json(&["sessions"])["sessions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let (code, health) = http_json(address, "GET", "/v1/health").await;
+    assert_eq!(code, 200);
+    assert_eq!(health["api"], "ready");
+    assert!(health["capture_owner"].is_null());
+    let (code, captures) = http_json(address, "GET", "/v1/captures?after=0&limit=10").await;
+    assert_eq!(code, 200);
+    assert!(captures["items"].as_array().unwrap().is_empty());
+    let (code, before) = http_json(address, "GET", "/v1/connection").await;
+    assert_eq!(code, 200);
+    assert_eq!(before["endpoint"], endpoint);
+    assert_eq!(before["session_active"], false);
+
+    let (code, started) = http_json(address, "POST", "/v1/connection").await;
+    assert_eq!(code, 200);
+    assert_eq!(
+        started["session"]["database"],
+        database.canonicalize().unwrap().to_str().unwrap()
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let (code, state) = http_json(address, "GET", "/v1/connection").await;
+            assert_eq!(code, 200);
+            if state["capture_owner"]["value"]["state"] == "connected" {
+                assert_eq!(state["session_active"], true);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("REST connected its KNX endpoint");
+
+    let (code, stopped) = http_json(address, "DELETE", "/v1/connection").await;
+    assert_eq!(code, 200);
+    assert_eq!(stopped["disconnected"], true);
+    assert_eq!(cli.json(&["rest", "--status"])["status"]["enabled"], true);
+    let (code, after) = http_json(address, "GET", "/v1/connection").await;
+    assert_eq!(code, 200);
+    assert_eq!(after["session_active"], false);
+    assert!(after["capture_owner"].is_null());
+    cli.json(&["rest", "--disable"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -332,7 +552,7 @@ async fn daemon_manages_two_isolated_sessions_and_rest_lifecycle() {
     );
 
     cli.json(&["disconnect", &second]);
-    assert_eq!(cli.json(&["rest", "--status"])["status"]["enabled"], false);
+    assert_eq!(cli.json(&["rest", "--status"])["status"]["enabled"], true);
     assert_eq!(
         cli.json(&["sessions"])["sessions"]
             .as_array()

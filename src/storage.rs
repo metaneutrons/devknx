@@ -264,14 +264,36 @@ impl CaptureStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let bound: Option<String> = transaction
+        Self::validate_endpoint_connection(&transaction, endpoint)?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO session_binding (id, endpoint) VALUES (1, ?1)",
+            [endpoint],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Confirm that this capture belongs to the selected KNX endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an identity mismatch or database error without changing the store.
+    pub fn validate_endpoint(&self, endpoint: &str) -> Result<(), StorageError> {
+        Self::validate_endpoint_connection(&self.connection, endpoint)
+    }
+
+    fn validate_endpoint_connection(
+        connection: &Connection,
+        endpoint: &str,
+    ) -> Result<(), StorageError> {
+        let bound: Option<String> = connection
             .query_row(
                 "SELECT endpoint FROM session_binding WHERE id = 1",
                 [],
                 |row| row.get(0),
             )
             .optional()?;
-        let conflicting_capture: Option<String> = transaction
+        let conflicting_capture: Option<String> = connection
             .query_row(
                 "SELECT transport || '://' || endpoint FROM capture_events
                  WHERE transport || '://' || endpoint <> ?1 LIMIT 1",
@@ -279,7 +301,7 @@ impl CaptureStore {
                 |row| row.get(0),
             )
             .optional()?;
-        let conflicting_router: Option<String> = transaction
+        let conflicting_router: Option<String> = connection
             .query_row(
                 "SELECT 'router://' || endpoint FROM routing_loss_events
                  WHERE 'router://' || endpoint <> ?1 LIMIT 1",
@@ -298,11 +320,6 @@ impl CaptureStore {
                 });
             }
         }
-        transaction.execute(
-            "INSERT OR IGNORE INTO session_binding (id, endpoint) VALUES (1, ?1)",
-            [endpoint],
-        )?;
-        transaction.commit()?;
         Ok(())
     }
 

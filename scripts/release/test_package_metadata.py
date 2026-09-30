@@ -28,6 +28,10 @@ class PackageMetadataTests(unittest.TestCase):
                 "devknx.rb", "devknx-app.rb", "devknx-bin.PKGBUILD", "devknx.PKGBUILD"
             })
             formula = (output / "devknx.rb").read_text()
+            for line in formula.splitlines():
+                # Homebrew permits long download URLs, not long Ruby code.
+                if not line.lstrip().startswith("url "):
+                    self.assertLessEqual(len(line), 118, line)
             self.assertIn(
                 hashlib.sha256(b"aarch64-apple-darwin").hexdigest(), formula
             )
@@ -37,7 +41,7 @@ class PackageMetadataTests(unittest.TestCase):
             for library in ("libxcursor", "libxi"):
                 self.assertIn(f'depends_on "{library}"', formula)
             self.assertIn(
-                "%w[libx11 libxcb libxcursor libxi libxkbcommon mesa wayland]", formula
+                "libx11 libxcb libxcursor libxi libxkbcommon mesa wayland", formula
             )
             self.assertIn('formula_opt_lib(name)', formula)
             self.assertIn('LD_LIBRARY_PATH:', formula)

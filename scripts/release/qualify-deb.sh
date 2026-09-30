@@ -15,7 +15,7 @@ apt-get update
 # Minimal Ubuntu images exclude /usr/share/doc by default. Keep this package's
 # documentation during unpacking so the licence checks test the actual package,
 # not the container image's deliberate documentation stripping.
-apt-get install -y \
+apt-get install -y --no-install-recommends \
   -o 'Dpkg::Options::=--path-include=/usr/share/doc/devknx/*' "$package"
 test "$(dpkg-query -W -f='${Version}' devknx)" = "${version}-1"
 devknx --version | grep -Fx "devknx $version"
@@ -23,3 +23,7 @@ for notice in LICENSE THIRD-PARTY-NOTICES.md licenses/Hack.txt \
   licenses/OFL-1.1.txt licenses/UFL-1.0.txt licenses/emoji-icon-font-MIT.txt; do
   test -s "/usr/share/doc/devknx/$notice"
 done
+# Install only the display-server harness here. Application libraries must
+# arrive through the package's declared dependencies, not test setup.
+apt-get install -y --no-install-recommends xvfb xauth
+bash "$(dirname "$0")/qualify-linux-gui.sh" "$(command -v devknx)"

@@ -79,6 +79,8 @@ class Devknx < Formula
   on_linux do
     depends_on "libx11"
     depends_on "libxcb"
+    depends_on "libxcursor"
+    depends_on "libxi"
     depends_on "libxkbcommon"
     depends_on "mesa"
     depends_on "wayland"
@@ -97,7 +99,7 @@ class Devknx < Formula
 
     if OS.linux?
       libexec.install root
-      gui_libraries = %w[libx11 libxcb libxkbcommon mesa wayland].map {{ |name| formula_opt_lib(name) }}
+      gui_libraries = %w[libx11 libxcb libxcursor libxi libxkbcommon mesa wayland].map {{ |name| formula_opt_lib(name) }}
       loader_path = "#{{gui_libraries.join(":")}}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
       bin.join("devknx").write_env_script libexec/"devknx", LD_LIBRARY_PATH: loader_path
     else
@@ -153,7 +155,7 @@ pkgdesc='{DESCRIPTION}'
 arch=('x86_64' 'aarch64')
 url='{HOMEPAGE}'
 license=('GPL-3.0-only')
-depends=('glibc' 'gcc-libs' 'libxkbcommon' 'libx11' 'wayland' 'libgl')
+depends=('glibc' 'gcc-libs' 'libxkbcommon' 'libxkbcommon-x11' 'libx11' 'libxcursor' 'libxi' 'wayland' 'libgl' 'mesa')
 provides=('devknx')
 conflicts=('devknx')
 options=('!strip' '!debug')
@@ -189,7 +191,7 @@ pkgdesc='{DESCRIPTION}'
 arch=('x86_64' 'aarch64')
 url='{HOMEPAGE}'
 license=('GPL-3.0-only')
-depends=('gcc-libs' 'glibc' 'libxkbcommon' 'libx11' 'wayland' 'libgl')
+depends=('gcc-libs' 'glibc' 'libxkbcommon' 'libxkbcommon-x11' 'libx11' 'libxcursor' 'libxi' 'wayland' 'libgl' 'mesa')
 makedepends=('cargo' 'git' 'libxcb')
 conflicts=('devknx-bin')
 options=('!lto' '!debug')

@@ -390,6 +390,9 @@ jobs:
       matrix:
         runner: [macos-15, ubuntu-24.04, ubuntu-24.04-arm]
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: final-candidate
@@ -430,6 +433,11 @@ jobs:
           brew test "$tap/devknx"
           command -v devknx
           devknx --version | grep -Fx "devknx $VERSION"
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends xvfb xauth
+            bash scripts/release/qualify-linux-gui.sh "$(command -v devknx)"
+          fi
           if [[ "$RUNNER_OS" == macOS ]]; then
             cask="$(brew --repository "$tap")/Casks/devknx-app.rb"
             mkdir -p "$(dirname "$cask")"
@@ -441,6 +449,7 @@ jobs:
             xcrun stapler validate "$app"
             spctl --assess --type execute -vv "$app"
             "$app/Contents/MacOS/devknx" --version | grep -Fx "devknx $VERSION"
+            "$app/Contents/MacOS/devknx" gui --smoke
             test "$(command -v devknx)" != "$app/Contents/MacOS/devknx"
           fi
 
@@ -461,6 +470,9 @@ jobs:
       run:
         shell: bash
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: final-candidate
@@ -471,8 +483,13 @@ jobs:
           VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           set -euo pipefail
-          pacman -Syu --noconfirm --needed --disable-sandbox \
-            libxkbcommon libx11 wayland libgl
+          dependency_list=$(bash -eu -c 'source "$1"; printf "%s\n" "${depends[@]}"' _ candidate/devknx-bin.PKGBUILD)
+          test -n "$dependency_list"
+          mapfile -t dependencies <<< "$dependency_list"
+          for dependency in "${dependencies[@]}"; do
+            [[ "$dependency" =~ ^[a-z0-9][a-z0-9+._-]*$ ]]
+          done
+          pacman -Syu --noconfirm --needed --disable-sandbox "${dependencies[@]}"
           archive="devknx-$TAG-${{ matrix.target }}.tar.gz"
           work=/home/builder/package
           useradd --create-home builder
@@ -493,6 +510,8 @@ jobs:
           tar -xzf "candidate/$archive" -C /tmp/archive
           cmp "/tmp/archive/devknx-$TAG-${{ matrix.target }}/devknx" /usr/bin/devknx
           test -s /usr/share/licenses/devknx-bin/OFL-1.1.txt
+          pacman -S --noconfirm --needed --disable-sandbox xorg-server-xvfb xorg-xauth
+          bash scripts/release/qualify-linux-gui.sh "$(command -v devknx)"
 
   qualify-aur-source:
     name: Build and install the AUR source package on ${{ matrix.arch }}
@@ -509,6 +528,9 @@ jobs:
       run:
         shell: bash
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: final-candidate
@@ -516,8 +538,14 @@ jobs:
       - name: Install declared toolchain and GUI dependencies
         run: |
           set -euo pipefail
+          dependency_list=$(bash -eu -c 'source "$1"; printf "%s\n" "${depends[@]}"' _ candidate/devknx.PKGBUILD)
+          test -n "$dependency_list"
+          mapfile -t dependencies <<< "$dependency_list"
+          for dependency in "${dependencies[@]}"; do
+            [[ "$dependency" =~ ^[a-z0-9][a-z0-9+._-]*$ ]]
+          done
           pacman -Syu --noconfirm --needed --disable-sandbox base-devel git rust namcap \
-            libxcb libxkbcommon libx11 wayland libgl
+            libxcb "${dependencies[@]}"
       - name: Build the tagged source and install
         env:
           VERSION: ${{ needs.metadata.outputs.version }}
@@ -542,6 +570,8 @@ jobs:
           pacman -U --noconfirm "${packages[0]}"
           devknx --version | grep -Fx "devknx $VERSION"
           test -s /usr/share/licenses/devknx/OFL-1.1.txt
+          pacman -S --noconfirm --needed --disable-sandbox xorg-server-xvfb xorg-xauth
+          bash scripts/release/qualify-linux-gui.sh "$(command -v devknx)"
 
   channel-qualification:
     name: Every package installation test passed

@@ -1,8 +1,10 @@
 """Offline positive and counter-probes for the signed update feed builder."""
 
 import importlib.util
+import io
 from pathlib import Path
 import unittest
+from unittest import mock
 import xml.etree.ElementTree as ET
 
 
@@ -13,6 +15,20 @@ SPEC.loader.exec_module(PUBLISH)
 
 
 class FeedTests(unittest.TestCase):
+    def test_public_digest_sends_a_named_user_agent(self):
+        payload = b"published archive"
+
+        def open_public(request, timeout):
+            self.assertEqual(timeout, 60)
+            self.assertEqual(request.get_header("User-agent"),
+                             "devknx-release-verifier/1.0")
+            return io.BytesIO(payload)
+
+        with mock.patch.object(PUBLISH.urllib.request, "urlopen",
+                               side_effect=open_public) as open_url:
+            PUBLISH.public_digest("https://example.com/archive.zip", payload)
+        open_url.assert_called_once()
+
     def test_new_feed_and_idempotent_republication(self):
         feed, repeated = PUBLISH.feed_with_item(
             None, "0.1.0", "app.zip", "signature", 123)

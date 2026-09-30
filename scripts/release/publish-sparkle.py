@@ -154,9 +154,12 @@ def feed_with_item(previous, version, archive_name, signature_text, length):
 
 def public_digest(url, expected):
     wanted = hashlib.sha256(expected).digest()
+    # Cloudflare rejects Python's default urllib user agent with HTTP 403.
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "devknx-release-verifier/1.0"})
     for attempt in range(12):
         try:
-            with urllib.request.urlopen(url, timeout=60) as response:
+            with urllib.request.urlopen(request, timeout=60) as response:
                 digest = hashlib.sha256()
                 while chunk := response.read(1024 * 1024):
                     digest.update(chunk)

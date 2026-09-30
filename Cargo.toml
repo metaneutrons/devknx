@@ -13,6 +13,10 @@ build = "build.rs"
 maintainer = "Fabian Schmieder <metaneutrons@users.noreply.github.com>"
 section = "utils"
 priority = "optional"
+extended-description = "Monitor and control KNXnet/IP installations through a terminal, desktop GUI, REST API, and MCP tools, with SQLite capture history and ETS group-address metadata."
+# These libraries are loaded dynamically, so ELF dependency discovery alone
+# cannot describe the full GUI runtime. Keep automatic linked dependencies too.
+depends = "$auto, libx11-6, libx11-xcb1, libxcursor1, libxi6, libxcb1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libegl1, libegl-mesa0, libgl1, libglx-mesa0, libgl1-mesa-dri"
 assets = [
     ["target/release/devknx", "usr/bin/", "755"],
     ["LICENSE", "usr/share/doc/devknx/LICENSE", "644"],

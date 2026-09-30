@@ -41,7 +41,7 @@ jobs:
         with:
           python-version: '3.13'
       - run: python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
-      - run: bash -n scripts/release/build-deb.sh scripts/release/fetch-sparkle.sh scripts/build-macos-app.sh
+      - run: bash -n scripts/release/build-deb.sh scripts/release/fetch-sparkle.sh scripts/release/qualify-deb.sh scripts/release/qualify-linux-gui.sh scripts/build-macos-app.sh
 
   package-source:
     name: Package tagged source

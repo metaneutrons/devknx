@@ -99,7 +99,9 @@ class Devknx < Formula
 
     if OS.linux?
       libexec.install root
-      gui_libraries = %w[libx11 libxcb libxcursor libxi libxkbcommon mesa wayland].map {{ |name| formula_opt_lib(name) }}
+      gui_libraries = %w[
+        libx11 libxcb libxcursor libxi libxkbcommon mesa wayland
+      ].map {{ |name| formula_opt_lib(name) }}
       loader_path = "#{{gui_libraries.join(":")}}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
       bin.join("devknx").write_env_script libexec/"devknx", LD_LIBRARY_PATH: loader_path
     else

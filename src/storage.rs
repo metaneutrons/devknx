@@ -244,7 +244,7 @@ impl CaptureStore {
     ///
     /// Returns an error for I/O failure, an unsupported schema, or migration failure.
     pub fn open(path: &Path, max_events: NonZeroU32) -> Result<Self, StorageError> {
-        Self::open_writable(path, Some(max_events))
+        Self::open_writable(path, Some(max_events), true)
     }
 
     /// Open a writable capture only for the selected canonical endpoint.
@@ -259,7 +259,7 @@ impl CaptureStore {
         max_events: NonZeroU32,
         endpoint: &str,
     ) -> Result<Self, StorageError> {
-        let mut store = Self::open_writable(path, None)?;
+        let mut store = Self::open_writable(path, None, true)?;
         store.bind_endpoint(endpoint)?;
         let transaction = store
             .connection
@@ -341,13 +341,27 @@ impl CaptureStore {
     ///
     /// Returns an error for I/O, unsupported schema, or an active writer.
     pub fn open_for_ets_import(path: &Path) -> Result<Self, StorageError> {
-        Self::open_writable(path, None)
+        Self::open_writable(path, None, true)
     }
 
-    fn open_writable(path: &Path, max_events: Option<NonZeroU32>) -> Result<Self, StorageError> {
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
+    /// Import into an existing capture without recreating a missing database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a missing file, unsupported schema or active writer.
+    pub fn open_existing_for_ets_import(path: &Path) -> Result<Self, StorageError> {
+        Self::open_writable(path, None, false)
+    }
+
+    fn open_writable(
+        path: &Path,
+        max_events: Option<NonZeroU32>,
+        create: bool,
+    ) -> Result<Self, StorageError> {
+        if create
+            && let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
         {
             #[cfg(unix)]
             {
@@ -362,13 +376,14 @@ impl CaptureStore {
         let database_path = normalized_sqlite_path(path)?;
         let writer_lease = acquire_writer_lease(&database_path)?;
         #[cfg(unix)]
-        prepare_private_file(&database_path)?;
-        let mut connection = Connection::open_with_flags(
-            &database_path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )?;
+        if create {
+            prepare_private_file(&database_path)?;
+        }
+        let mut flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        if create {
+            flags |= OpenFlags::SQLITE_OPEN_CREATE;
+        }
+        let mut connection = Connection::open_with_flags(&database_path, flags)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         migrate(&mut connection)?;
         connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
@@ -1252,6 +1267,14 @@ mod tests {
                 lost_messages: count,
             },
         )
+    }
+
+    #[test]
+    fn existing_only_import_writer_never_creates_a_missing_capture() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing.sqlite");
+        assert!(CaptureStore::open_existing_for_ets_import(&path).is_err());
+        assert!(!path.exists());
     }
 
     #[test]

@@ -3,6 +3,32 @@
 `devknx` imports two group-address export formats. It does not import full
 `.knxproj` projects or infer datapoint types from captured bytes.
 
+## GUI and TUI
+
+Select the connection's capture first: save its connection settings or open a
+saved capture. In the GUI, choose **Import ETS…** in the toolbar or **File →
+Import ETS Group Addresses…** on macOS (`Cmd-I`). Choose the export in the
+native file picker, select CSV or XML and, for CSV, UTF-8 or legacy Latin-1.
+**Preview import** validates the entire file and shows the destination capture,
+address/DPT counts and sample entries. **Replace ETS catalogue** is a separate
+confirmation; canceling or closing the preview changes nothing.
+
+In the TUI, press `i`, enter the export path and choose its format and encoding.
+The confirmation shows the same bounded summary and samples. Press `y` to
+import or `Esc` to cancel; `c` disconnects the selected session when needed.
+
+Disconnect the session using this capture before confirming. The import never
+disconnects automatically or stops the daemon or REST listener. An exclusive
+writer lease also rejects a racing or external connection. A preview is bound
+to the selected database and contains the exact validated metadata snapshot:
+changing the source file afterwards cannot alter the confirmed import.
+Loaded history, its filter and raw bytes remain in place; names, DPTs and
+decodable values refresh immediately after import. Selecting another capture
+discards an unconfirmed preview; wait for an ongoing commit to finish before
+switching connections.
+
+## CLI and export formats
+
 ```sh
 devknx ets-import group-addresses.csv --database captures.sqlite --format csv
 devknx ets-import group-addresses.xml --database captures.sqlite --format xml

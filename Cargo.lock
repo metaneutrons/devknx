@@ -860,6 +860,7 @@ dependencies = [
  "rfd",
  "rmcp",
  "rusqlite",
+ "same-file",
  "schemars",
  "serde",
  "serde_json",

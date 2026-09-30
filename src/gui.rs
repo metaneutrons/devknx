@@ -8,12 +8,14 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use devknx::control::RestStatus;
+use devknx::ets::{CsvEncoding, EtsFormat};
 use devknx::ipc::WireState;
 use devknx::paths;
 use eframe::egui;
 use knx_rs_ip::discovery::GatewayInfo;
 
 use crate::color::{self, Tone};
+use crate::ets_import::{self, EtsImportOutcome, EtsImportPreview};
 use crate::interface::{
     self, ConnectionMode, ConnectionSettings, DisplayCapture, Follower, MonitorModel,
 };
@@ -193,12 +195,101 @@ enum RestRequestKind {
     Change,
 }
 
+struct EtsImportDialog {
+    open: bool,
+    file: String,
+    format: EtsFormat,
+    encoding: CsvEncoding,
+    preview: Option<EtsImportPreview>,
+    prepare_receiver: Option<Receiver<Result<EtsImportPreview, String>>>,
+    commit_receiver: Option<Receiver<Result<EtsImportOutcome, String>>>,
+    error: Option<String>,
+}
+
+impl Default for EtsImportDialog {
+    fn default() -> Self {
+        Self {
+            open: false,
+            file: String::new(),
+            format: EtsFormat::Csv31,
+            encoding: CsvEncoding::Utf8,
+            preview: None,
+            prepare_receiver: None,
+            commit_receiver: None,
+            error: None,
+        }
+    }
+}
+
+fn poll_import<T>(receiver: &mut Option<Receiver<Result<T, String>>>) -> Option<Result<T, String>> {
+    let result = match receiver.as_ref()?.try_recv() {
+        Ok(result) => result,
+        Err(mpsc::TryRecvError::Empty) => return None,
+        Err(mpsc::TryRecvError::Disconnected) => {
+            Err("ETS import worker stopped unexpectedly".into())
+        }
+    };
+    *receiver = None;
+    Some(result)
+}
+
+fn render_ets_options(ui: &mut egui::Ui, dialog: &mut EtsImportDialog, preparing: bool) {
+    ui.add_enabled_ui(!preparing, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("ETS export");
+            if ui
+                .add(egui::TextEdit::singleline(&mut dialog.file).desired_width(320.0))
+                .changed()
+            {
+                dialog.error = None;
+            }
+            if ui.button("Choose…").clicked()
+                && let Some(file) = rfd::FileDialog::new()
+                    .set_title("Choose ETS Group Address Export")
+                    .add_filter("ETS exports", &["csv", "xml"])
+                    .pick_file()
+            {
+                if file
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("xml"))
+                {
+                    dialog.format = EtsFormat::GaXml01;
+                } else {
+                    dialog.format = EtsFormat::Csv31;
+                }
+                dialog.file = file.display().to_string();
+                dialog.error = None;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Format");
+            ui.selectable_value(&mut dialog.format, EtsFormat::Csv31, "ETS CSV (3/1)");
+            ui.selectable_value(&mut dialog.format, EtsFormat::GaXml01, "GA Export 01 XML");
+        });
+        if dialog.format == EtsFormat::Csv31 {
+            ui.horizontal(|ui| {
+                ui.label("Encoding");
+                ui.selectable_value(&mut dialog.encoding, CsvEncoding::Utf8, "UTF-8");
+                ui.selectable_value(
+                    &mut dialog.encoding,
+                    CsvEncoding::Latin1,
+                    "Latin-1 (legacy)",
+                );
+            });
+        } else {
+            dialog.encoding = CsvEncoding::Utf8;
+            ui.small("XML must use UTF-8.");
+        }
+    });
+}
+
 #[derive(Default)]
 #[expect(
     clippy::struct_excessive_bools,
     reason = "independent visible GUI dialogs"
 )]
 struct MonitorApp {
+    ets_import: EtsImportDialog,
     primary_database: Option<PathBuf>,
     database_override: Option<PathBuf>,
     offline_capture: bool,
@@ -302,6 +393,10 @@ impl MonitorApp {
     }
 
     fn attach(&mut self, database: &Path, offline: bool) {
+        if self.ets_import.commit_receiver.is_some() {
+            self.error = Some("Wait for the ETS import to finish before changing captures".into());
+            return;
+        }
         let same_primary = self.primary_database.as_ref().is_some_and(|primary| {
             primary == database
                 || matches!(
@@ -312,6 +407,7 @@ impl MonitorApp {
         let offline = offline && !same_primary;
         match MonitorModel::open(database.to_path_buf()) {
             Ok(model) => {
+                self.ets_import = EtsImportDialog::default();
                 self.follower = (!offline).then(|| Follower::start(database.to_path_buf()));
                 self.model = Some(model);
                 self.offline_capture = offline;
@@ -335,6 +431,9 @@ impl MonitorApp {
     }
 
     fn open_capture_dialog(&mut self) {
+        if self.ets_import.commit_receiver.is_some() {
+            return;
+        }
         let mut dialog = rfd::FileDialog::new()
             .set_title("Open KNX Capture")
             .add_filter("SQLite capture", &["sqlite", "sqlite3", "db"]);
@@ -365,7 +464,7 @@ impl MonitorApp {
             self.error = Some("Return to Live Capture before connecting to a gateway".into());
             return;
         }
-        if self.connection_receiver.is_some() {
+        if self.connection_receiver.is_some() || self.ets_import.commit_receiver.is_some() {
             return;
         }
         let endpoint = match self.settings.endpoint() {
@@ -398,6 +497,11 @@ impl MonitorApp {
     ) -> Result<PathBuf, String> {
         if self.offline_capture {
             return Err("Return to Live Capture before changing connection settings".into());
+        }
+        if self.ets_import.commit_receiver.is_some() {
+            return Err(
+                "Wait for the ETS import to finish before changing connection settings".into(),
+            );
         }
         let database = match &self.database_override {
             Some(path) => path.clone(),
@@ -432,6 +536,7 @@ impl MonitorApp {
             interface::save_recent_settings(settings)?;
         }
         if let Some(model) = replacement {
+            self.ets_import = EtsImportDialog::default();
             self.follower = Some(Follower::start(database.clone()));
             self.model = Some(model);
             self.primary_database = Some(database.clone());
@@ -572,6 +677,7 @@ impl MonitorApp {
 
     fn process_background(&mut self) {
         self.process_rest_background();
+        self.process_ets_import();
         if self.model.is_none()
             && !self.offline_capture
             && let Ok(endpoint) = self.settings.endpoint()
@@ -667,12 +773,164 @@ impl MonitorApp {
         }
     }
 
+    fn prepare_ets_import(&mut self) {
+        let Some(model) = &self.model else { return };
+        let database = model.database.clone();
+        let file = PathBuf::from(&self.ets_import.file);
+        let format = self.ets_import.format;
+        let encoding = self.ets_import.encoding;
+        let (sender, receiver) = mpsc::channel();
+        self.ets_import.prepare_receiver = Some(receiver);
+        self.ets_import.preview = None;
+        self.ets_import.error = None;
+        std::thread::spawn(move || {
+            let _ = sender.send(ets_import::prepare(database, file, format, encoding));
+        });
+    }
+
+    fn confirm_ets_import(&mut self) {
+        if self.connection_receiver.is_some() || self.action_receiver.is_some() {
+            self.ets_import.error = Some("Wait for the current operation to finish".into());
+            return;
+        }
+        let Some(preview) = self.ets_import.preview.as_ref() else {
+            return;
+        };
+        if !self
+            .model
+            .as_ref()
+            .is_some_and(|model| model.database == preview.database && !model.owner_available)
+        {
+            self.ets_import.error =
+                Some("Disconnect the session using this capture before importing".into());
+            return;
+        }
+        let preview = self.ets_import.preview.take().expect("checked preview");
+        let (sender, receiver) = mpsc::channel();
+        self.ets_import.commit_receiver = Some(receiver);
+        self.ets_import.error = None;
+        std::thread::spawn(move || {
+            let _ = sender.send(ets_import::commit(preview));
+        });
+    }
+
+    fn process_ets_import(&mut self) {
+        if let Some(result) = poll_import(&mut self.ets_import.prepare_receiver) {
+            match result {
+                Ok(preview)
+                    if self.ets_import.open
+                        && self
+                            .model
+                            .as_ref()
+                            .is_some_and(|model| model.database == preview.database) =>
+                {
+                    self.ets_import.preview = Some(preview);
+                }
+                Ok(_) => {
+                    self.ets_import.error =
+                        Some("Capture changed; create a new import preview".into());
+                }
+                Err(error) => self.ets_import.error = Some(error),
+            }
+        }
+        if let Some(result) = poll_import(&mut self.ets_import.commit_receiver) {
+            match result {
+                Ok(outcome) => {
+                    if let Some(model) = &mut self.model
+                        && model.database == outcome.database
+                    {
+                        model.notice(outcome.notice());
+                        if let Err(error) = model.refresh_ets() {
+                            self.error =
+                                Some(format!("Import saved, but display refresh failed: {error}"));
+                        }
+                        if let Some(selected) = &self.selected {
+                            self.selected =
+                                model.rows.iter().find(|row| row.id == selected.id).cloned();
+                        }
+                    }
+                    self.ets_import.open = false;
+                }
+                Err(error) => self.ets_import.error = Some(error),
+            }
+        }
+    }
+
+    fn render_ets_import(&mut self, ctx: &egui::Context) {
+        if !self.ets_import.open {
+            return;
+        }
+        let busy = self.ets_import.commit_receiver.is_some();
+        let preparing = self.ets_import.prepare_receiver.is_some();
+        let mut open = true;
+        let mut prepare = false;
+        let mut confirm = false;
+        let mut disconnect = false;
+        let mut cancel = false;
+        egui::Window::new("Import ETS Group Addresses")
+            .open(&mut open)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .default_width(550.0)
+            .default_height(260.0)
+            .max_height((ctx.content_rect().height() - 24.0).max(240.0))
+            .vscroll(true)
+            .show(ctx, |ui| {
+                let Some(model) = &self.model else {
+                    ui.label("Save connection settings or open a capture first to select the import destination.");
+                    return;
+                };
+                ui.label("Destination capture");
+                ui.monospace(model.database.display().to_string());
+                ui.small("Replaces the active ETS catalogue only. Raw captures and previous revisions are preserved.");
+                ui.separator();
+                if busy {
+                    ui.spinner();
+                    ui.label("Importing ETS group addresses…");
+                } else if let Some(preview) = &self.ets_import.preview {
+                    ui.label(format!("Source: {}", preview.file.display()));
+                    ui.strong(preview.summary());
+                    for line in preview.sample_lines() { ui.monospace(line); }
+                    ui.small("Only declared, unambiguous DPTs decode values. Standard four-column CSV supplies names but no DPTs.");
+                    if model.owner_available {
+                        ui.label("Disconnect this capture session before importing. The daemon and REST stay running.");
+                        disconnect = ui.add_enabled(self.connection_receiver.is_none(), egui::Button::new("Disconnect session")).clicked();
+                    }
+                    ui.horizontal(|ui| {
+                        confirm = ui.add_enabled(!model.owner_available && self.connection_receiver.is_none() && self.action_receiver.is_none(), egui::Button::new("Replace ETS catalogue")).clicked();
+                        if ui.button("Back").clicked() { self.ets_import.preview = None; }
+                        cancel = ui.button("Cancel").clicked();
+                    });
+                } else {
+                    render_ets_options(ui, &mut self.ets_import, preparing);
+                    ui.horizontal(|ui| {
+                        prepare = ui.add_enabled(!preparing && !self.ets_import.file.trim().is_empty(), egui::Button::new("Preview import")).clicked();
+                        cancel = ui.button("Cancel").clicked();
+                        if preparing { ui.spinner(); ui.label("Validating export…"); }
+                    });
+                }
+                if let Some(error) = &self.ets_import.error { ui.colored_label(loss_color(ui.visuals().dark_mode), error); }
+            });
+        if (!open || cancel) && !busy {
+            self.ets_import = EtsImportDialog::default();
+        } else if prepare {
+            self.prepare_ets_import();
+        } else if confirm {
+            self.confirm_ets_import();
+        } else if disconnect {
+            self.disconnect();
+        }
+    }
+
     fn process_menu(&mut self) -> bool {
         if platform::take(MenuAction::OpenDatabase) {
             self.open_capture_dialog();
         }
         if platform::take(MenuAction::ExportCsv) {
             self.show_export = true;
+        }
+        if platform::take(MenuAction::ImportEts) {
+            self.ets_import.open = true;
         }
         if platform::take(MenuAction::Discover) {
             self.discover();
@@ -1208,7 +1466,13 @@ impl MonitorApp {
                 .as_ref()
                 .is_some_and(|model| model.owner_available);
             if self.offline_capture {
-                if ui.button("Live capture").clicked() {
+                if ui
+                    .add_enabled(
+                        self.ets_import.commit_receiver.is_none(),
+                        egui::Button::new("Live capture"),
+                    )
+                    .clicked()
+                {
                     if let Some(database) = self.primary_database.clone() {
                         self.attach(&database, false);
                     } else {
@@ -1219,7 +1483,7 @@ impl MonitorApp {
                 }
             } else if ui
                 .add_enabled(
-                    self.connection_receiver.is_none(),
+                    self.connection_receiver.is_none() && self.ets_import.commit_receiver.is_none(),
                     egui::Button::new(if owner_available {
                         "Disconnect"
                     } else {
@@ -1260,19 +1524,7 @@ impl MonitorApp {
             {
                 self.show_write = true;
             }
-            if ui
-                .button("Open…")
-                .on_hover_text("Open a saved capture file")
-                .clicked()
-            {
-                self.open_capture_dialog();
-            }
-            if ui
-                .add_enabled(self.model.is_some(), egui::Button::new("Export…"))
-                .clicked()
-            {
-                self.show_export = true;
-            }
+            self.render_capture_actions(ui);
             ui.separator();
             self.render_color_toggle(ui);
             ui.separator();
@@ -1304,6 +1556,33 @@ impl MonitorApp {
             self.save_color_preference();
         }
         toggle.on_hover_text("Color changes display only, not captures or exports");
+    }
+
+    fn render_capture_actions(&mut self, ui: &mut egui::Ui) {
+        let busy = self.ets_import.commit_receiver.is_some();
+        if ui
+            .add_enabled(!busy, egui::Button::new("Open…"))
+            .on_hover_text("Open a saved capture file")
+            .clicked()
+        {
+            self.open_capture_dialog();
+        }
+        if ui
+            .add_enabled(
+                self.model.is_some() && !busy,
+                egui::Button::new("Import ETS…"),
+            )
+            .on_hover_text("Preview and import ETS group-address CSV or XML")
+            .clicked()
+        {
+            self.ets_import.open = true;
+        }
+        if ui
+            .add_enabled(self.model.is_some(), egui::Button::new("Export…"))
+            .clicked()
+        {
+            self.show_export = true;
+        }
     }
 
     fn save_color_preference(&mut self) {
@@ -1646,6 +1925,7 @@ impl eframe::App for MonitorApp {
         });
         self.live_smoke_step(&ctx, scroll_offset);
         self.dialogs(&ctx);
+        self.render_ets_import(&ctx);
         platform::update_color_menu_state(self.color_enabled, color::ui_is_locked());
     }
 }
@@ -1655,6 +1935,160 @@ mod tests {
     use super::*;
     use devknx::storage::CaptureStore;
     use std::num::NonZeroU32;
+
+    fn import_app() -> (tempfile::TempDir, MonitorApp, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("capture.sqlite");
+        drop(CaptureStore::open_for_ets_import(&database).unwrap());
+        let file = directory.path().join("groups.csv");
+        std::fs::write(&file, "Main;Middle;Sub;Address\nHome;Lights;Desk;1/2/4\n").unwrap();
+        let app = MonitorApp {
+            model: Some(MonitorModel::open(database).unwrap()),
+            ..Default::default()
+        };
+        (directory, app, file)
+    }
+
+    #[test]
+    fn canceled_or_wrong_target_preview_cannot_be_activated() {
+        let (_directory, mut app, file) = import_app();
+        let database = app.model.as_ref().unwrap().database.clone();
+        let (sender, receiver) = mpsc::channel();
+        app.ets_import.prepare_receiver = Some(receiver);
+        sender
+            .send(ets_import::prepare(
+                database.clone(),
+                file.clone(),
+                EtsFormat::Csv31,
+                CsvEncoding::Utf8,
+            ))
+            .unwrap();
+        // Closing the dialog while its parser runs must not resurrect a preview.
+        app.process_ets_import();
+        assert!(app.ets_import.preview.is_none());
+        assert_eq!(
+            CaptureStore::open_existing(&database)
+                .unwrap()
+                .ets_revision()
+                .unwrap(),
+            None
+        );
+        app.ets_import.open = true;
+        let other = database.with_file_name("other.sqlite");
+        drop(CaptureStore::open_for_ets_import(&other).unwrap());
+        let (sender, receiver) = mpsc::channel();
+        app.ets_import.prepare_receiver = Some(receiver);
+        sender
+            .send(ets_import::prepare(
+                other,
+                file,
+                EtsFormat::Csv31,
+                CsvEncoding::Utf8,
+            ))
+            .unwrap();
+        app.process_ets_import();
+        assert!(app.ets_import.preview.is_none());
+        assert!(
+            app.ets_import
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Capture changed")
+        );
+    }
+
+    #[test]
+    fn active_connection_and_pending_operations_block_import_confirmation() {
+        let (_directory, mut app, file) = import_app();
+        let database = app.model.as_ref().unwrap().database.clone();
+        app.ets_import.preview = Some(
+            ets_import::prepare(database.clone(), file, EtsFormat::Csv31, CsvEncoding::Utf8)
+                .unwrap(),
+        );
+        app.model.as_mut().unwrap().owner_available = true;
+        app.confirm_ets_import();
+        assert!(app.ets_import.preview.is_some());
+        assert!(app.ets_import.commit_receiver.is_none());
+        app.model.as_mut().unwrap().owner_available = false;
+        let (_sender, receiver) = mpsc::channel();
+        app.connection_receiver = Some(receiver);
+        app.confirm_ets_import();
+        assert!(app.ets_import.preview.is_some());
+        assert!(app.ets_import.commit_receiver.is_none());
+        assert_eq!(
+            CaptureStore::open_existing(&database)
+                .unwrap()
+                .ets_revision()
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn import_commit_blocks_capture_switch_and_connect() {
+        let (_directory, mut app, _file) = import_app();
+        let original = app.model.as_ref().unwrap().database.clone();
+        let other = original.with_file_name("other.sqlite");
+        drop(CaptureStore::open_for_ets_import(&other).unwrap());
+        let (_sender, receiver) = mpsc::channel();
+        app.ets_import.commit_receiver = Some(receiver);
+        app.attach(&other, true);
+        assert_eq!(app.model.as_ref().unwrap().database, original);
+        assert!(
+            app.error
+                .as_deref()
+                .unwrap()
+                .contains("ETS import to finish")
+        );
+        app.connect();
+        assert!(app.connection_receiver.is_none());
+        let settings = ConnectionSettings::from_endpoint("tunnel://192.0.2.8:3671").unwrap();
+        assert!(
+            app.select_connection(&settings, "tunnel://192.0.2.8:3671")
+                .unwrap_err()
+                .contains("ETS import to finish")
+        );
+    }
+
+    #[test]
+    fn completed_import_refreshes_selected_details_without_changing_filter() {
+        let (_directory, mut app, file) = import_app();
+        let model = app.model.as_mut().unwrap();
+        append_rows(model, 1, 1);
+        model.rows[0].destination = "1/2/4".into();
+        model.filter = "Desk".into();
+        app.selected = Some(model.rows[0].clone());
+        let outcome = ets_import::commit(
+            ets_import::prepare(
+                model.database.clone(),
+                file,
+                EtsFormat::Csv31,
+                CsvEncoding::Utf8,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        app.ets_import.commit_receiver = Some(receiver);
+        app.ets_import.open = true;
+        sender.send(Ok(outcome)).unwrap();
+        app.process_ets_import();
+        assert_eq!(app.model.as_ref().unwrap().filter, "Desk");
+        assert_eq!(
+            app.selected.as_ref().unwrap().label.as_deref(),
+            Some("Desk")
+        );
+        assert!(!app.ets_import.open);
+        assert!(
+            app.model
+                .as_ref()
+                .unwrap()
+                .notices
+                .last()
+                .unwrap()
+                .contains("revision 1")
+        );
+    }
 
     #[test]
     fn rest_indicator_distinguishes_live_off_and_unavailable() {

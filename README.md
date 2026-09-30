@@ -33,7 +33,7 @@ desktop button and an API call.
 | KNXnet/IP tunneling and routing capture | Experimental CLI stream with bounded reconnect and endpoint-specific SQLite persistence |
 | Independent capture process | One per-user daemon with explicit endpoint sessions, current-user control IPC, and endpoint-scoped capture streams |
 | Durable telegram history | Experimental SQLite history with ID cursor and retention cap; interactive views filter the loaded window and export the full retained history |
-| ETS group-address CSV and XML import | Experimental CLI import; TUI and GUI display active ETS labels and DPT declarations |
+| ETS group-address CSV and XML import | CLI import and preview-confirmed TUI/GUI import; all surfaces use active ETS labels and DPT declarations |
 | DPT-validated read, write preview, and write | Experimental CLI/TUI/GUI operations through the single capture owner; loopback-qualified, not yet hardware-qualified |
 | Terminal UI and native desktop UI | Experimental; the connection workflow and toolbar have been revised after visual feedback and require renewed visual qualification |
 | Local REST and MCP interfaces | Experimental daemon-controlled REST listener and structured MCP stdio tools; both use the same DPT-validated operation path |
@@ -132,7 +132,8 @@ bounded search and exact-address write opt-in.
 
 The GUI shows a bounded live/history view with readable local timestamps,
 ETS names and unambiguous DPT-decoded values, a text filter, raw cEMI details,
-read and prepared typed-write dialogs, and non-overwriting CSV export.
+read and prepared typed-write dialogs, preview-confirmed ETS CSV/XML import,
+and non-overwriting CSV export.
 GUI and TUI include a DPT column and show group-value payloads as `0x…` when no
 unambiguous decoded value is available; they never guess a DPT from the payload
 length. Multiple ETS DPT declarations are marked as ambiguous, with the complete
@@ -141,7 +142,7 @@ The GUI's separate toolbar exposes connection and capture actions; capture stora
 explained under Settings rather than presented as the KNX connection. Its macOS
 app has native application, File, Edit, View, Operation, Window and Help menus.
 The TUI offers `c` connect/disconnect, `s` endpoint settings, `a` REST loopback control, `/` filter,
-`r` read, `w` prepared typed write, `e` export, `h` reload, `PgUp` older history, `d` discovery,
+`r` read, `w` prepared typed write, `i` ETS import, `e` export, `h` reload, `PgUp` older history, `d` discovery,
 `j`/`k` scroll, `F8` toggle capture colors and `q` quit.
 The GUI has a Color checkbox in its toolbar. Both interactive views remember
 that display preference independently of the selected capture database.
@@ -153,7 +154,13 @@ accent, router losses are red and local subscriber lag is amber. The textual
 labels remain present without color. JSON lines, CSV, SQLite, REST and MCP
 payloads are never colorized.
 In both interfaces, a typed write is previewed before a separate send action.
-Expert raw sending, ETS import, backup and durable audit inspection remain CLI
+Use **Import ETS…** in the GUI toolbar (or File menu on macOS) and `i` in the
+TUI to load group-address CSV or XML. Both show the selected capture, metadata
+summary and sample addresses before replacement. Disconnect that capture session
+to confirm the import; the daemon and REST listener can remain running.
+Loaded telegrams immediately gain the new names and declared DPTs. Standard ETS
+four-column CSV contains no DPTs; see the [ETS import guide](docs/ets-import.md).
+Expert raw sending, backup and durable audit inspection remain CLI
 commands. The [capability registry](src/capabilities.rs) records these explicit
 differences. On attach the interactive views load the latest 1,000 rows and
 can page backward into older retained history. They keep up to 5,000 rows in

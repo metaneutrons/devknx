@@ -29,6 +29,7 @@ enum {
     ACTION_TOGGLE_CONNECTION = 1 << 6,
     ACTION_CONNECTION_SETTINGS = 1 << 7,
     ACTION_TOGGLE_COLOR = 1 << 8,
+    ACTION_IMPORT_ETS = 1 << 9,
 };
 
 static void initialize_sparkle_updater_on_main_thread(void *context) {
@@ -120,6 +121,7 @@ static void forward_edit_action(id target, unsigned short key_code,
 - (void)openHelp:(id)sender;
 - (void)openDatabase:(id)sender;
 - (void)exportCsv:(id)sender;
+- (void)importEts:(id)sender;
 - (void)discover:(id)sender;
 - (void)focusFilter:(id)sender;
 - (void)readGroup:(id)sender;
@@ -153,6 +155,7 @@ static void forward_edit_action(id target, unsigned short key_code,
 }
 - (void)openDatabase:(id)sender { (void)sender; pending_actions |= ACTION_OPEN_DATABASE; }
 - (void)exportCsv:(id)sender { (void)sender; pending_actions |= ACTION_EXPORT_CSV; }
+- (void)importEts:(id)sender { (void)sender; pending_actions |= ACTION_IMPORT_ETS; }
 - (void)discover:(id)sender { (void)sender; pending_actions |= ACTION_DISCOVER; }
 - (void)focusFilter:(id)sender { (void)sender; pending_actions |= ACTION_FILTER; }
 - (void)readGroup:(id)sender { (void)sender; pending_actions |= ACTION_READ; }
@@ -259,6 +262,7 @@ void devknx_init_macos_app(const char *version, const uint8_t *icon, size_t icon
 
         NSMenu *file = add_menu(main, @"File");
         add_item(file, @"Open Capture…", @selector(openDatabase:), @"o", menu_handler, NSEventModifierFlagCommand);
+        add_item(file, @"Import ETS Group Addresses…", @selector(importEts:), @"i", menu_handler, NSEventModifierFlagCommand);
         add_item(file, @"Export CSV…", @selector(exportCsv:), @"e", menu_handler, NSEventModifierFlagCommand);
         [file addItem:[NSMenuItem separatorItem]];
         add_item(file, @"Close Window", @selector(performClose:), @"w", nil, NSEventModifierFlagCommand);

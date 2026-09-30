@@ -24,6 +24,8 @@ use std::time::UNIX_EPOCH;
 use tokio::sync::{broadcast, oneshot};
 
 mod color;
+#[cfg(any(feature = "gui", feature = "tui"))]
+mod ets_import;
 #[cfg(feature = "gui")]
 mod gui;
 #[cfg(any(feature = "gui", feature = "tui"))]

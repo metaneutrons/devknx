@@ -1,6 +1,6 @@
 [package]
 name = "devknx"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["Fabian Schmieder"]
 description = "KNX monitor with CLI, TUI, GUI, REST, and MCP interfaces"

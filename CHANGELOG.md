@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/metaneutrons/devknx/compare/v0.1.0...v0.1.1) (2026-09-30)
+
+
+### Bug Fixes
+
+* preserve package licences in Debian qualification containers ([#54](https://github.com/metaneutrons/devknx/issues/54)) ([d0a0c13](https://github.com/metaneutrons/devknx/commit/d0a0c1308d6258a1e7cbfe7b799aa72458996a7a))
+
 ## 0.1.0 (2026-09-30)
 
 

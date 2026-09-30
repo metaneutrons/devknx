@@ -67,9 +67,10 @@ pub async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                     break Some(Box::new(io::Error::other("control channel closed")) as Box<dyn Error + Send + Sync>);
                 };
                 sessions.reap_finished().await;
-                let response = sessions.handle(call.request).await;
+                let (request, reply) = call.into_request_and_reply();
+                let response = sessions.handle(request).await;
                 let stop = matches!(response, ControlResponse::Stopped);
-                let _ = call.response.send(response);
+                reply.respond(response).await;
                 if stop {
                     break None;
                 }

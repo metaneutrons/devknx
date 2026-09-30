@@ -99,6 +99,38 @@ pub struct RestStatus {
 pub struct ControlCall {
     pub request: ControlRequest,
     pub response: oneshot::Sender<ControlResponse>,
+    written: oneshot::Receiver<()>,
+}
+
+impl ControlCall {
+    pub(crate) fn into_request_and_reply(self) -> (ControlRequest, ControlReply) {
+        (
+            self.request,
+            ControlReply {
+                response: self.response,
+                written: self.written,
+            },
+        )
+    }
+}
+
+pub(crate) struct ControlReply {
+    response: oneshot::Sender<ControlResponse>,
+    written: oneshot::Receiver<()>,
+}
+
+impl ControlReply {
+    /// A stop response must reach the transport before the daemon's runtime
+    /// exits. Other responses must not block the control loop on slow clients.
+    pub(crate) async fn respond(self, response: ControlResponse) {
+        let stopping = matches!(response, ControlResponse::Stopped);
+        let _ = self.response.send(response);
+        if stopping {
+            // The transport has bounded I/O and drops the sender on failure,
+            // so a disconnected client cannot prevent daemon shutdown.
+            let _ = self.written.await;
+        }
+    }
 }
 
 /// One authenticated current-user listener for daemon control requests.
@@ -221,7 +253,10 @@ impl ControlClient {
     }
 }
 
-async fn handle_client(mut stream: Stream, calls: mpsc::Sender<ControlCall>) -> io::Result<()> {
+async fn handle_client<S>(mut stream: S, calls: mpsc::Sender<ControlCall>) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let request_bytes = match read_frame(&mut stream).await {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -250,11 +285,13 @@ async fn handle_client(mut stream: Stream, calls: mpsc::Sender<ControlCall>) -> 
         return Ok(());
     };
     let (response_tx, response_rx) = oneshot::channel();
+    let (written_tx, written_rx) = oneshot::channel();
     match tokio::time::timeout(
         IO_TIMEOUT,
         calls.send(ControlCall {
             request,
             response: response_tx,
+            written: written_rx,
         }),
     )
     .await
@@ -288,7 +325,9 @@ async fn handle_client(mut stream: Stream, calls: mpsc::Sender<ControlCall>) -> 
             reason: "daemon control response timed out".to_owned(),
         },
     };
-    write_frame(&mut stream, &response).await
+    let result = write_frame(&mut stream, &response).await;
+    let _ = written_tx.send(());
+    result
 }
 
 async fn request_at_default_path(request: ControlRequest) -> io::Result<ControlResponse> {
@@ -336,11 +375,12 @@ async fn write_frame<S: AsyncWrite + Unpin>(
     response: &ControlResponse,
 ) -> io::Result<()> {
     let encoded = encode_frame(response)?;
-    tokio::time::timeout(IO_TIMEOUT, stream.write_all(&encoded))
-        .await
-        .map_err(|_| {
-            io::Error::new(io::ErrorKind::TimedOut, "control response write timed out")
-        })??;
+    tokio::time::timeout(IO_TIMEOUT, async {
+        stream.write_all(&encoded).await?;
+        stream.flush().await
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control response write timed out"))??;
     Ok(())
 }
 
@@ -553,6 +593,83 @@ fn bind_windows(name: &str) -> io::Result<Listener> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stop_reply_waits_for_the_complete_transport_frame() {
+        let (mut client, stream) = tokio::io::duplex(1);
+        let (calls_tx, mut calls_rx) = mpsc::channel(1);
+        let transport = tokio::spawn(handle_client(stream, calls_tx));
+        client
+            .write_all(&encode_frame(&ControlRequest::Stop).unwrap())
+            .await
+            .unwrap();
+        let call = calls_rx.recv().await.unwrap();
+        let reply = tokio::spawn(
+            call.into_request_and_reply()
+                .1
+                .respond(ControlResponse::Stopped),
+        );
+
+        // One byte fits in the pipe. The rest cannot be written until this
+        // test reads it, so the shutdown barrier is exercised deterministically.
+        let first = client.read_u8().await.unwrap();
+        assert!(
+            !reply.is_finished(),
+            "daemon exited before writing its reply"
+        );
+        let mut frame = vec![first];
+        frame.extend(read_frame(&mut client).await.unwrap());
+        assert_eq!(
+            serde_json::from_slice::<ControlResponse>(&frame).unwrap(),
+            ControlResponse::Stopped
+        );
+        tokio::time::timeout(IO_TIMEOUT, reply)
+            .await
+            .unwrap()
+            .unwrap();
+        transport.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordinary_reply_does_not_wait_for_a_slow_transport() {
+        let (response, received) = oneshot::channel();
+        let (_written_tx, written) = oneshot::channel();
+        let call = ControlCall {
+            request: ControlRequest::Ping,
+            response,
+            written,
+        };
+        let reply = tokio::spawn(
+            call.into_request_and_reply()
+                .1
+                .respond(ControlResponse::Pong),
+        );
+        assert_eq!(received.await.unwrap(), ControlResponse::Pong);
+        assert!(reply.is_finished(), "ordinary control call blocked on I/O");
+        reply.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnected_stop_client_does_not_block_shutdown() {
+        let (mut client, stream) = tokio::io::duplex(1);
+        let (calls_tx, mut calls_rx) = mpsc::channel(1);
+        let transport = tokio::spawn(handle_client(stream, calls_tx));
+        client
+            .write_all(&encode_frame(&ControlRequest::Stop).unwrap())
+            .await
+            .unwrap();
+        let call = calls_rx.recv().await.unwrap();
+        drop(client);
+        tokio::time::timeout(
+            IO_TIMEOUT,
+            call.into_request_and_reply()
+                .1
+                .respond(ControlResponse::Stopped),
+        )
+        .await
+        .unwrap();
+        assert!(transport.await.unwrap().is_err());
+    }
 
     #[test]
     fn control_protocol_is_tagged_and_rest_status_has_no_token_field() {

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/metaneutrons/devknx/compare/v0.1.0...v0.1.1) (2026-09-30)
+
+
+### Bug Fixes
+
+* keep generated Homebrew Ruby within style limits ([#61](https://github.com/metaneutrons/devknx/issues/61)) ([2b597b6](https://github.com/metaneutrons/devknx/commit/2b597b6cc6994882c5142032c95d8bfe741d8d00))
+
 ## 0.1.0 (2026-09-30)
 
 

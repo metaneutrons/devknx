@@ -224,7 +224,17 @@ pub struct CaptureStore {
     connection: Connection,
     max_events: Option<NonZeroU32>,
     writable: bool,
-    _writer_lease: Option<File>,
+    _writer_lease: Option<WriterLease>,
+}
+
+/// Release ownership explicitly: a concurrent fork may briefly retain a copy
+/// of the file descriptor, so closing only this descriptor is insufficient.
+struct WriterLease(File);
+
+impl Drop for WriterLease {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 impl CaptureStore {
@@ -876,7 +886,7 @@ impl CaptureStore {
     }
 }
 
-fn acquire_writer_lease(database_path: &Path) -> Result<Option<File>, StorageError> {
+fn acquire_writer_lease(database_path: &Path) -> Result<Option<WriterLease>, StorageError> {
     if database_path == Path::new(":memory:") {
         return Ok(None);
     }
@@ -923,9 +933,9 @@ fn acquire_writer_lease(database_path: &Path) -> Result<Option<File>, StorageErr
     }
 }
 
-fn lock_writer_file(file: File, path: PathBuf) -> Result<Option<File>, StorageError> {
+fn lock_writer_file(file: File, path: PathBuf) -> Result<Option<WriterLease>, StorageError> {
     match file.try_lock() {
-        Ok(()) => Ok(Some(file)),
+        Ok(()) => Ok(Some(WriterLease(file))),
         Err(TryLockError::WouldBlock) => Err(StorageError::WriterBusy(path)),
         Err(TryLockError::Error(error)) => Err(error.into()),
     }
@@ -1474,6 +1484,40 @@ mod tests {
         assert!(CaptureStore::open_existing(&path).is_ok());
         drop(first);
         assert!(CaptureStore::open(&path, nz(10)).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[expect(
+        clippy::used_underscore_binding,
+        reason = "probe the retained RAII lease descriptor"
+    )]
+    fn owner_drop_releases_the_writer_lease_even_with_a_duplicated_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("captures.sqlite");
+        let cap = NonZeroU32::new(10).unwrap();
+        let writer = CaptureStore::open(&path, cap).unwrap();
+        let duplicate = writer
+            ._writer_lease
+            .as_ref()
+            .unwrap()
+            .0
+            .try_clone()
+            .unwrap();
+        assert!(matches!(
+            CaptureStore::open(&path, cap),
+            Err(StorageError::WriterBusy(_))
+        ));
+        drop(writer);
+        let replacement = CaptureStore::open(&path, cap)
+            .expect("dropping the owner must release its lease even while a duplicate survives");
+        drop(duplicate);
+        assert!(matches!(
+            CaptureStore::open(&path, cap),
+            Err(StorageError::WriterBusy(_))
+        ));
+        drop(replacement);
+        assert!(CaptureStore::open(&path, cap).is_ok());
     }
 
     #[cfg(unix)]

@@ -12,12 +12,13 @@
 
 <p align="center">
   <a href="https://github.com/metaneutrons/devknx/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/metaneutrons/devknx/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/metaneutrons/devknx/releases/latest"><img alt="GitHub release" src="https://img.shields.io/github/v/release/metaneutrons/devknx"></a>
   <a href="LICENSE"><img alt="GPL-3.0-only" src="https://img.shields.io/badge/license-GPL--3.0--only-blue.svg"></a>
   <a href="https://github.com/metaneutrons/devknx/issues"><img alt="GitHub issues" src="https://img.shields.io/github/issues/metaneutrons/devknx"></a>
 </p>
 
 > [!IMPORTANT]
-> **Early development.** There is no stable release yet. The daemon can run without a KNX connection. GUI and TUI connect only when requested. Group writes can affect a live installation; qualify them on an isolated test network first.
+> **Initial release: 0.1.0.** The daemon can run without a KNX connection. GUI and TUI connect only when requested. Group writes can affect a live installation; qualify them on an isolated test network first. Live receive has been hardware-tested; typed read/write operations have loopback tests, not production hardware qualification.
 
 ## What devknx does
 
@@ -44,11 +45,72 @@ explicitly supplied), and its preview is the exact frame sent by the capture
 owner. A read reports transmission separately from a matching response or
 timeout; transmission alone does not establish an actuator state change.
 
-The first stable version targets KNXnet/IP. The older
+devknx 0.1.0 targets KNXnet/IP. The older
 [`KnxMonitor`](https://github.com/metaneutrons/KnxMonitor) also supports KNX-USB;
-**USB is not part of devknx's initial release**. KnxMonitor will remain
-available, with this difference stated explicitly when it is eventually
-marked deprecated.
+**USB is not part of devknx's initial release**. Keep KnxMonitor if you need
+KNX-USB; devknx is not yet a replacement for that connection type.
+
+## Installation
+
+Download the appropriate archive from [GitHub Releases](https://github.com/metaneutrons/devknx/releases/latest),
+or use a package channel below. The standalone CLI and macOS app can be installed
+side by side.
+
+### Homebrew
+
+For the CLI on macOS ARM64 or Linux x86_64/ARM64:
+
+```sh
+brew tap metaneutrons/tap
+brew install devknx
+```
+
+For the signed and notarized macOS ARM64 app (macOS 12 or newer):
+
+```sh
+brew install --cask metaneutrons/tap/devknx-app
+```
+
+The formula puts `devknx` on `PATH`; the cask installs `devknx.app` in
+`/Applications`. Sparkle updates only the app, never the standalone CLI.
+
+### Linux: APT and AUR
+
+For Debian 12 or newer and Ubuntu 24.04 or newer, follow the fingerprint-checked setup instructions on
+[`deb.metaneutrons.cc`](https://deb.metaneutrons.cc/index.html) to add the shared,
+signed archive, then install:
+
+```sh
+sudo apt-get update
+sudo apt-get install devknx
+```
+
+For Arch Linux, use [`devknx-bin`](https://aur.archlinux.org/packages/devknx-bin)
+for prebuilt binaries or [`devknx`](https://aur.archlinux.org/packages/devknx)
+to build from source. Linux musl archives are headless; GNU/glibc packages
+include the GUI.
+
+APT, AUR and Homebrew install the GUI's runtime libraries automatically.
+The GNU/glibc tar archives do not install system dependencies; prefer a package
+manager for desktop use. Use a musl archive for a standalone headless CLI.
+
+### Windows
+
+Extract the x86_64 or ARM64 ZIP from [GitHub Releases](https://github.com/metaneutrons/devknx/releases/latest).
+Open PowerShell in the extracted version-and-target folder containing
+`devknx.exe`, then start the desktop or terminal UI:
+
+```powershell
+.\devknx.exe gui
+.\devknx.exe tui --endpoint tunnel://YOUR_GATEWAY:3671
+```
+
+Add the executable's directory to `PATH` if you want to use `devknx` from any
+terminal without the current-directory prefix.
+
+Windows binaries are not Authenticode-signed. SmartScreen may warn on first
+launch; verify the release's checksum, cosign bundle, and provenance before
+running a downloaded binary.
 
 ## Try the development build
 
@@ -310,24 +372,24 @@ cargo build --locked --no-default-features
 ```
 
 On macOS ARM64, `scripts/build-macos-app.sh` (requires `jq`) assembles an **unsigned local**
-`dist/devknx.app`. The release bundle will be signed, notarized, and distributed
-separately. The app requires macOS 12 or newer and provides a native **Check for
+`dist/devknx.app`. Published release bundles are signed and notarized;
+local unsigned builds are not equivalent to those downloads. The app requires
+macOS 12 or newer and provides a native **Check for
 Updates…** menu item. Sparkle uses a separately signed update archive and the
 feed at [`devknx.metaneutrons.cc/appcast.xml`](https://devknx.metaneutrons.cc/appcast.xml);
-the CLI package remains a separate Homebrew formula. The feed becomes available
-with the first release. The [update and signing procedure](docs/sparkle-updates.md)
+the CLI package remains a separate Homebrew formula. The
+[update and signing procedure](docs/sparkle-updates.md)
 documents the release boundary.
 
 `resources/icon-master.png` is the source for the macOS `.icns`, Windows
 executable `.ico`, and Linux icon sizes. Embedded font licences are
 listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
-## Planned distribution
+## Platforms and release artifacts
 
-No package listed here is available yet. The non-publishing
+The release provides the following platform-specific artifacts. The non-publishing
 [release-candidate build](docs/release-preparation.md) produces temporary CI
-artifacts for packaging tests; it is not a release. Release qualification will
-cover:
+artifacts for packaging tests; it is not a release.
 
 | Platform | Architectures | Deliverables |
 | --- | --- | --- |
@@ -335,13 +397,9 @@ cover:
 | Linux | x86_64 and ARM64 | GNU and musl CLI archives, Debian packages, Homebrew formula, AUR packages |
 | Windows | x86_64 and ARM64 | CLI archives with the icon embedded in each executable |
 
-Windows binaries are not Authenticode-signed. SmartScreen may warn on first
-launch; verify the release's checksum, cosign bundle and provenance before
-running a downloaded binary.
-
-The Homebrew formula will put `devknx` on `PATH`; the cask will put
-`devknx.app` in `/Applications`. They will install side by side. The packages
-will be published through GitHub Releases, the
+Release artifacts carry SHA-256 checksums, keyless cosign bundles, GitHub
+provenance, and SPDX SBOMs. Package definitions are also signed and attested.
+Packages are published through GitHub Releases, the
 [`metaneutrons` Homebrew tap](https://github.com/metaneutrons/homebrew-tap),
 the AUR, and the shared [`deb.metaneutrons.cc`](https://deb.metaneutrons.cc/index.html)
 archive. The macOS Intel target is intentionally excluded. Linux musl archives
@@ -357,8 +415,9 @@ Fabian's repositories; it does not require a separate project website.
 The [capability registry](src/capabilities.rs) records which current operations
 exist in the CLI, TUI and GUI and why their coverage differs during development.
 The [M4 qualification record](https://github.com/metaneutrons/devknx/issues/7)
-links the native GUI live/reconnect CI run and the TUI 5,000-row test. These
-tests do not replace a visual review of the app before the first stable release.
+links the native GUI live/reconnect CI run and the TUI 5,000-row test. Local
+macOS visual checks cover the connection workflow, capture layout, and ETS
+import; automated tests do not establish full cross-platform visual qualification.
 
 ## Development and security
 

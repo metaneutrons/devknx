@@ -8,6 +8,7 @@ use devknx::control::{ControlClient, ControlRequest, ControlResponse};
 use devknx::daemon;
 use devknx::ets::{CsvEncoding, EtsCatalog, EtsFormat, parse_group_address};
 use devknx::ipc::{IpcClient, IpcMessage, IpcServer, WireState};
+use devknx::lifecycle::{IdleTimeout, LeaseKeeper, LeaseKind};
 use devknx::mcp;
 use devknx::operations::{OperationRequest, RawPayload, prepare};
 use devknx::paths;
@@ -92,16 +93,28 @@ enum Command {
     /// Run the connection-independent daemon, or inspect, stop or restart an
     /// existing daemon.
     Daemon {
-        /// Report whether the daemon runs and which build it is.
-        #[arg(long, conflicts_with_all = ["stop", "restart"])]
+        /// Report whether the daemon runs, which build it is, its idle
+        /// period and what holds it.
+        #[arg(long, conflicts_with_all = ["stop", "restart", "set_idle_timeout"])]
         status: bool,
         /// Stop the running daemon.
-        #[arg(long, conflicts_with = "restart")]
+        #[arg(long, conflicts_with_all = ["restart", "set_idle_timeout"])]
         stop: bool,
         /// Replace the running daemon with one from this executable and
         /// connect its KNX sessions again.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "set_idle_timeout")]
         restart: bool,
+        /// Run with this idle period (`90s`, `15m`, `2h`; `0` never stops),
+        /// over `idle_timeout` in settings.json.
+        #[arg(long, value_name = "PERIOD", conflicts_with_all = ["status", "stop", "restart"])]
+        idle_timeout: Option<IdleTimeout>,
+        /// Change the running daemon's idle period until it stops.
+        #[arg(long, value_name = "PERIOD")]
+        set_idle_timeout: Option<IdleTimeout>,
+        /// Wait for a stopping daemon to give up the control endpoint. Set
+        /// when a client starts the daemon.
+        #[arg(long, hide = true)]
+        wait_for_endpoint: bool,
     },
     /// Start one KNX session in the per-user daemon.
     Connect {
@@ -399,17 +412,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             status,
             stop,
             restart,
+            idle_timeout,
+            set_idle_timeout,
+            wait_for_endpoint,
         }) => {
             if status {
                 match ControlClient::request_existing(ControlRequest::Identify).await {
-                    Ok(ControlResponse::Identity { identity }) => println!(
-                        "{}",
-                        serde_json::json!({ "running": true, "build": identity })
-                    ),
+                    Ok(ControlResponse::Identity { identity }) => {
+                        // Older daemons know neither; they report null.
+                        let lifecycle =
+                            match ControlClient::request_existing(ControlRequest::GetLifecycle)
+                                .await
+                            {
+                                Ok(ControlResponse::Lifecycle { state }) => Some(state),
+                                _ => None,
+                            };
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "running": true,
+                                "build": identity,
+                                "lifecycle": lifecycle,
+                            })
+                        );
+                    }
                     // A daemon from before the build identity refuses the request.
                     Ok(ControlResponse::Error { .. }) => {
-                        println!("{{\"running\":true,\"build\":null}}");
+                        println!("{{\"running\":true,\"build\":null,\"lifecycle\":null}}");
                     }
+                    Ok(ControlResponse::Stopping) => println!("{{\"running\":false}}"),
                     Ok(response) => print_control_response(&response)?,
                     Err(error)
                         if matches!(
@@ -427,6 +458,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 print_control_response(
                     &ControlClient::request_existing(ControlRequest::Stop).await?,
                 )?;
+            } else if let Some(timeout) = set_idle_timeout {
+                match ControlClient::request_existing(ControlRequest::SetIdleTimeout {
+                    seconds: timeout.0.as_secs(),
+                })
+                .await
+                {
+                    Ok(response) => print_control_response(&response)?,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::NotFound
+                                | io::ErrorKind::ConnectionRefused
+                                | io::ErrorKind::AddrNotAvailable
+                        ) =>
+                    {
+                        return Err(io::Error::other(
+                            "the daemon is not running; start it with `devknx daemon --idle-timeout`",
+                        )
+                        .into());
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             } else if restart {
                 let restart = ControlClient::restart().await?;
                 if restart.rest_was_enabled {
@@ -443,9 +496,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 println!("{}", serde_json::to_string(&restart)?);
             } else {
-                daemon::run()
-                    .await
-                    .map_err(|error| io::Error::other(error.to_string()))?;
+                daemon::run(daemon::DaemonOptions {
+                    idle_timeout,
+                    wait_for_endpoint,
+                })
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))?;
             }
         }
         Some(Command::Connect {
@@ -541,6 +597,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ControlResponse::Error { reason } => return Err(io::Error::other(reason).into()),
                 _ => return Err(io::Error::other("unexpected session response").into()),
             };
+            let _lease = LeaseKeeper::start(LeaseKind::Monitor);
             run_monitor_client(&database).await?;
         }
         Some(Command::Serve {
@@ -596,6 +653,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     parse_group_address(address).map(knx_rs_core::address::GroupAddress::raw)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let _lease = LeaseKeeper::start(LeaseKind::Mcp);
             mcp::run(
                 resolve_capture_selector(selector)?,
                 selected_endpoint,
@@ -607,6 +665,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_ipc_client(&resolve_capture_selector(selector)?, false).await?;
         }
         Some(Command::Follow { selector }) => {
+            let _lease = LeaseKeeper::start(LeaseKind::Follow);
             run_ipc_client(&resolve_capture_selector(selector)?, true).await?;
         }
         Some(Command::History {
@@ -817,6 +876,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let fixed_database = selector.database.is_some();
             let endpoint = selector.endpoint.clone();
             let database = resolve_capture_selector(selector)?;
+            let _lease = LeaseKeeper::start(LeaseKind::Tui);
             tui::run(database, fixed_database, endpoint.as_deref())?;
         }
         Some(Command::Skill {
@@ -866,8 +926,7 @@ async fn connect_session(
 ) -> io::Result<ControlResponse> {
     let endpoint = paths::canonical_endpoint(endpoint).map_err(io::Error::other)?;
     let database = database.map(std::path::absolute).transpose()?;
-    ControlClient::ensure_daemon().await?;
-    ControlClient::request_existing(ControlRequest::Connect {
+    ControlClient::request(ControlRequest::Connect {
         endpoint,
         database,
         max_events: max_events.get(),
@@ -936,7 +995,9 @@ const fn runs_for_a_while(command: Option<&Command>) -> bool {
             status,
             stop,
             restart,
-        }) => !*status && !*stop && !*restart,
+            set_idle_timeout,
+            ..
+        }) => !*status && !*stop && !*restart && set_idle_timeout.is_none(),
         #[cfg(feature = "gui")]
         Some(Command::Gui { .. }) => true,
         #[cfg(feature = "tui")]

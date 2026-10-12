@@ -13,10 +13,12 @@ pub mod enrichment;
 pub mod ets;
 pub mod identity;
 pub mod ipc;
+pub mod lifecycle;
 pub mod mcp;
 pub mod operations;
 pub mod paths;
 pub mod service;
+pub mod settings;
 pub mod storage;
 #[cfg(windows)]
 mod windows_pipe;

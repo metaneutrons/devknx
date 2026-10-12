@@ -68,6 +68,24 @@ pub enum ControlRequest {
     },
     RestDisable,
     RestStatus,
+    /// Create or extend a long-lived client's lease, which holds the daemon
+    /// while no KNX session does. It lapses after
+    /// [`LEASE_TTL`](crate::lifecycle::LEASE_TTL) without renewal.
+    RenewLease {
+        client: String,
+        kind: crate::lifecycle::LeaseKind,
+    },
+    /// End a lease before it lapses, when the client quits normally.
+    ReleaseLease {
+        client: String,
+    },
+    /// Change the running daemon's idle period. `0` means never stop by
+    /// itself. Lasts until this daemon stops.
+    SetIdleTimeout {
+        seconds: u64,
+    },
+    /// The daemon's idle period, its source, and what holds it.
+    GetLifecycle,
     Stop,
 }
 
@@ -90,6 +108,12 @@ pub enum ControlResponse {
     Identity {
         identity: crate::identity::BuildIdentity,
     },
+    Lifecycle {
+        state: crate::lifecycle::LifecycleState,
+    },
+    /// The daemon is stopping and did not act on the request. A client
+    /// starts a new daemon and sends the request again.
+    Stopping,
     Error {
         reason: String,
     },
@@ -219,10 +243,30 @@ impl ControlClient {
     ///
     /// Returns a local IPC, timeout, serialization, or startup error.
     pub async fn request(request: ControlRequest) -> io::Result<ControlResponse> {
-        if !matches!(request, ControlRequest::Stop) {
-            Self::ensure_daemon().await?;
+        if matches!(request, ControlRequest::Stop) {
+            return Self::request_existing(request).await;
         }
-        Self::request_existing(request).await
+        // A daemon can stop between the check and the request, through its
+        // idle stop. It then refuses the connection or answers `Stopping`;
+        // either way it did not act on the request, so starting a new daemon
+        // and sending once more is safe whatever the request does. Any other
+        // failure is returned as it is: the daemon may have acted on it.
+        let deadline = Instant::now() + DAEMON_START_TIMEOUT;
+        loop {
+            Self::ensure_daemon().await?;
+            match Self::request_existing(request.clone()).await {
+                Ok(ControlResponse::Stopping) => {}
+                Err(error) if daemon_unavailable(&error) => {}
+                other => return other,
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the daemon kept stopping for ten seconds",
+                ));
+            }
+            tokio::time::sleep(DAEMON_POLL_INTERVAL).await;
+        }
     }
 
     /// Send one request without starting a daemon.
@@ -245,6 +289,8 @@ impl ControlClient {
     pub async fn ensure_daemon() -> io::Result<()> {
         match Self::request_existing(ControlRequest::Ping).await {
             Ok(ControlResponse::Pong) => return Ok(()),
+            // A stopping daemon gives up the endpoint; the new one waits for it.
+            Ok(ControlResponse::Stopping) => {}
             Ok(_) => return Err(invalid_data("daemon returned an unexpected Ping response")),
             Err(error) if daemon_unavailable(&error) => {}
             Err(error) => return Err(error),
@@ -255,6 +301,7 @@ impl ControlClient {
         loop {
             match Self::request_existing(ControlRequest::Ping).await {
                 Ok(ControlResponse::Pong) => return Ok(()),
+                Ok(ControlResponse::Stopping) => {}
                 Ok(_) => {
                     return Err(invalid_data("daemon returned an unexpected Ping response"));
                 }
@@ -559,12 +606,24 @@ fn daemon_unavailable(error: &io::Error) -> bool {
     )
 }
 
+/// Remove the control endpoint so a late client's connect fails at once.
+///
+/// Only the daemon that owns the endpoint calls this, while it still holds
+/// the owner lock, so no other daemon can have bound the path yet. On
+/// Windows the pipe goes when its listener does.
+pub fn release_endpoint() {
+    #[cfg(unix)]
+    if let Ok(path) = socket_path(false) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 fn spawn_daemon() -> io::Result<()> {
     use std::process::{Command, Stdio};
 
     let mut command = Command::new(std::env::current_exe()?);
     command
-        .arg("daemon")
+        .args(["daemon", "--wait-for-endpoint"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

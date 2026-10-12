@@ -11,6 +11,7 @@ pub mod control;
 pub mod daemon;
 pub mod enrichment;
 pub mod ets;
+pub mod identity;
 pub mod ipc;
 pub mod mcp;
 pub mod operations;

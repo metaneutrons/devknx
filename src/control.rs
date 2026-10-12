@@ -43,6 +43,9 @@ const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(50);
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ControlRequest {
     Ping,
+    /// Which build the daemon is. A request of its own, so a client can still
+    /// reach a daemon too old to know it and warn about it.
+    Identify,
     List,
     Connect {
         endpoint: String,
@@ -73,12 +76,23 @@ pub enum ControlRequest {
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ControlResponse {
     Pong,
-    Sessions { sessions: Vec<SessionInfo> },
-    Session { session: SessionInfo },
+    Sessions {
+        sessions: Vec<SessionInfo>,
+    },
+    Session {
+        session: SessionInfo,
+    },
     Disconnected,
-    Rest { status: RestStatus },
+    Rest {
+        status: RestStatus,
+    },
     Stopped,
-    Error { reason: String },
+    Identity {
+        identity: crate::identity::BuildIdentity,
+    },
+    Error {
+        reason: String,
+    },
 }
 
 /// Public endpoint and database identity for one configured session.
@@ -86,6 +100,9 @@ pub enum ControlResponse {
 pub struct SessionInfo {
     pub endpoint: String,
     pub database: PathBuf,
+    /// The session's retention limit, so a restart can reconnect it as it was.
+    #[serde(default)]
+    pub max_events: Option<u32>,
 }
 
 /// Daemon-owned REST listener state. Credentials are deliberately excluded.
@@ -253,6 +270,140 @@ impl ControlClient {
             tokio::time::sleep(DAEMON_POLL_INTERVAL).await;
         }
     }
+
+    /// The warning when the running daemon is another build than this
+    /// process, or `None` when it is the same build, the user opted out, or
+    /// no daemon answers.
+    ///
+    /// A daemon too old to know `Identify` refuses the request; that is
+    /// reported as a build that cannot say which it is, which it certainly
+    /// differs from this one.
+    pub async fn build_warning() -> Option<String> {
+        let ours = crate::identity::BuildIdentity::current();
+        let theirs = match Self::request_existing(ControlRequest::Identify).await {
+            Ok(ControlResponse::Identity { identity }) => identity,
+            Ok(ControlResponse::Error { .. }) => crate::identity::BuildIdentity {
+                version: "an older build".to_owned(),
+                commit: None,
+                dirty: None,
+                stamp: String::new(),
+                executable: None,
+            },
+            _ => return None,
+        };
+        crate::identity::warning(&ours, &theirs)
+    }
+
+    /// Replace the running daemon with one started from this executable.
+    ///
+    /// The daemon keeps its KNX sessions only in memory, so they are listed
+    /// first and connected again afterwards, each with its database and
+    /// retention limit. A REST listener is not restored: the daemon does not
+    /// report its token, and enabling it again without one would weaken it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an IPC error, or a timeout when the old daemon does not stop
+    /// or a new one does not start.
+    pub async fn restart() -> io::Result<Restart> {
+        let (sessions, rest_was_enabled, was_running) =
+            match Self::request_existing(ControlRequest::List).await {
+                Ok(ControlResponse::Sessions { sessions }) => {
+                    let rest = matches!(
+                        Self::request_existing(ControlRequest::RestStatus).await,
+                        Ok(ControlResponse::Rest { status }) if status.enabled
+                    );
+                    (sessions, rest, true)
+                }
+                Ok(_) => (Vec::new(), false, true),
+                Err(error) if daemon_unavailable(&error) => (Vec::new(), false, false),
+                Err(error) => return Err(error),
+            };
+        if was_running {
+            match Self::request_existing(ControlRequest::Stop).await {
+                Ok(_) => {}
+                Err(error) if daemon_unavailable(&error) => {}
+                Err(error) => return Err(error),
+            }
+            Self::wait_stopped().await?;
+        }
+        let ControlResponse::Identity { identity } =
+            Self::request(ControlRequest::Identify).await?
+        else {
+            return Err(invalid_data("the new daemon did not identify itself"));
+        };
+        let mut reconnected = Vec::new();
+        let mut failed = Vec::new();
+        for session in sessions {
+            let response = Self::request_existing(ControlRequest::Connect {
+                endpoint: session.endpoint.clone(),
+                database: Some(session.database.clone()),
+                max_events: session.max_events.unwrap_or(DEFAULT_MAX_EVENTS),
+            })
+            .await;
+            let reason = match response {
+                Ok(ControlResponse::Session { session }) => {
+                    reconnected.push(session);
+                    continue;
+                }
+                Ok(ControlResponse::Error { reason }) => reason,
+                Ok(_) => "unexpected response".to_owned(),
+                Err(error) => error.to_string(),
+            };
+            failed.push(FailedSession { session, reason });
+        }
+        Ok(Restart {
+            was_running,
+            identity,
+            reconnected,
+            failed,
+            rest_was_enabled,
+        })
+    }
+
+    /// Wait until the daemon no longer accepts connections.
+    async fn wait_stopped() -> io::Result<()> {
+        let deadline = Instant::now() + DAEMON_START_TIMEOUT;
+        loop {
+            match Self::request_existing(ControlRequest::Ping).await {
+                Err(error) if daemon_unavailable(&error) => return Ok(()),
+                _ if Instant::now() >= deadline => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "the daemon did not stop within ten seconds",
+                    ));
+                }
+                _ => tokio::time::sleep(DAEMON_POLL_INTERVAL).await,
+            }
+        }
+    }
+}
+
+/// The retention limit `devknx connect` uses when none is given, and the one
+/// a restart uses for a session whose daemon did not report its limit.
+pub const DEFAULT_MAX_EVENTS: u32 = 100_000;
+
+/// What `devknx daemon --restart` did.
+#[derive(Clone, Debug, Serialize)]
+pub struct Restart {
+    /// Whether a daemon was running before.
+    pub was_running: bool,
+    /// The build of the daemon now running.
+    pub identity: crate::identity::BuildIdentity,
+    /// Sessions connected again in the new daemon.
+    pub reconnected: Vec<SessionInfo>,
+    /// Sessions the new daemon could not connect again, with the reason.
+    pub failed: Vec<FailedSession>,
+    /// Whether the old daemon had a REST listener, which was not restored.
+    pub rest_was_enabled: bool,
+}
+
+/// A session a restart could not connect again.
+#[derive(Clone, Debug, Serialize)]
+pub struct FailedSession {
+    #[serde(flatten)]
+    pub session: SessionInfo,
+    pub reason: String,
 }
 
 async fn handle_client<S>(mut stream: S, calls: mpsc::Sender<ControlCall>) -> io::Result<()>

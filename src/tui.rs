@@ -90,6 +90,8 @@ struct App {
     connection_receiver: Option<Receiver<Result<String, String>>>,
     rest_receiver: Option<Receiver<Result<RestStatus, String>>>,
     rest_status: Option<RestStatus>,
+    /// Set while the daemon is another build; marked in the title bar.
+    build_warning: Option<String>,
     last_rest_refresh: Instant,
     rest_action_pending: bool,
     settings: ConnectionSettings,
@@ -208,6 +210,7 @@ impl App {
             connection_receiver: None,
             rest_receiver: None,
             rest_status: None,
+            build_warning: None,
             last_rest_refresh: Instant::now()
                 .checked_sub(Duration::from_secs(5))
                 .unwrap_or_else(Instant::now),
@@ -232,6 +235,14 @@ impl App {
             color_enabled: color::ui_enabled(),
             skill_offer: None,
         })
+    }
+
+    /// Mark the title bar and say in full, once, which builds differ.
+    fn show_build_warning(&mut self, warning: Option<String>) {
+        if let Some(warning) = &warning {
+            self.model.notice(warning.clone());
+        }
+        self.build_warning = warning;
     }
 
     fn poll(&mut self) {
@@ -1135,7 +1146,8 @@ impl App {
                 Some(_) => "off",
                 None => "unknown",
             };
-            let title = format!(" KNXnet/IP · {status} · REST {rest} ");
+            let build = if self.build_warning.is_some() { " · daemon is another build" } else { "" };
+            let title = format!(" KNXnet/IP · {status} · REST {rest}{build} ");
             frame.render_widget(Paragraph::new(title).block(Block::default().borders(Borders::ALL)), areas[0]);
 
             let visible: Vec<_> = self.model.rows.iter().filter(|row| row.matches(&self.model.filter)).collect();
@@ -1424,6 +1436,7 @@ pub fn run(
     interface::ensure_database(&database).map_err(io::Error::other)?;
     let mut app =
         App::new(database, fixed_database, selected_endpoint).map_err(io::Error::other)?;
+    app.show_build_warning(interface::build_warning());
     app.offer_skill(devknx::agent_skill::Offer::for_this_user(
         &<crate::Cli as clap::CommandFactory>::command(),
     ));
@@ -1555,6 +1568,28 @@ mod tests {
         app.submit();
         assert_eq!(app.model.filter, "light");
         app.draw(&mut terminal).unwrap();
+    }
+
+    /// A daemon of another build is marked in the title bar and said in full
+    /// once; the same build shows nothing.
+    #[test]
+    fn a_daemon_of_another_build_is_marked_in_the_title() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("capture.sqlite");
+        drop(CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap());
+        let mut app = App::new(database, true, None).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        app.show_build_warning(None);
+        app.draw(&mut terminal).unwrap();
+        assert!(!read_screen(&terminal).contains("another build"));
+        app.show_build_warning(Some("warning: the daemon is 0.2.0 (aaaaaaa)".into()));
+        app.draw(&mut terminal).unwrap();
+        let screen = read_screen(&terminal);
+        assert!(screen.contains("daemon is another build"), "{screen}");
+        assert_eq!(
+            app.model.notices.last().map(String::as_str),
+            Some("warning: the daemon is 0.2.0 (aaaaaaa)")
+        );
     }
 
     #[test]

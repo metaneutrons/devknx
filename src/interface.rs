@@ -578,6 +578,17 @@ pub fn disconnect_owner(database: &Path) -> Result<String, String> {
     }
 }
 
+/// The warning when the running daemon is another build than this window or
+/// terminal monitor, or `None` when it is the same build or none runs.
+#[must_use]
+pub fn build_warning() -> Option<String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    runtime.block_on(ControlClient::build_warning())
+}
+
 fn control_request(request: ControlRequest) -> io::Result<ControlResponse> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

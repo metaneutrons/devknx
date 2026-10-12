@@ -310,6 +310,9 @@ struct MonitorApp {
     rest_receiver: Option<Receiver<Result<RestStatus, String>>>,
     rest_request_kind: Option<RestRequestKind>,
     rest_status: Option<RestStatus>,
+    /// Shown in the status bar while the daemon is another build.
+    build_warning: Option<String>,
+    build_receiver: Option<Receiver<Option<String>>>,
     rest_error: Option<String>,
     rest_action_error: Option<String>,
     rest_last_refresh: Option<Instant>,
@@ -397,6 +400,11 @@ impl MonitorApp {
             };
         }
         app.refresh_rest_status();
+        let (sender, receiver) = mpsc::channel();
+        app.build_receiver = Some(receiver);
+        std::thread::spawn(move || {
+            let _ = sender.send(interface::build_warning());
+        });
         app
     }
 
@@ -683,8 +691,19 @@ impl MonitorApp {
         }
     }
 
+    /// Take the daemon's build comparison once the background check is done.
+    fn process_build_warning(&mut self) {
+        if let Some(receiver) = &self.build_receiver
+            && let Ok(warning) = receiver.try_recv()
+        {
+            self.build_warning = warning;
+            self.build_receiver = None;
+        }
+    }
+
     fn process_background(&mut self) {
         self.process_rest_background();
+        self.process_build_warning();
         self.process_ets_import();
         if self.model.is_none()
             && !self.offline_capture
@@ -1922,6 +1941,14 @@ impl MonitorApp {
                 ui.separator();
                 ui.label("History saved locally")
                     .on_hover_text(model.database.display().to_string());
+            }
+            if let Some(warning) = &self.build_warning {
+                ui.separator();
+                ui.colored_label(
+                    warning_color(ui.visuals().dark_mode),
+                    "Daemon is another build",
+                )
+                .on_hover_text(warning);
             }
             ui.separator();
             open_rest = ui

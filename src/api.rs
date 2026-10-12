@@ -1493,7 +1493,7 @@ mod tests {
         let response = request(app.clone(), Method::GET, "/v1/routing-losses?after=1", None).await;
         let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let empty: Value = serde_json::from_slice(&body).unwrap();
-        assert!(empty["items"].as_array().unwrap().is_empty());
+        assert!(empty["items"].as_array().unwrap().is_empty(), "{empty}");
 
         let response = request(app, Method::GET, "/v1/routing-loss-events?after=0", None).await;
         assert_eq!(response.status(), StatusCode::OK);

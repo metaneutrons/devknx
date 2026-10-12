@@ -191,7 +191,7 @@ async fn rest_without_default_endpoint_controls_isolated_sessions() {
     let address: SocketAddr = enabled["status"]["bind"].as_str().unwrap().parse().unwrap();
     let (code, empty) = http_json(address, "GET", "/v1/sessions").await;
     assert_eq!(code, 200);
-    assert!(empty["sessions"].as_array().unwrap().is_empty());
+    assert!(empty["sessions"].as_array().unwrap().is_empty(), "{empty}");
     let (code, missing) = http_json(address, "GET", "/v1/captures").await;
     assert_eq!(code, 400);
     assert_eq!(missing["error"], "explicit endpoint is required");
@@ -261,7 +261,10 @@ async fn rest_without_default_endpoint_controls_isolated_sessions() {
     let (code, second_page) =
         http_json(address, "GET", &format!("/v1/captures?endpoint={second}")).await;
     assert_eq!(code, 200);
-    assert!(second_page["items"].as_array().unwrap().is_empty());
+    assert!(
+        second_page["items"].as_array().unwrap().is_empty(),
+        "{second_page}"
+    );
     let (code, stopped) =
         http_json(address, "DELETE", &format!("/v1/sessions?endpoint={first}")).await;
     assert_eq!(code, 200);
@@ -326,11 +329,10 @@ async fn foreground_daemon_starts_without_a_knx_session() {
         "foreground daemon not ready after {:?}; last status: {last_status:?}",
         started.elapsed()
     );
+    let sessions = cli.json(&["sessions"]);
     assert!(
-        cli.json(&["sessions"])["sessions"]
-            .as_array()
-            .unwrap()
-            .is_empty()
+        sessions["sessions"].as_array().unwrap().is_empty(),
+        "{sessions}"
     );
     assert!(!cli.application_data_dir().join("captures").exists());
     assert_eq!(cli.json(&["rest", "--status"])["status"]["enabled"], false);
@@ -372,11 +374,10 @@ async fn rest_starts_offline_and_controls_its_selected_knx_session() {
         !database.exists(),
         "REST started a capture without a Connect request"
     );
+    let sessions = cli.json(&["sessions"]);
     assert!(
-        cli.json(&["sessions"])["sessions"]
-            .as_array()
-            .unwrap()
-            .is_empty()
+        sessions["sessions"].as_array().unwrap().is_empty(),
+        "{sessions}"
     );
 
     let (code, health) = http_json(address, "GET", "/v1/health").await;
@@ -385,7 +386,10 @@ async fn rest_starts_offline_and_controls_its_selected_knx_session() {
     assert!(health["capture_owner"].is_null());
     let (code, captures) = http_json(address, "GET", "/v1/captures?after=0&limit=10").await;
     assert_eq!(code, 200);
-    assert!(captures["items"].as_array().unwrap().is_empty());
+    assert!(
+        captures["items"].as_array().unwrap().is_empty(),
+        "{captures}"
+    );
     let (code, before) = http_json(address, "GET", "/v1/connection").await;
     assert_eq!(code, 200);
     assert_eq!(before["endpoint"], endpoint);

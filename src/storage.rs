@@ -1997,7 +1997,7 @@ mod tests {
             reader.export_csv(&mut invalid_output, -1),
             Err(StorageError::InvalidCursor(-1))
         ));
-        assert!(invalid_output.is_empty());
+        assert!(invalid_output.is_empty(), "{invalid_output:?}");
     }
 
     #[cfg(unix)]

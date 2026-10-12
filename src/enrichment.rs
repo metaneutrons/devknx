@@ -366,8 +366,12 @@ mod tests {
 
         assert_eq!(enrichment.ets_revision, Some(1));
         assert_eq!(enrichment.group_name, None);
-        assert!(enrichment.hierarchy.is_empty());
-        assert!(enrichment.dpts.is_empty());
+        assert!(
+            enrichment.hierarchy.is_empty(),
+            "{:?}",
+            enrichment.hierarchy
+        );
+        assert!(enrichment.dpts.is_empty(), "{:?}", enrichment.dpts);
         assert_eq!(enrichment.value, None);
     }
 }

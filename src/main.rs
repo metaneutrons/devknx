@@ -1278,7 +1278,7 @@ mod tests {
     #[test]
     fn every_tool_and_route_is_in_the_skill_reference() {
         let tools = devknx::mcp::McpServer::tools().list_all();
-        assert!(!tools.is_empty());
+        assert!(!tools.is_empty(), "no MCP tools listed");
         let text = devknx::agent_skill::mcp_reference();
         for tool in tools {
             assert!(

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/metaneutrons/devknx/compare/v0.1.0...v0.2.0) (2026-10-12)
+
+
+### Features
+
+* ship an agent skill and keep it current ([#68](https://github.com/metaneutrons/devknx/issues/68)) ([d805fe9](https://github.com/metaneutrons/devknx/commit/d805fe95e11e4cadd8f526b00bdc1af45548a940))
+
 ## 0.1.0 (2026-09-30)
 
 

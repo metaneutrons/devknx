@@ -7,7 +7,7 @@
 //! settings apply to the daemon and every client of the current user. The file
 //! is optional; a missing file means the defaults.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +23,22 @@ pub struct Settings {
     /// How long the daemon waits, idle, before it stops by itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_timeout: Option<IdleTimeout>,
+    /// What quitting the window or the terminal monitor does to the daemon.
+    #[serde(default)]
+    pub on_quit: OnQuit,
+}
+
+/// What quitting the window or the terminal monitor does to the daemon.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnQuit {
+    /// Ask each time.
+    #[default]
+    Ask,
+    /// Stop it.
+    Stop,
+    /// Leave it running.
+    Keep,
 }
 
 impl Settings {
@@ -41,13 +57,57 @@ impl Settings {
     ///
     /// Returns an error when the file exists but cannot be read or parsed.
     pub fn load() -> Result<Self, String> {
-        let path = Self::path()?;
-        match std::fs::read(&path) {
+        Self::load_from(&Self::path()?)
+    }
+
+    /// Read the settings from `path`; a missing file gives the defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file exists but cannot be read or parsed.
+    pub fn load_from(path: &Path) -> Result<Self, String> {
+        match std::fs::read(path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map_err(|error| format!("{} is not valid: {error}", path.display())),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(error) => Err(format!("cannot read {}: {error}", path.display())),
         }
+    }
+
+    /// Remember the answer to the quit question in `path`, keeping every
+    /// other field of the file as it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file is not a JSON object, or it cannot be
+    /// written.
+    pub fn save_on_quit(path: &Path, on_quit: OnQuit) -> Result<(), String> {
+        let mut document = match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+                .map_err(|error| format!("{} is not valid: {error}", path.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                serde_json::Value::Object(serde_json::Map::new())
+            }
+            Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+        };
+        let object = document
+            .as_object_mut()
+            .ok_or_else(|| format!("{} is not a JSON object", path.display()))?;
+        object.insert(
+            "on_quit".to_owned(),
+            serde_json::to_value(on_quit).map_err(|error| error.to_string())?,
+        );
+        let text = serde_json::to_string_pretty(&document).map_err(|error| error.to_string())?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+        }
+        // Written beside the file and renamed over it, so a reader never sees
+        // half of it.
+        let partial = path.with_extension("json.partial");
+        std::fs::write(&partial, text + "\n")
+            .and_then(|()| std::fs::rename(&partial, path))
+            .map_err(|error| format!("cannot write {}: {error}", path.display()))
     }
 }
 
@@ -64,7 +124,29 @@ mod tests {
             serde_json::from_str::<Settings>("{}").unwrap(),
             Settings::default()
         );
+        assert_eq!(settings.on_quit, OnQuit::Ask);
         // Counter-probe: a malformed period is an error, not the default.
         assert!(serde_json::from_str::<Settings>(r#"{"idle_timeout":"2 days"}"#).is_err());
+    }
+
+    #[test]
+    fn the_quit_answer_is_saved_without_touching_other_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("devknx").join(FILE_NAME);
+        Settings::save_on_quit(&path, OnQuit::Keep).unwrap();
+        assert_eq!(Settings::load_from(&path).unwrap().on_quit, OnQuit::Keep);
+
+        std::fs::write(&path, r#"{"idle_timeout":"1h","later":[1,2]}"#).unwrap();
+        Settings::save_on_quit(&path, OnQuit::Stop).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["idle_timeout"], "1h");
+        assert_eq!(saved["later"], serde_json::json!([1, 2]));
+        assert_eq!(saved["on_quit"], "stop");
+
+        // Counter-probe: a file that is not an object is left alone.
+        std::fs::write(&path, "[]").unwrap();
+        assert!(Settings::save_on_quit(&path, OnQuit::Keep).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]");
     }
 }

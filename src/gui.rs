@@ -289,12 +289,25 @@ fn render_ets_options(ui: &mut egui::Ui, dialog: &mut EtsImportDialog, preparing
     });
 }
 
+/// The question on quit, with what stopping the daemon would end.
+struct QuitQuestion {
+    view: interface::DaemonView,
+    remember: bool,
+}
+
 #[derive(Default)]
 #[expect(
     clippy::struct_excessive_bools,
     reason = "independent visible GUI dialogs"
 )]
 struct MonitorApp {
+    /// Talks to the daemon when quitting; `None` asks nothing, as in tests.
+    quit_daemon: Option<interface::DaemonControl>,
+    /// Where the answer to the quit question is remembered.
+    settings_file: Option<PathBuf>,
+    quit_question: Option<QuitQuestion>,
+    /// Quitting is decided; the next close goes through.
+    quit_resolved: bool,
     /// The agent skill offered at start, until it is answered.
     skill_offer: Option<devknx::agent_skill::Offer>,
     /// What answering the offer did, until it is dismissed.
@@ -367,6 +380,11 @@ impl MonitorApp {
                 pin_to_top: false,
                 result,
             }),
+            // Tests never reach the daemon of the user running them.
+            #[cfg(not(test))]
+            quit_daemon: Some(interface::daemon_control()),
+            #[cfg(not(test))]
+            settings_file: devknx::settings::Settings::path().ok(),
             ..Self::default()
         };
         if let Some(database) = database {
@@ -1130,6 +1148,107 @@ impl MonitorApp {
     }
 
     /// The agent skill offer, and then what answering it did.
+    /// Closing the window or quitting from the menu: decide what happens to
+    /// the daemon first. The smoke runs close themselves and nobody answers
+    /// there, so they are let through.
+    fn process_quit(&mut self, ctx: &egui::Context) {
+        let close = ctx.input(|input| input.viewport().close_requested());
+        let menu_quit = platform::take(MenuAction::Quit);
+        if self.quit_resolved || self.smoke.is_some() || self.live_smoke.is_some() {
+            if menu_quit {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            return;
+        }
+        if !close && !menu_quit {
+            return;
+        }
+        if close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        if self.quit_question.is_none() && self.begin_quit() {
+            self.quit_resolved = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// Returns whether the window may close now; otherwise the question is up.
+    fn begin_quit(&mut self) -> bool {
+        let Some(control) = &self.quit_daemon else {
+            return true;
+        };
+        match interface::plan_quit(control, self.settings_file.as_deref()) {
+            interface::QuitPlan::Quit => true,
+            interface::QuitPlan::Ask(view) => {
+                self.quit_question = Some(QuitQuestion {
+                    view,
+                    remember: false,
+                });
+                false
+            }
+        }
+    }
+
+    /// Act on the answer; `None` cancels the quit.
+    fn answer_quit(&mut self, ctx: &egui::Context, stop: Option<bool>) {
+        let Some(question) = self.quit_question.take() else {
+            return;
+        };
+        let Some(stop) = stop else {
+            return;
+        };
+        if let Some(control) = &self.quit_daemon
+            && let Err(error) = interface::answer_quit(
+                control,
+                self.settings_file.as_deref(),
+                stop,
+                question.remember,
+            )
+        {
+            eprintln!("{error}");
+        }
+        self.quit_resolved = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    fn quit_window(&mut self, ctx: &egui::Context) {
+        let Some(question) = &mut self.quit_question else {
+            return;
+        };
+        let mut answer = None;
+        egui::Window::new("Quit devknx")
+            .resizable(false)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new("Stop the daemon too?").strong());
+                ui.add_space(6.0);
+                for line in question
+                    .view
+                    .what_stopping_ends(devknx::lifecycle::LeaseKind::Gui)
+                {
+                    ui.label(line);
+                }
+                ui.add_space(8.0);
+                ui.checkbox(&mut question.remember, "Remember my answer");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Stop the daemon").clicked() {
+                        answer = Some(Some(true));
+                    }
+                    if ui.button("Leave it running").clicked() {
+                        answer = Some(Some(false));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        answer = Some(None);
+                    }
+                });
+            });
+        if let Some(answer) = answer {
+            self.answer_quit(ctx, answer);
+        }
+    }
+
     fn skill_offer_window(&mut self, ctx: &egui::Context) {
         if let Some(result) = &self.skill_result {
             let mut dismissed = false;
@@ -1182,6 +1301,7 @@ impl MonitorApp {
     #[expect(clippy::too_many_lines, reason = "four independent small modal forms")]
     fn dialogs(&mut self, ctx: &egui::Context) {
         self.skill_offer_window(ctx);
+        self.quit_window(ctx);
         if self.show_settings {
             let mut open = self.show_settings;
             let mut save = false;
@@ -1973,6 +2093,7 @@ impl eframe::App for MonitorApp {
         self.process_background();
         let focus_filter = self.process_menu();
         let ctx = ui.ctx().clone();
+        self.process_quit(&ctx);
         self.smoke_step(&ctx);
         ctx.request_repaint_after(Duration::from_millis(100));
         let (_, status, detail) = self.connection_status();
@@ -2039,6 +2160,67 @@ mod tests {
     use super::*;
     use devknx::storage::CaptureStore;
     use std::num::NonZeroU32;
+
+    /// Closing the window with a daemon running asks first; the answer stops
+    /// it or leaves it, cancelling keeps the window, and without a daemon the
+    /// window closes at once.
+    #[test]
+    fn quitting_asks_about_the_daemon() {
+        use crate::interface::DaemonRequest::{Stop, View};
+        let directory = tempfile::tempdir().unwrap();
+        let settings = directory.path().join("settings.json");
+        let view = crate::interface::DaemonView {
+            sessions: Vec::new(),
+            leases: vec![devknx::lifecycle::LeaseKind::Gui],
+            rest: RestStatus {
+                enabled: false,
+                endpoint: None,
+                bind: None,
+                allow_remote_writes: false,
+            },
+        };
+        let (control, asked) = crate::interface::fake_daemon_control(Some(view));
+        let ctx = egui::Context::default();
+        let mut app = MonitorApp {
+            quit_daemon: Some(control),
+            settings_file: Some(settings.clone()),
+            ..MonitorApp::default()
+        };
+
+        assert!(!app.begin_quit(), "asking must not close yet");
+        let lines = app
+            .quit_question
+            .as_ref()
+            .unwrap()
+            .view
+            .what_stopping_ends(devknx::lifecycle::LeaseKind::Gui);
+        assert_eq!(lines, vec!["No KNX session is configured.".to_owned()]);
+        app.answer_quit(&ctx, None);
+        assert!(
+            app.quit_question.is_none() && !app.quit_resolved,
+            "cancel keeps the window"
+        );
+
+        assert!(!app.begin_quit());
+        app.quit_question.as_mut().unwrap().remember = true;
+        app.answer_quit(&ctx, Some(true));
+        assert!(app.quit_resolved);
+        assert_eq!(*asked.lock().unwrap(), vec![View, View, Stop]);
+        assert_eq!(
+            devknx::settings::Settings::load_from(&settings)
+                .unwrap()
+                .on_quit,
+            devknx::settings::OnQuit::Stop
+        );
+
+        let (control, asked) = crate::interface::fake_daemon_control(None);
+        let mut app = MonitorApp {
+            quit_daemon: Some(control),
+            ..MonitorApp::default()
+        };
+        assert!(app.begin_quit(), "no daemon, nothing to ask");
+        assert_eq!(*asked.lock().unwrap(), vec![View]);
+    }
 
     /// The agent skill offer installs, remembers a no, or asks again next
     /// time.

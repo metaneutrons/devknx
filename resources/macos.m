@@ -30,6 +30,7 @@ enum {
     ACTION_CONNECTION_SETTINGS = 1 << 7,
     ACTION_TOGGLE_COLOR = 1 << 8,
     ACTION_IMPORT_ETS = 1 << 9,
+    ACTION_QUIT = 1 << 10,
 };
 
 static void initialize_sparkle_updater_on_main_thread(void *context) {
@@ -130,6 +131,8 @@ static void forward_edit_action(id target, unsigned short key_code,
 - (void)connectionSettings:(id)sender;
 - (void)toggleColor:(id)sender;
 - (void)checkForUpdates:(id)sender;
+- (void)quitApp:(id)sender;
+- (void)handleQuitEvent:(NSAppleEventDescriptor *)event withReplyEvent:(NSAppleEventDescriptor *)reply;
 @end
 
 @implementation DevknxMenuHandler
@@ -164,6 +167,23 @@ static void forward_edit_action(id target, unsigned short key_code,
 - (void)connectionSettings:(id)sender { (void)sender; pending_actions |= ACTION_CONNECTION_SETTINGS; }
 - (void)toggleColor:(id)sender { (void)sender; pending_actions |= ACTION_TOGGLE_COLOR; }
 - (void)checkForUpdates:(id)sender { (void)sender; }
+// Quit goes through the window rather than `terminate:`, which would end the
+// process without the window hearing of it and so skip the question about the
+// daemon. The window closes once that question is answered.
+- (void)quitApp:(id)sender { (void)sender; pending_actions |= ACTION_QUIT; }
+// The quit Apple event: Quit in the Dock, `osascript ... quit`, and
+// -[NSRunningApplication terminate]. AppKit's own handler calls terminate:
+// and so skips the question as well. Logout, restart and shutdown carry a
+// reason; they quit as before, because a question nobody answers would stop
+// the logout.
+- (void)handleQuitEvent:(NSAppleEventDescriptor *)event withReplyEvent:(NSAppleEventDescriptor *)reply {
+    (void)reply;
+    if ([event attributeDescriptorForKeyword:kAEQuitReason]) {
+        [NSApp terminate:nil];
+        return;
+    }
+    pending_actions |= ACTION_QUIT;
+}
 @end
 
 static DevknxMenuHandler *menu_handler = nil;
@@ -258,7 +278,15 @@ void devknx_init_macos_app(const char *version, const uint8_t *icon, size_t icon
                  NSEventModifierFlagCommand | NSEventModifierFlagOption);
         add_item(application, @"Show All", @selector(unhideAllApplications:), @"", nil, 0);
         [application addItem:[NSMenuItem separatorItem]];
-        add_item(application, @"Quit devknx", @selector(terminate:), @"q", nil, NSEventModifierFlagCommand);
+        add_item(application, @"Quit devknx", @selector(quitApp:), @"q", menu_handler, NSEventModifierFlagCommand);
+        // Replaces AppKit's handler, which it installs while the application
+        // finishes launching; this runs once the window exists, so ours is
+        // the last one installed.
+        [[NSAppleEventManager sharedAppleEventManager]
+            setEventHandler:menu_handler
+                andSelector:@selector(handleQuitEvent:withReplyEvent:)
+              forEventClass:kCoreEventClass
+                 andEventID:kAEQuitApplication];
 
         NSMenu *file = add_menu(main, @"File");
         add_item(file, @"Open Capture…", @selector(openDatabase:), @"o", menu_handler, NSEventModifierFlagCommand);

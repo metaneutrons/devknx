@@ -66,7 +66,7 @@ jobs:
           test -s "extracted/devknx-$tag/THIRD-PARTY-NOTICES.md"
           test -s "extracted/devknx-$tag/licenses/OFL-1.1.txt"
           test "$(find extracted -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')" -eq 1
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: candidate-source
           path: packages/*
@@ -114,7 +114,7 @@ jobs:
           mkdir -p candidate
           command cp "$binary" candidate/devknx
           chmod +x candidate/devknx
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: native-${{ matrix.target }}
           path: candidate/devknx
@@ -138,7 +138,7 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: native-${{ matrix.target }}
           path: native
@@ -175,7 +175,7 @@ jobs:
           mkdir -p deb-root
           dpkg-deb --extract "$package" deb-root
           deb-root/usr/bin/devknx --version | grep -Fx "devknx $version"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: candidate-${{ matrix.target }}
           path: packages/
@@ -220,7 +220,7 @@ jobs:
           ditto -x -k "packages/devknx-$tag-aarch64-apple-darwin.app.zip" app-unpacked
           app-unpacked/devknx.app/Contents/MacOS/devknx --version |
             grep -Fx "devknx $version"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: candidate-aarch64-apple-darwin
           path: packages/
@@ -266,7 +266,7 @@ jobs:
           if ((& "unpacked/devknx-$tag-${{ matrix.target }}/devknx.exe" --version) -ne "devknx $version") {
             throw 'The extracted executable has the wrong version.'
           }
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: candidate-${{ matrix.target }}
           path: packages/
@@ -291,7 +291,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: candidate-${{ matrix.target }}
           path: candidate

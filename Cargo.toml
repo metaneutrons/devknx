@@ -42,6 +42,7 @@ multiple_crate_versions = "allow"
 [dependencies]
 async-stream = "0.3"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
+agent-skill-installer = "0.2.1"
 clap = { version = "4.6", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
 crossterm = { version = "0.29", optional = true }

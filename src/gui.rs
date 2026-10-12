@@ -70,16 +70,20 @@ pub fn run(
             .with_min_inner_size([650.0, 420.0]),
         ..Default::default()
     };
+    // Not in the automated smoke runs, which nobody answers.
+    let skill_offer = if smoke {
+        None
+    } else {
+        devknx::agent_skill::Offer::for_this_user(&<crate::Cli as clap::CommandFactory>::command())
+    };
     eframe::run_native(
         "devknx",
         options,
         Box::new(move |_cc| {
             platform::init_app();
-            Ok(Box::new(MonitorApp::new(
-                database,
-                app_smoke_result,
-                smoke_live,
-            )))
+            let mut app = MonitorApp::new(database, app_smoke_result, smoke_live);
+            app.skill_offer = skill_offer;
+            Ok(Box::new(app))
         }),
     )?;
     if let Some(result) = smoke_result
@@ -289,6 +293,10 @@ fn render_ets_options(ui: &mut egui::Ui, dialog: &mut EtsImportDialog, preparing
     reason = "independent visible GUI dialogs"
 )]
 struct MonitorApp {
+    /// The agent skill offered at start, until it is answered.
+    skill_offer: Option<devknx::agent_skill::Offer>,
+    /// What answering the offer did, until it is dismissed.
+    skill_result: Option<String>,
     ets_import: EtsImportDialog,
     primary_database: Option<PathBuf>,
     database_override: Option<PathBuf>,
@@ -1084,8 +1092,75 @@ impl MonitorApp {
         ctx.request_repaint_after(Duration::from_millis(50));
     }
 
+    /// Answer the agent skill offer: install (`Some(true)`), never offer these
+    /// places again (`Some(false)`), or ask next time (`None`).
+    fn answer_skill_offer(&mut self, answer: Option<bool>) {
+        let Some(offer) = self.skill_offer.take() else {
+            return;
+        };
+        self.skill_result = match answer {
+            Some(true) => Some(offer.accept().join("\n")),
+            Some(false) => Some(offer.decline().map_or_else(
+                |error| format!("Could not save the answer: {error}"),
+                |()| "Not offered again. `devknx skill --install` installs it later.".to_owned(),
+            )),
+            None => None,
+        };
+    }
+
+    /// The agent skill offer, and then what answering it did.
+    fn skill_offer_window(&mut self, ctx: &egui::Context) {
+        if let Some(result) = &self.skill_result {
+            let mut dismissed = false;
+            egui::Window::new("AI tools")
+                .resizable(false)
+                .collapsible(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.label(result);
+                    ui.add_space(8.0);
+                    dismissed = ui.button("OK").clicked();
+                });
+            if dismissed {
+                self.skill_result = None;
+            }
+            return;
+        }
+        let Some(offer) = &self.skill_offer else {
+            return;
+        };
+        let mut answer = None;
+        egui::Window::new("AI tools")
+            .resizable(false)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(devknx::agent_skill::Offer::QUESTION).strong());
+                ui.add_space(6.0);
+                for line in offer.lines() {
+                    ui.label(line);
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Install").clicked() {
+                        answer = Some(Some(true));
+                    }
+                    if ui.button("Not here").clicked() {
+                        answer = Some(Some(false));
+                    }
+                    if ui.button("Later").clicked() {
+                        answer = Some(None);
+                    }
+                });
+            });
+        if let Some(answer) = answer {
+            self.answer_skill_offer(answer);
+        }
+    }
+
     #[expect(clippy::too_many_lines, reason = "four independent small modal forms")]
     fn dialogs(&mut self, ctx: &egui::Context) {
+        self.skill_offer_window(ctx);
         if self.show_settings {
             let mut open = self.show_settings;
             let mut save = false;
@@ -1935,6 +2010,39 @@ mod tests {
     use super::*;
     use devknx::storage::CaptureStore;
     use std::num::NonZeroU32;
+
+    /// The agent skill offer installs, remembers a no, or asks again next
+    /// time.
+    #[test]
+    fn the_skill_offer_installs_remembers_or_waits() {
+        use devknx::agent_skill::{Offer, sandbox_agent};
+        let directory = tempfile::tempdir().unwrap();
+        let cli = <crate::Cli as clap::CommandFactory>::command();
+        let dir = directory.path();
+        let mut app = MonitorApp {
+            skill_offer: Offer::for_agent(sandbox_agent(&cli, dir, &[".claude"])),
+            ..MonitorApp::default()
+        };
+        app.answer_skill_offer(None);
+        assert!(app.skill_offer.is_none() && app.skill_result.is_none());
+        let again = Offer::for_agent(sandbox_agent(&cli, dir, &[]));
+        assert!(again.is_some(), "later did not ask again");
+
+        app.skill_offer = again;
+        app.answer_skill_offer(Some(false));
+        assert!(
+            app.skill_result
+                .as_deref()
+                .is_some_and(|text| text.contains("Not offered again")),
+            "{:?}",
+            app.skill_result
+        );
+        assert!(Offer::for_agent(sandbox_agent(&cli, dir, &[])).is_none());
+
+        app.skill_offer = Offer::for_agent(sandbox_agent(&cli, dir, &[".codex"]));
+        app.answer_skill_offer(Some(true));
+        assert!(dir.join("home/.agents/skills/devknx/SKILL.md").exists());
+    }
 
     fn import_app() -> (tempfile::TempDir, MonitorApp, PathBuf) {
         let directory = tempfile::tempdir().unwrap();

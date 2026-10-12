@@ -73,6 +73,8 @@ enum Mode {
     EtsImportPreparing,
     ConfirmEtsImport,
     EtsImportCommitting,
+    /// Offering the agent skill to AI tools found on this computer.
+    SkillOffer,
 }
 
 #[expect(
@@ -109,9 +111,76 @@ struct App {
     selected: usize,
     follow_tail: bool,
     color_enabled: bool,
+    /// The agent skill offered at start, until it is answered.
+    skill_offer: Option<devknx::agent_skill::Offer>,
 }
 
 impl App {
+    /// Put the agent skill offer up, when there is one.
+    fn offer_skill(&mut self, offer: Option<devknx::agent_skill::Offer>) {
+        if offer.is_some() {
+            self.skill_offer = offer;
+            self.mode = Mode::SkillOffer;
+        }
+    }
+
+    /// Answer the agent skill offer: install, or never offer these places
+    /// again.
+    fn answer_skill_offer(&mut self, install: bool) {
+        self.mode = Mode::Normal;
+        let Some(offer) = self.skill_offer.take() else {
+            return;
+        };
+        let notice = if install {
+            offer.accept().join("; ")
+        } else {
+            match offer.decline() {
+                Ok(()) => {
+                    "Agent skill not offered again; `devknx skill --install` installs it later"
+                        .to_owned()
+                }
+                Err(error) => format!("Could not save the answer: {error}"),
+            }
+        };
+        self.model.notice(notice);
+    }
+
+    fn draw_skill_offer_overlay(&self, frame: &mut Frame<'_>) {
+        let Some(offer) = self
+            .skill_offer
+            .as_ref()
+            .filter(|_| self.mode == Mode::SkillOffer)
+        else {
+            return;
+        };
+        let area = import_overlay_area(frame.area());
+        frame.render_widget(Clear, area);
+        let mut lines = vec![
+            Line::styled(
+                devknx::agent_skill::Offer::QUESTION,
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Line::raw(""),
+        ];
+        lines.extend(
+            offer
+                .lines()
+                .iter()
+                .map(|line| Line::raw(format!("  {line}"))),
+        );
+        lines.extend([
+            Line::raw(""),
+            Line::raw("y  install        n  not here, do not ask again"),
+            Line::raw("Esc  ask next time"),
+        ]);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .block(Block::default().title(" AI tools ").borders(Borders::ALL)),
+            area,
+        );
+    }
+
     fn new(
         database: PathBuf,
         fixed_database: bool,
@@ -161,6 +230,7 @@ impl App {
             selected,
             follow_tail: true,
             color_enabled: color::ui_enabled(),
+            skill_offer: None,
         })
     }
 
@@ -762,7 +832,8 @@ impl App {
             | Mode::EtsImportEncoding
             | Mode::EtsImportPreparing
             | Mode::ConfirmEtsImport
-            | Mode::EtsImportCommitting => {}
+            | Mode::EtsImportCommitting
+            | Mode::SkillOffer => {}
         }
     }
 
@@ -790,6 +861,14 @@ impl App {
             } else {
                 self.mode = Mode::Normal;
                 self.input.clear();
+            }
+            return false;
+        }
+        if self.mode == Mode::SkillOffer {
+            match key.code {
+                KeyCode::Char('y') => self.answer_skill_offer(true),
+                KeyCode::Char('n') => self.answer_skill_offer(false),
+                _ => {}
             }
             return false;
         }
@@ -1104,6 +1183,7 @@ impl App {
                 Mode::EtsImportPreparing => "Preparing ETS import preview… Esc cancels".into(),
                 Mode::ConfirmEtsImport => "Review the ETS import preview".into(),
                 Mode::EtsImportCommitting => "ETS import in progress… input is disabled".into(),
+                Mode::SkillOffer => "AI tools: y install · n not here · Esc ask next time".into(),
             };
             let notice = self.model.notices.last().map_or("", String::as_str);
             let notice_style = if self.color_enabled {
@@ -1119,6 +1199,7 @@ impl App {
                 .block(Block::default().borders(Borders::ALL)), areas[3]);
 
             self.draw_ets_import_overlay(frame);
+            self.draw_skill_offer_overlay(frame);
         })?;
         Ok(())
     }
@@ -1343,6 +1424,9 @@ pub fn run(
     interface::ensure_database(&database).map_err(io::Error::other)?;
     let mut app =
         App::new(database, fixed_database, selected_endpoint).map_err(io::Error::other)?;
+    app.offer_skill(devknx::agent_skill::Offer::for_this_user(
+        &<crate::Cli as clap::CommandFactory>::command(),
+    ));
     install_panic_hook();
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -1371,6 +1455,36 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode) -> bool {
         app.key(crossterm::event::KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// The agent skill is offered at start when there is a place to offer;
+    /// `y` installs, `n` is remembered.
+    #[test]
+    fn the_skill_offer_installs_or_is_remembered() {
+        use devknx::agent_skill::{Offer, sandbox_agent};
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("capture.sqlite");
+        drop(CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap());
+        let cli = <crate::Cli as clap::CommandFactory>::command();
+        let skills = directory.path().join("skills");
+
+        let mut app = App::new(database.clone(), true, None).unwrap();
+        app.offer_skill(None);
+        assert_eq!(app.mode, Mode::Normal);
+        app.offer_skill(Offer::for_agent(sandbox_agent(&cli, &skills, &[".claude"])));
+        assert_eq!(app.mode, Mode::SkillOffer);
+        assert!(!press(&mut app, KeyCode::Char('y')));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(skills.join("home/.claude/skills/devknx/SKILL.md").exists());
+
+        let mut app = App::new(database, true, None).unwrap();
+        app.offer_skill(Offer::for_agent(sandbox_agent(&cli, &skills, &[".codex"])));
+        assert_eq!(app.mode, Mode::SkillOffer);
+        assert!(!press(&mut app, KeyCode::Char('n')));
+        assert!(
+            Offer::for_agent(sandbox_agent(&cli, &skills, &[])).is_none(),
+            "the no was not remembered"
+        );
     }
 
     fn preview_for(database: PathBuf, file: PathBuf) -> crate::ets_import::EtsImportPreview {

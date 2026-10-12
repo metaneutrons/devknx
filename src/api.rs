@@ -1094,8 +1094,12 @@ async fn wait_for_live(
     clippy::too_many_lines,
     reason = "the complete OpenAPI route and schema document is kept in one auditable value"
 )]
-async fn openapi(State(state): State<ApiState>) -> Json<Value> {
-    let mut document = json!({
+/// The `OpenAPI` document before the listener's own settings are applied:
+/// every route and its schemas. The skill devknx installs for AI tools lists
+/// its routes from here, so they match the build.
+#[must_use]
+pub fn openapi_document() -> Value {
+    json!({
         "openapi": "3.1.0",
         "info": { "title": "devknx REST API", "version": env!("CARGO_PKG_VERSION"), "description": "The daemon-managed listener starts without a KNX session. GET/POST/DELETE /v1/sessions control explicit endpoints. Data requests require an endpoint unless a listener default was selected. Bearer authentication is required when a token is configured and always for non-loopback bindings. Remote typed writes additionally require explicit enablement. Raw writes are not exposed." },
         "paths": {
@@ -1216,7 +1220,32 @@ async fn openapi(State(state): State<ApiState>) -> Json<Value> {
                 } } } } }
             }
         }
-    });
+    })
+}
+
+/// Every route with its methods, from the `OpenAPI` document.
+#[must_use]
+pub fn routes() -> Vec<(String, Vec<String>)> {
+    let document = openapi_document();
+    document["paths"]
+        .as_object()
+        .map(|paths| {
+            paths
+                .iter()
+                .map(|(path, item)| {
+                    let methods = item
+                        .as_object()
+                        .map(|ops| ops.keys().map(|method| method.to_uppercase()).collect())
+                        .unwrap_or_default();
+                    (path.clone(), methods)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn openapi(State(state): State<ApiState>) -> Json<Value> {
+    let mut document = openapi_document();
     if let Some(paths) = document.get_mut("paths").and_then(Value::as_object_mut) {
         for path in [
             "/v1/captures",

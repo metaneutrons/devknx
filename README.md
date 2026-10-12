@@ -295,6 +295,31 @@ responses. No real router loss report has been observed in the qualification
 window; parser and integration tests exercise the diagnostic path. See the
 [M2 evidence and limits](https://github.com/metaneutrons/devknx/issues/5).
 
+### The agent skill
+
+AI coding tools work better with devknx when they know it is there and how to
+use it safely. devknx ships an [Agent Skill](https://agentskills.io/specification)
+for that: when to reach for devknx, how to find gateways, follow captures and
+look up group addresses, and that every write needs the user's explicit
+agreement after a preview. Its references list every command, MCP tool and REST
+route, generated from the binary that installs it.
+
+```sh
+devknx skill                  # where it is, and what devknx would do
+devknx skill --install        # install where it is missing, after asking
+devknx skill --decline        # stop offering it
+devknx skill --remove         # take out the copies devknx installed
+```
+
+It goes only into the skills folders of AI tools found on the machine, such as
+`~/.claude/skills` for Claude Code and `~/.agents/skills`, which Codex, Gemini
+CLI and GitHub Copilot read. The GUI and the TUI ask once when they start and
+find such a place nobody decided on: install, not here, or ask next time. A
+place you declined is not offered again, while a tool installed later is asked
+about on its own. A copy devknx installed and nobody changed is brought up to
+the running version whenever the GUI, the TUI, the daemon or the MCP server
+starts; one you edited is left alone.
+
 ## Storage and operation safety
 
 `connect` and `monitor` create a versioned SQLite capture store for the selected

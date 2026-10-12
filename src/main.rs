@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Fabian Schmieder
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory as _, Parser, Subcommand, ValueEnum};
 use devknx::api::{self, ApiConfig};
 use devknx::capture::{CaptureEvent, RoutingLossEvent};
 use devknx::control::{ControlClient, ControlRequest, ControlResponse};
@@ -320,6 +320,26 @@ enum Command {
         #[arg(long, default_value_t = NonZeroU32::new(100).expect("nonzero"))]
         limit: NonZeroU32,
     },
+    /// Show or change the agent skill that teaches AI tools to use devknx.
+    ///
+    /// Without a flag it shows, for every skills folder of an AI tool found on
+    /// this machine, whether the skill is there and what devknx would do.
+    /// Nothing is installed without your consent. A copy devknx installed and
+    /// nobody changed is kept up to date without asking.
+    Skill {
+        /// Install where it is missing, after asking (at once with --yes)
+        #[arg(long, conflicts_with_all = ["remove", "decline"])]
+        install: bool,
+        /// Remove the copies devknx installed and nobody changed
+        #[arg(long, conflicts_with = "decline")]
+        remove: bool,
+        /// Stop offering it where it is missing
+        #[arg(long)]
+        decline: bool,
+        /// Install without asking
+        #[arg(long, requires = "install")]
+        yes: bool,
+    },
     /// Open the native desktop application.
     #[cfg(feature = "gui")]
     Gui {
@@ -353,6 +373,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         cli.color.unwrap_or_default()
     });
+    if runs_for_a_while(cli.command.as_ref()) {
+        devknx::agent_skill::update_in_background(&Cli::command());
+    }
     match cli.command {
         Some(Command::Discover) => {
             let gateways = discovery::discover(Ipv4Addr::UNSPECIFIED).await?;
@@ -758,6 +781,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let database = resolve_capture_selector(selector)?;
             tui::run(database, fixed_database, endpoint.as_deref())?;
         }
+        Some(Command::Skill {
+            install,
+            remove,
+            decline,
+            yes,
+        }) => run_skill(if remove {
+            SkillRequest::Remove
+        } else if decline {
+            SkillRequest::Decline
+        } else if install {
+            SkillRequest::Install { ask: !yes }
+        } else {
+            SkillRequest::Status
+        })?,
         #[cfg(feature = "gui")]
         None => gui::run(None, false, false)?,
         #[cfg(not(feature = "gui"))]
@@ -849,6 +886,115 @@ async fn wait_connected(database: &std::path::Path) -> io::Result<()> {
             "KNX session did not connect within 15 seconds",
         )
     })?
+}
+
+/// Whether the command starts something that runs for a while: the window,
+/// the terminal monitor, the daemon or the MCP server. Those keep the agent
+/// skill up to date; a one-shot command does not.
+const fn runs_for_a_while(command: Option<&Command>) -> bool {
+    match command {
+        None | Some(Command::Mcp { .. }) => true,
+        Some(Command::Daemon { status, stop }) => !*status && !*stop,
+        #[cfg(feature = "gui")]
+        Some(Command::Gui { .. }) => true,
+        #[cfg(feature = "tui")]
+        Some(Command::Tui { .. }) => true,
+        _ => false,
+    }
+}
+
+/// What `devknx skill` was asked to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SkillRequest {
+    Status,
+    Install { ask: bool },
+    Decline,
+    Remove,
+}
+
+/// `devknx skill`: the agent skill's state, or install, decline or remove it.
+fn run_skill(request: SkillRequest) -> Result<(), Box<dyn std::error::Error>> {
+    use devknx::agent_skill::{NAME, describe, installable, outcome, undecided};
+    use std::io::IsTerminal as _;
+
+    let agent = devknx::agent_skill::agent(&Cli::command())?;
+    match request {
+        SkillRequest::Status => {
+            let assessment = agent.status()?;
+            println!("Agent skill {NAME} {}", env!("CARGO_PKG_VERSION"));
+            if assessment.steps.is_empty() {
+                println!("No AI tool with a skills folder was found.");
+            }
+            for step in &assessment.steps {
+                println!("{}", describe(step, agent.catalog()));
+            }
+            for unserved in &assessment.plan.unserved {
+                println!(
+                    "{} is installed but cannot be reached: {}",
+                    unserved.tool, unserved.reason
+                );
+            }
+            if !undecided(&assessment).is_empty() {
+                println!("\n`devknx skill --install` installs it, `--decline` stops offering it.");
+            }
+        }
+        SkillRequest::Install { ask } => {
+            let assessment = agent.status()?;
+            let steps = installable(&assessment);
+            if !steps.is_empty() {
+                println!("The devknx skill would be installed into:");
+                for step in steps {
+                    println!("  {}", describe(step, agent.catalog()));
+                }
+                if ask {
+                    if !io::stdin().is_terminal() {
+                        return Err(
+                            "not installed: add --yes to install without being asked".into()
+                        );
+                    }
+                    print!("Install it there? [y/N] ");
+                    io::stdout().flush()?;
+                    let mut answer = String::new();
+                    io::stdin().read_line(&mut answer)?;
+                    if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                        println!("Not installed.");
+                        return Ok(());
+                    }
+                }
+            }
+            // Also brings copies devknx installed earlier up to date.
+            let outcomes = agent.install_everywhere()?;
+            if outcomes.is_empty() {
+                println!("Nothing to install: it is everywhere it can go.");
+            }
+            for done in &outcomes {
+                println!("{}", outcome(done));
+            }
+        }
+        SkillRequest::Decline => {
+            let places = match agent.offer()? {
+                Some(offer) => {
+                    let places = offer.steps().len();
+                    offer.decline()?;
+                    places
+                }
+                None => 0,
+            };
+            println!(
+                "Not offered again for {places} place(s). `devknx skill --install` still installs there."
+            );
+        }
+        SkillRequest::Remove => {
+            let outcomes = agent.remove()?;
+            if outcomes.is_empty() {
+                println!("No copy of the skill to remove.");
+            }
+            for done in &outcomes {
+                println!("{}", outcome(done));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn print_control_response(response: &ControlResponse) -> Result<(), Box<dyn std::error::Error>> {
@@ -1094,6 +1240,118 @@ mod tests {
     use knx_rs_core::types::Priority;
 
     use super::*;
+
+    /// The skill is valid under the specification as this build makes it.
+    #[test]
+    fn the_agent_skill_is_valid() {
+        let skill = devknx::agent_skill::skill(&Cli::command()).expect("a valid skill");
+        assert_eq!(skill.name(), devknx::agent_skill::NAME);
+    }
+
+    /// Every command of the binary is in the skill's reference, with its
+    /// options.
+    #[test]
+    fn every_command_is_in_the_skill_reference() {
+        fn walk(cmd: &clap::Command, parent: &str, text: &str) {
+            for sub in cmd.get_subcommands().filter(|sub| !sub.is_hide_set()) {
+                let path = format!("{parent} {}", sub.get_name());
+                assert!(text.contains(&format!("## {path}\n")), "{path} is missing");
+                for arg in sub
+                    .get_arguments()
+                    .filter(|a| !a.is_global_set() && !a.is_hide_set())
+                {
+                    if let Some(long) = arg.get_long()
+                        && !matches!(long, "help" | "version")
+                    {
+                        assert!(text.contains(&format!("--{long}")), "{path} --{long}");
+                    }
+                }
+                walk(sub, &path, text);
+            }
+        }
+        let text = devknx::agent_skill::cli_reference(&Cli::command());
+        walk(&Cli::command(), "devknx", &text);
+    }
+
+    /// Every MCP tool and every REST route is in the reference, and every
+    /// tool carries the prefix the guidance tells the agent to look for.
+    #[test]
+    fn every_tool_and_route_is_in_the_skill_reference() {
+        let tools = devknx::mcp::McpServer::tools().list_all();
+        assert!(!tools.is_empty());
+        let text = devknx::agent_skill::mcp_reference();
+        for tool in tools {
+            assert!(
+                text.contains(&format!("## {}\n", tool.name)),
+                "{}",
+                tool.name
+            );
+            assert!(tool.name.starts_with("knx_"), "{}", tool.name);
+        }
+        let routes = devknx::api::routes();
+        assert!(routes.len() >= 10, "{routes:?}");
+        let text = devknx::agent_skill::http_reference();
+        for (path, _) in routes {
+            assert!(text.contains(&format!("`{path}`")), "{path}");
+        }
+    }
+
+    /// The commands and options the guidance names exist.
+    #[test]
+    fn the_skill_guidance_names_real_commands() {
+        let text = devknx::agent_skill::cli_reference(&Cli::command());
+        for needed in [
+            "## devknx discover\n",
+            "## devknx sessions\n",
+            "## devknx connect\n",
+            "## devknx disconnect\n",
+            "## devknx history\n",
+            "## devknx follow\n",
+            "## devknx ets-lookup\n",
+            "## devknx read\n",
+            "## devknx write-preview\n",
+            "## devknx write\n",
+            "## devknx write-raw\n",
+            "## devknx ets-import\n",
+            "--endpoint",
+            "--after",
+            "--limit",
+            "--filter",
+        ] {
+            assert!(text.contains(needed), "{needed:?}");
+        }
+    }
+
+    /// The agent skill is kept current by what runs for a while, and not by a
+    /// one-shot command.
+    #[test]
+    fn long_running_commands_update_the_skill() {
+        let runs = |args: &[&str]| {
+            let cli = Cli::try_parse_from(args).expect("parse");
+            runs_for_a_while(cli.command.as_ref())
+        };
+        assert!(runs(&["devknx"]));
+        assert!(runs(&["devknx", "daemon"]));
+        assert!(runs(&[
+            "devknx",
+            "mcp",
+            "--endpoint",
+            "tunnel://192.0.2.1:3671"
+        ]));
+        assert!(!runs(&["devknx", "daemon", "--status"]));
+        assert!(!runs(&["devknx", "daemon", "--stop"]));
+        assert!(!runs(&["devknx", "sessions"]));
+        assert!(!runs(&["devknx", "skill"]));
+        #[cfg(feature = "gui")]
+        assert!(runs(&["devknx", "gui"]));
+        #[cfg(feature = "tui")]
+        assert!(runs(&[
+            "devknx",
+            "tui",
+            "--endpoint",
+            "tunnel://192.0.2.1:3671"
+        ]));
+    }
 
     #[test]
     fn global_color_options_parse_and_conflict() {

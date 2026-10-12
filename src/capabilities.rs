@@ -29,6 +29,9 @@ pub enum Capability {
     GroupRead,
     OperationAudit,
     ColorDisplay,
+    /// Show, install, decline or remove the agent skill for AI tools; the
+    /// monitors offer it once.
+    AgentSkill,
 }
 
 /// All tracked application operations.
@@ -55,6 +58,7 @@ pub const ALL: &[Capability] = &[
     Capability::GroupRead,
     Capability::OperationAudit,
     Capability::ColorDisplay,
+    Capability::AgentSkill,
 ];
 
 /// Human-facing adapter.
@@ -162,6 +166,10 @@ pub const CLI: &[Declaration] = &[
         capability: Capability::OperationAudit,
         source_anchor: "Some(Command::Audit {",
     },
+    Declaration {
+        capability: Capability::AgentSkill,
+        source_anchor: "Some(Command::Skill {",
+    },
 ];
 
 /// Terminal control anchors in `src/tui.rs`.
@@ -230,6 +238,10 @@ pub const TUI: &[Declaration] = &[
         capability: Capability::GroupRead,
         source_anchor: "interface::read_request",
     },
+    Declaration {
+        capability: Capability::AgentSkill,
+        source_anchor: "Mode::SkillOffer",
+    },
 ];
 
 /// Desktop control anchors in `src/gui.rs`.
@@ -297,6 +309,10 @@ pub const GUI: &[Declaration] = &[
     Declaration {
         capability: Capability::GroupRead,
         source_anchor: "interface::read_request",
+    },
+    Declaration {
+        capability: Capability::AgentSkill,
+        source_anchor: "fn skill_offer_window",
     },
 ];
 

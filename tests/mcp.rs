@@ -185,11 +185,13 @@ async fn stdio_can_connect_and_disconnect_before_the_capture_database_exists() {
     } }),
     )
     .await;
+    let sessions = receive(&mut lines, 2).await;
     assert!(
-        receive(&mut lines, 2).await["result"]["structuredContent"]["sessions"]
+        sessions["result"]["structuredContent"]["sessions"]
             .as_array()
             .unwrap()
-            .is_empty()
+            .is_empty(),
+        "{sessions}"
     );
 
     send(

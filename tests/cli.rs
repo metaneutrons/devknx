@@ -893,7 +893,7 @@ fn history_and_export_read_the_same_committed_frame() {
     assert!(String::from_utf8_lossy(&filtered.stdout).contains("id=1"));
     let absent = devknx(&["history", "--database", path, "--filter", "kitchen"]);
     assert!(absent.status.success());
-    assert!(absent.stdout.is_empty());
+    assert_eq!(absent.stdout, [] as [u8; 0]);
 
     let export = devknx(&["export", "--database", path]);
     assert!(export.status.success());
@@ -903,7 +903,7 @@ fn history_and_export_read_the_same_committed_frame() {
 
     let empty = devknx(&["history", "--database", path, "--after", "1"]);
     assert!(empty.status.success());
-    assert!(empty.stdout.is_empty());
+    assert_eq!(empty.stdout, [] as [u8; 0]);
 }
 
 #[test]
@@ -948,11 +948,13 @@ fn router_loss_history_is_separate_and_survives_backup() {
             ..
         }
     ));
-    assert!(devknx(&["history", "--database", path]).stdout.is_empty());
-    assert!(
-        devknx(&["router-losses", "--database", path, "--after", "1"])
-            .stdout
-            .is_empty()
+    assert_eq!(
+        devknx(&["history", "--database", path]).stdout,
+        [] as [u8; 0]
+    );
+    assert_eq!(
+        devknx(&["router-losses", "--database", path, "--after", "1"]).stdout,
+        [] as [u8; 0]
     );
     let backup = devknx(&[
         "backup",
@@ -1047,10 +1049,9 @@ async fn router_report_flows_through_service_ipc_and_history() {
         assert!(history.status.success(), "{:?}", history.stderr);
         let stored: IpcMessage = serde_json::from_slice(history.stdout.trim_ascii()).unwrap();
         assert_eq!(stored, live);
-        assert!(
-            devknx(&["history", "--database", database])
-                .stdout
-                .is_empty()
+        assert_eq!(
+            devknx(&["history", "--database", database]).stdout,
+            [] as [u8; 0]
         );
     })
     .await

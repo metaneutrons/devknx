@@ -639,8 +639,9 @@ mod tests {
         assert_eq!(group.notation, "1/2/3");
         assert_eq!(group.name, "Ceiling; east");
         assert_eq!(group.hierarchy, ["Lighting", "Ground floor"]);
-        assert!(group.description.is_empty());
-        assert!(group.dpts.is_empty()); // ETS four-column 3/1 has no DPT column.
+        assert!(group.description.is_empty(), "{:?}", group.description);
+        // ETS four-column 3/1 has no DPT column.
+        assert!(group.dpts.is_empty(), "{:?}", group.dpts);
     }
 
     #[test]

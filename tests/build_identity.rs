@@ -52,10 +52,7 @@ impl Sandbox {
     }
 
     fn run(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
-        let output = self
-            .command(args, env)
-            .output()
-            .expect("run isolated devknx CLI");
+        let output = self.run_unchecked(args, env);
         assert!(
             output.status.success(),
             "devknx {}: {}",
@@ -63,6 +60,42 @@ impl Sandbox {
             String::from_utf8_lossy(&output.stderr)
         );
         output
+    }
+
+    /// Run a command and give up on it after a minute. Its output goes to
+    /// files, not pipes: a daemon it starts may outlive it and would keep a
+    /// pipe open, so reading to the end would wait for the daemon, not the
+    /// command.
+    fn run_unchecked(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+        let out = tempfile::tempfile().expect("a file for stdout");
+        let err = tempfile::tempfile().expect("a file for stderr");
+        let mut child = self
+            .command(args, env)
+            .stdout(out.try_clone().unwrap())
+            .stderr(err.try_clone().unwrap())
+            .spawn()
+            .expect("run isolated devknx CLI");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "devknx {} did not finish in a minute; stderr so far: {}",
+                    args.join(" "),
+                    read_all(err)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        Output {
+            status,
+            stdout: read_all(out).into_bytes(),
+            stderr: read_all(err).into_bytes(),
+        }
     }
 
     /// A foreground daemon claiming another build, ready to answer.
@@ -92,8 +125,21 @@ impl Sandbox {
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
-        let _ = self.command(&["daemon", "--stop"], &[]).output();
+        let _ = self
+            .command(&["daemon", "--stop"], &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
+}
+
+fn read_all(mut file: std::fs::File) -> String {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    let mut text = String::new();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    file.read_to_string(&mut text).unwrap();
+    text
 }
 
 fn json(output: &Output) -> Value {

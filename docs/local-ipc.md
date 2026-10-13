@@ -20,7 +20,9 @@ sessions and the leases held. `ping`, `identify`, `get_lifecycle` and
 `renew_lease` do not count as activity. Once the daemon decides to stop, it
 removes its endpoint (Unix) and answers every request still on its way with
 `stopping`, without acting on it; a client then starts a new daemon and sends
-the request again. That daemon waits for the old one to give up the endpoint. Connect identifies a canonical endpoint and optional database
+the request again. That daemon waits for the old one to give up the endpoint. A request that
+reaches the daemon after its control loop has ended is answered `stopping`
+too. Connect identifies a canonical endpoint and optional database
 override. Disconnect identifies one endpoint; `disconnect_scoped` atomically
 selects the session by capture database. Stop ends all sessions and the daemon.
 REST status omits its bearer token. CLI offline commands and status queries do

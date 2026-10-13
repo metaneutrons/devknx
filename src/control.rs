@@ -526,15 +526,9 @@ where
     .await
     {
         Ok(Ok(())) => {}
-        Ok(Err(_)) => {
-            return write_frame(
-                &mut stream,
-                &ControlResponse::Error {
-                    reason: "daemon control loop stopped".to_owned(),
-                },
-            )
-            .await;
-        }
+        // The control loop is gone: the daemon stopped, and did not act on
+        // the request. Saying so lets the client send it to a new daemon.
+        Ok(Err(_)) => return write_frame(&mut stream, &ControlResponse::Stopping).await,
         Err(_) => {
             return write_frame(
                 &mut stream,
@@ -547,9 +541,9 @@ where
     }
     let response = match tokio::time::timeout(IO_TIMEOUT, response_rx).await {
         Ok(Ok(response)) => response,
-        Ok(Err(_)) => ControlResponse::Error {
-            reason: "daemon did not return a control response".to_owned(),
-        },
+        // The loop dropped the request without answering it, as it does when
+        // it ends: the daemon is stopping and did not act on it.
+        Ok(Err(_)) => ControlResponse::Stopping,
         Err(_) => ControlResponse::Error {
             reason: "daemon control response timed out".to_owned(),
         },
@@ -914,6 +908,58 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        transport.await.unwrap().unwrap();
+    }
+
+    /// A request that reaches a connection after the daemon's control loop has
+    /// ended is answered `Stopping`, not with an error that looks like a
+    /// failure of the request.
+    #[tokio::test]
+    async fn a_request_after_the_control_loop_ended_is_answered_stopping() {
+        // The loop is gone before the request arrives.
+        let (mut client, stream) = tokio::io::duplex(4096);
+        let (calls_tx, calls_rx) = mpsc::channel(1);
+        drop(calls_rx);
+        let transport = tokio::spawn(handle_client(stream, calls_tx));
+        client
+            .write_all(&encode_frame(&ControlRequest::Ping).unwrap())
+            .await
+            .unwrap();
+        let answer: ControlResponse =
+            serde_json::from_slice(&read_frame(&mut client).await.unwrap()).unwrap();
+        assert_eq!(answer, ControlResponse::Stopping);
+        transport.await.unwrap().unwrap();
+
+        // The loop took the request and ended without answering it.
+        let (mut client, stream) = tokio::io::duplex(4096);
+        let (calls_tx, mut calls_rx) = mpsc::channel(1);
+        let transport = tokio::spawn(handle_client(stream, calls_tx));
+        client
+            .write_all(&encode_frame(&ControlRequest::Ping).unwrap())
+            .await
+            .unwrap();
+        drop(calls_rx.recv().await.unwrap());
+        let answer: ControlResponse =
+            serde_json::from_slice(&read_frame(&mut client).await.unwrap()).unwrap();
+        assert_eq!(answer, ControlResponse::Stopping);
+        transport.await.unwrap().unwrap();
+
+        // Counter-probe: a request the daemon answers is not turned into one.
+        let (mut client, stream) = tokio::io::duplex(4096);
+        let (calls_tx, mut calls_rx) = mpsc::channel(1);
+        let transport = tokio::spawn(handle_client(stream, calls_tx));
+        client
+            .write_all(&encode_frame(&ControlRequest::Ping).unwrap())
+            .await
+            .unwrap();
+        let call = calls_rx.recv().await.unwrap();
+        call.into_request_and_reply()
+            .1
+            .respond(ControlResponse::Pong)
+            .await;
+        let answer: ControlResponse =
+            serde_json::from_slice(&read_frame(&mut client).await.unwrap()).unwrap();
+        assert_eq!(answer, ControlResponse::Pong);
         transport.await.unwrap().unwrap();
     }
 

@@ -611,12 +611,18 @@ fn daemon_unavailable(error: &io::Error) -> bool {
 /// Only the daemon that owns the endpoint calls this, while it still holds
 /// the owner lock, so no other daemon can have bound the path yet. On
 /// Windows the pipe goes when its listener does.
+#[cfg(unix)]
 pub fn release_endpoint() {
-    #[cfg(unix)]
     if let Ok(path) = socket_path(false) {
         let _ = std::fs::remove_file(path);
     }
 }
+
+/// Remove the control endpoint so a late client's connect fails at once.
+///
+/// Nothing to do on Windows: the pipe goes when its listener does.
+#[cfg(windows)]
+pub const fn release_endpoint() {}
 
 fn spawn_daemon() -> io::Result<()> {
     use std::process::{Command, Stdio};

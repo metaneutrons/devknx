@@ -89,6 +89,30 @@ pub enum ControlRequest {
     Stop,
 }
 
+impl ControlRequest {
+    /// Whether sending the request twice does what sending it once does.
+    ///
+    /// Connecting an endpoint that is connected answers with its session, and
+    /// the others only read or set an absolute value. Disconnecting is not on
+    /// the list: its second answer would be an error for the session the first
+    /// one removed.
+    #[must_use]
+    pub const fn is_repeatable(&self) -> bool {
+        matches!(
+            self,
+            Self::Ping
+                | Self::Identify
+                | Self::List
+                | Self::Connect { .. }
+                | Self::RestStatus
+                | Self::RenewLease { .. }
+                | Self::ReleaseLease { .. }
+                | Self::SetIdleTimeout { .. }
+                | Self::GetLifecycle
+        )
+    }
+}
+
 /// Result returned by the daemon for one control request.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
@@ -249,14 +273,19 @@ impl ControlClient {
         // A daemon can stop between the check and the request, through its
         // idle stop. It then refuses the connection or answers `Stopping`;
         // either way it did not act on the request, so starting a new daemon
-        // and sending once more is safe whatever the request does. Any other
-        // failure is returned as it is: the daemon may have acted on it.
+        // and sending once more is safe whatever the request does. A daemon
+        // that is already going away can also close a connection it accepted
+        // without an answer, which Windows reports as an unexpected end of the
+        // stream. The request may have been carried out then, so it is sent
+        // again only when sending it twice does no harm. Any other failure is
+        // returned as it is: the daemon may have acted on it.
         let deadline = Instant::now() + DAEMON_START_TIMEOUT;
         loop {
             Self::ensure_daemon().await?;
             match Self::request_existing(request.clone()).await {
                 Ok(ControlResponse::Stopping) => {}
                 Err(error) if daemon_unavailable(&error) => {}
+                Err(error) if request.is_repeatable() && ended_without_answer(&error) => {}
                 other => return other,
             }
             if Instant::now() >= deadline {
@@ -597,6 +626,17 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
+/// Whether the connection ended before an answer came.
+fn ended_without_answer(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+    )
+}
+
 fn daemon_unavailable(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -811,6 +851,35 @@ fn bind_windows(name: &str) -> io::Result<Listener> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_requests_that_do_no_harm_twice_are_repeated() {
+        assert!(
+            ControlRequest::Connect {
+                endpoint: "tunnel://127.0.0.1:3671".into(),
+                database: None,
+                max_events: 1,
+            }
+            .is_repeatable()
+        );
+        assert!(ControlRequest::List.is_repeatable());
+        // Counter-probes: a second disconnect, REST change or stop is not the
+        // same as the first.
+        assert!(
+            !ControlRequest::Disconnect {
+                endpoint: "tunnel://127.0.0.1:3671".into(),
+            }
+            .is_repeatable()
+        );
+        assert!(!ControlRequest::RestDisable.is_repeatable());
+        assert!(!ControlRequest::Stop.is_repeatable());
+        assert!(ended_without_answer(&io::Error::from(
+            io::ErrorKind::UnexpectedEof
+        )));
+        assert!(!ended_without_answer(&io::Error::from(
+            io::ErrorKind::TimedOut
+        )));
+    }
 
     #[tokio::test]
     async fn stop_reply_waits_for_the_complete_transport_frame() {

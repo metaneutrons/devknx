@@ -326,7 +326,11 @@ build. When they differ, a CLI command that uses the daemon prints one line on
 stderr, so stdout stays clean JSON. The window marks it in the bottom bar, the
 terminal monitor in its title bar, and the MCP server adds the warning to its
 next tool result, where the AI tool can pass it on. A daemon too old to
-identify itself counts as another build.
+identify itself counts as another build. A build without git, as from a source
+archive, has no commit; client and daemon are then the same build when they
+share the version and the moment they were built, and a daemon of the same
+version built at another moment is reported as one it cannot tell from this
+build.
 
 Nothing restarts the daemon on its own, because a restart interrupts the
 captures. `devknx daemon --restart` stops it, starts one from the calling

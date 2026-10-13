@@ -83,7 +83,8 @@ pub enum Mismatch {
     Different,
     /// The same commit, but one side was built from a modified tree.
     Modified,
-    /// The same version, and one side's commit is unknown.
+    /// The same version, and a commit unknown on one side, or on both with
+    /// builds of different moments.
     CannotTell,
 }
 
@@ -104,6 +105,10 @@ pub fn compare(client: &BuildIdentity, daemon: &BuildIdentity) -> Option<Mismatc
             _ => Some(Mismatch::Modified),
         },
         _ if client.version != daemon.version => Some(Mismatch::Different),
+        // No git on either side, as in a build from a source archive: the
+        // build stamp says whether it is the same binary, which it is for a
+        // client and the daemon the same installation started.
+        (None, None) if client.stamp == daemon.stamp => None,
         _ => Some(Mismatch::CannotTell),
     }
 }
@@ -227,6 +232,16 @@ mod tests {
             compare(&release, &build("0.2.7", None, None, "/x")),
             Some(Mismatch::CannotTell)
         );
+        // No commit on either side, the same version and the same build
+        // stamp: the same binary, as for a package built from a source
+        // archive. The counter-probe is another stamp, which cannot be told.
+        let archive = build("0.2.7", None, None, "/usr/bin/devknx");
+        assert_eq!(compare(&archive, &archive.clone()), None);
+        let rebuilt = BuildIdentity {
+            stamp: "2".to_string(),
+            ..archive.clone()
+        };
+        assert_eq!(compare(&rebuilt, &archive), Some(Mismatch::CannotTell));
         // A commit unknown, another version: different.
         assert_eq!(
             compare(&release, &build("0.2.6", None, None, "/x")),

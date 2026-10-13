@@ -321,7 +321,10 @@ impl ControlClient {
             // A stopping daemon gives up the endpoint; the new one waits for it.
             Ok(ControlResponse::Stopping) => {}
             Ok(_) => return Err(invalid_data("daemon returned an unexpected Ping response")),
-            Err(error) if daemon_unavailable(&error) => {}
+            // A ping can be sent again, so a connection that ended without an
+            // answer, as one does when the daemon is going away, is no
+            // different from no daemon.
+            Err(error) if daemon_unavailable(&error) || ended_without_answer(&error) => {}
             Err(error) => return Err(error),
         }
 
@@ -334,7 +337,7 @@ impl ControlClient {
                 Ok(_) => {
                     return Err(invalid_data("daemon returned an unexpected Ping response"));
                 }
-                Err(error) if daemon_unavailable(&error) => {}
+                Err(error) if daemon_unavailable(&error) || ended_without_answer(&error) => {}
                 Err(error) => return Err(error),
             }
             if Instant::now() >= deadline {

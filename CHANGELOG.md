@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.0](https://github.com/metaneutrons/devknx/compare/v0.2.0...v0.3.0) (2026-10-13)
+
+
+### Features
+
+* **daemon:** stop by itself when idle ([#72](https://github.com/metaneutrons/devknx/issues/72)) ([65b6fbf](https://github.com/metaneutrons/devknx/commit/65b6fbf931e0a16c3f8165c1d60ccdcac94ac990))
+* **daemon:** warn when the daemon is another build ([#70](https://github.com/metaneutrons/devknx/issues/70)) ([40c5384](https://github.com/metaneutrons/devknx/commit/40c5384b28c3b33a64b91eadf86a6cc8483ab99f))
+* **gui:** ask about the daemon when quitting ([#73](https://github.com/metaneutrons/devknx/issues/73)) ([aa5cc78](https://github.com/metaneutrons/devknx/commit/aa5cc789c17146bcc81822641966dd4862ff58c5))
+
+
+### Bug Fixes
+
+* **daemon:** start a daemon when the first ping ends without an answer ([#74](https://github.com/metaneutrons/devknx/issues/74)) ([5fb638a](https://github.com/metaneutrons/devknx/commit/5fb638a5497bb9e688c5d2c69e9fc5243721477b))
+
 ## [0.2.0](https://github.com/metaneutrons/devknx/compare/v0.1.0...v0.2.0) (2026-10-12)
 
 

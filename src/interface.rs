@@ -578,6 +578,183 @@ pub fn disconnect_owner(database: &Path) -> Result<String, String> {
     }
 }
 
+/// What the daemon holds, as the quit question shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DaemonView {
+    pub sessions: Vec<devknx::control::SessionInfo>,
+    pub leases: Vec<devknx::lifecycle::LeaseKind>,
+    pub rest: RestStatus,
+}
+
+impl DaemonView {
+    /// What stopping the daemon would end, one line each, seen from a client
+    /// of kind `own`, whose own lease is not counted.
+    #[must_use]
+    pub fn what_stopping_ends(&self, own: devknx::lifecycle::LeaseKind) -> Vec<String> {
+        let mut lines = Vec::new();
+        if self.sessions.is_empty() {
+            lines.push("No KNX session is configured.".to_owned());
+        }
+        for session in &self.sessions {
+            lines.push(format!("{} stops capturing.", session.endpoint));
+        }
+        let mut others = self.leases.clone();
+        if let Some(index) = others.iter().position(|kind| *kind == own) {
+            others.remove(index);
+        }
+        if !others.is_empty() {
+            let names: Vec<String> = others.iter().map(ToString::to_string).collect();
+            lines.push(format!("Also attached: {}.", names.join(", ")));
+        }
+        if self.rest.enabled {
+            match self.rest.bind {
+                Some(bind) => lines.push(format!("The REST listener on {bind} goes away.")),
+                None => lines.push("The REST listener goes away.".to_owned()),
+            }
+        }
+        lines
+    }
+}
+
+/// What a monitor asks of the daemon when it quits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DaemonRequest {
+    /// What it holds; `None` when no daemon runs.
+    View,
+    /// Stop it.
+    Stop,
+}
+
+/// Talks to the daemon for the quit question. Tests put a fake in its place,
+/// so they never stop the daemon of the user running them.
+pub type DaemonControl =
+    Arc<dyn Fn(DaemonRequest) -> Result<Option<DaemonView>, String> + Send + Sync>;
+
+/// The daemon of the current user.
+#[must_use]
+#[cfg_attr(test, expect(dead_code, reason = "tests use a fake daemon instead"))]
+pub fn daemon_control() -> DaemonControl {
+    Arc::new(|request| match request {
+        DaemonRequest::View => daemon_view(),
+        DaemonRequest::Stop => match control_request(ControlRequest::Stop) {
+            Ok(ControlResponse::Stopped | ControlResponse::Stopping) => Ok(None),
+            Ok(ControlResponse::Error { reason }) => Err(reason),
+            Ok(_) => Err("the daemon gave an unexpected answer to Stop".to_owned()),
+            Err(error) if daemon_absent(&error) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        },
+    })
+}
+
+#[cfg_attr(test, expect(dead_code, reason = "tests use a fake daemon instead"))]
+fn daemon_view() -> Result<Option<DaemonView>, String> {
+    let sessions = match control_request(ControlRequest::List) {
+        Ok(ControlResponse::Sessions { sessions }) => sessions,
+        Ok(ControlResponse::Stopping) => return Ok(None),
+        Ok(ControlResponse::Error { reason }) => return Err(reason),
+        Ok(_) => return Err("the daemon gave an unexpected answer to List".to_owned()),
+        Err(error) if daemon_absent(&error) => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    // A daemon from before leases does not know the request; it then has
+    // none to report.
+    let leases = match control_request(ControlRequest::GetLifecycle) {
+        Ok(ControlResponse::Lifecycle { state }) => state.leases,
+        _ => Vec::new(),
+    };
+    let rest = rest_status()?;
+    Ok(Some(DaemonView {
+        sessions,
+        leases,
+        rest,
+    }))
+}
+
+#[cfg_attr(test, expect(dead_code, reason = "tests use a fake daemon instead"))]
+fn daemon_absent(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::AddrNotAvailable
+    )
+}
+
+/// What quitting does, decided from the remembered answer and the daemon.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QuitPlan {
+    /// Quit; the daemon stays as it is.
+    Quit,
+    /// Ask first, showing what stopping the daemon would end.
+    Ask(DaemonView),
+}
+
+/// Decide what quitting does. A remembered `stop` stops the daemon here.
+///
+/// With no daemon running there is nothing to ask about. A daemon that cannot
+/// be reached is left alone rather than holding up the quit.
+#[must_use]
+pub fn plan_quit(control: &DaemonControl, settings_file: Option<&Path>) -> QuitPlan {
+    let on_quit = settings_file
+        .and_then(|path| devknx::settings::Settings::load_from(path).ok())
+        .map(|settings| settings.on_quit)
+        .unwrap_or_default();
+    match on_quit {
+        devknx::settings::OnQuit::Keep => QuitPlan::Quit,
+        devknx::settings::OnQuit::Stop => {
+            let _ = control(DaemonRequest::Stop);
+            QuitPlan::Quit
+        }
+        devknx::settings::OnQuit::Ask => match control(DaemonRequest::View) {
+            Ok(Some(view)) => QuitPlan::Ask(view),
+            Ok(None) | Err(_) => QuitPlan::Quit,
+        },
+    }
+}
+
+/// Act on the answer to the quit question, and remember it when asked to.
+///
+/// # Errors
+///
+/// Returns why the answer could not be remembered or the daemon not stopped;
+/// the monitor quits either way.
+pub fn answer_quit(
+    control: &DaemonControl,
+    settings_file: Option<&Path>,
+    stop: bool,
+    remember: bool,
+) -> Result<(), String> {
+    let answer = if stop {
+        devknx::settings::OnQuit::Stop
+    } else {
+        devknx::settings::OnQuit::Keep
+    };
+    let saved = settings_file.filter(|_| remember).map_or(Ok(()), |path| {
+        devknx::settings::Settings::save_on_quit(path, answer)
+    });
+    let stopped = if stop {
+        control(DaemonRequest::Stop).map(|_| ())
+    } else {
+        Ok(())
+    };
+    saved.and(stopped)
+}
+
+/// A fake daemon for tests of the quit question: it answers with `view` and
+/// records what it was asked.
+#[cfg(test)]
+pub fn fake_daemon_control(
+    view: Option<DaemonView>,
+) -> (DaemonControl, Arc<std::sync::Mutex<Vec<DaemonRequest>>>) {
+    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = Arc::clone(&asked);
+    let control: DaemonControl = Arc::new(move |request| {
+        log.lock().unwrap().push(request);
+        Ok(view.clone())
+    });
+    (control, asked)
+}
+
 /// The warning when the running daemon is another build than this window or
 /// terminal monitor, or `None` when it is the same build or none runs.
 #[must_use]

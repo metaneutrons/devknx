@@ -307,6 +307,14 @@ data directory (`~/Library/Application Support/devknx` on macOS,
 daemon while it stops is answered with "stopping" rather than acted on, and
 the client starts a new daemon and sends it again.
 
+Quitting the window (closing it, or `Cmd+Q` and Quit in the Dock on macOS) or
+the terminal monitor (`q`, `Ctrl+C`) asks whether the daemon should stop too,
+and names what that would end: the KNX sessions that stop capturing, other
+attached clients, and a REST listener. The answer can be remembered; it is
+kept as `on_quit` in `settings.json`, as `ask`, `stop` or `keep`, and with
+`stop` or `keep` nobody is asked. Logging out or shutting down the computer
+quits without asking.
+
 ### When the daemon is another build
 
 Every client talks to whatever daemon answers, and that can be another build:

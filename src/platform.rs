@@ -27,6 +27,9 @@ pub enum MenuAction {
     ToggleColor = 256,
     /// Preview and import an ETS group-address export.
     ImportEts = 512,
+    /// Quit the application (Cmd+Q, Quit in the Dock), asking about the
+    /// daemon first as closing the window does.
+    Quit = 1024,
 }
 
 impl MenuAction {
@@ -43,6 +46,7 @@ impl MenuAction {
         Self::ConnectionSettings,
         Self::ToggleColor,
         Self::ImportEts,
+        Self::Quit,
     ];
 }
 
@@ -155,6 +159,7 @@ mod tests {
             (MenuAction::ConnectionSettings, "connectionSettings:"),
             (MenuAction::ToggleColor, "toggleColor:"),
             (MenuAction::ImportEts, "importEts:"),
+            (MenuAction::Quit, "quitApp:"),
         ] {
             assert!(MenuAction::ALL.contains(&action));
             assert!(native.contains(&format!("@selector({selector})")));

@@ -75,6 +75,14 @@ enum Mode {
     EtsImportCommitting,
     /// Offering the agent skill to AI tools found on this computer.
     SkillOffer,
+    /// Asking whether quitting should stop the daemon too.
+    QuitQuestion,
+}
+
+/// The question on quit, with what stopping the daemon would end.
+struct QuitQuestion {
+    view: interface::DaemonView,
+    remember: bool,
 }
 
 #[expect(
@@ -115,6 +123,13 @@ struct App {
     color_enabled: bool,
     /// The agent skill offered at start, until it is answered.
     skill_offer: Option<devknx::agent_skill::Offer>,
+    /// Talks to the daemon when quitting; a fake in tests.
+    daemon: interface::DaemonControl,
+    /// Where the answer to the quit question is remembered.
+    settings_file: Option<PathBuf>,
+    quit_question: Option<QuitQuestion>,
+    /// Said on stderr once the terminal is restored.
+    exit_message: Option<String>,
 }
 
 impl App {
@@ -234,7 +249,88 @@ impl App {
             follow_tail: true,
             color_enabled: color::ui_enabled(),
             skill_offer: None,
+            // Tests never reach the daemon of the user running them.
+            #[cfg(not(test))]
+            daemon: interface::daemon_control(),
+            #[cfg(test)]
+            daemon: interface::fake_daemon_control(None).0,
+            #[cfg(not(test))]
+            settings_file: devknx::settings::Settings::path().ok(),
+            #[cfg(test)]
+            settings_file: None,
+            quit_question: None,
+            exit_message: None,
         })
+    }
+
+    /// Quitting was asked for: quit now, or ask about the daemon first.
+    /// Returns whether to quit now.
+    fn begin_quit(&mut self) -> bool {
+        match interface::plan_quit(&self.daemon, self.settings_file.as_deref()) {
+            interface::QuitPlan::Quit => true,
+            interface::QuitPlan::Ask(view) => {
+                self.quit_question = Some(QuitQuestion {
+                    view,
+                    remember: false,
+                });
+                self.mode = Mode::QuitQuestion;
+                false
+            }
+        }
+    }
+
+    /// Act on the answer; the terminal monitor quits either way.
+    fn answer_quit(&mut self, stop: bool) {
+        let Some(question) = self.quit_question.take() else {
+            return;
+        };
+        if let Err(error) = interface::answer_quit(
+            &self.daemon,
+            self.settings_file.as_deref(),
+            stop,
+            question.remember,
+        ) {
+            self.exit_message = Some(error);
+        }
+    }
+
+    fn draw_quit_overlay(&self, frame: &mut Frame<'_>) {
+        let Some(question) = self
+            .quit_question
+            .as_ref()
+            .filter(|_| self.mode == Mode::QuitQuestion)
+        else {
+            return;
+        };
+        let area = import_overlay_area(frame.area());
+        frame.render_widget(Clear, area);
+        let mut lines = vec![
+            Line::styled(
+                "Stop the daemon too?",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Line::raw(""),
+        ];
+        lines.extend(
+            question
+                .view
+                .what_stopping_ends(devknx::lifecycle::LeaseKind::Tui)
+                .into_iter()
+                .map(|line| Line::raw(format!("  {line}"))),
+        );
+        let remember = if question.remember { "x" } else { " " };
+        lines.extend([
+            Line::raw(""),
+            Line::raw(format!("[{remember}] r  remember my answer")),
+            Line::raw(""),
+            Line::raw("s  stop the daemon    k  leave it running    Esc  cancel"),
+        ]);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .block(Block::default().title(" Quit ").borders(Borders::ALL)),
+            area,
+        );
     }
 
     /// Mark the title bar and say in full, once, which builds differ.
@@ -844,7 +940,8 @@ impl App {
             | Mode::EtsImportPreparing
             | Mode::ConfirmEtsImport
             | Mode::EtsImportCommitting
-            | Mode::SkillOffer => {}
+            | Mode::SkillOffer
+            | Mode::QuitQuestion => {}
         }
     }
 
@@ -857,7 +954,12 @@ impl App {
             return false;
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            return true;
+            // A second Ctrl+C at the question leaves the daemon as it is.
+            if self.mode == Mode::QuitQuestion {
+                self.quit_question = None;
+                return true;
+            }
+            return self.begin_quit();
         }
         if key.code == KeyCode::Esc {
             if matches!(
@@ -872,6 +974,26 @@ impl App {
             } else {
                 self.mode = Mode::Normal;
                 self.input.clear();
+                self.quit_question = None;
+            }
+            return false;
+        }
+        if self.mode == Mode::QuitQuestion {
+            match key.code {
+                KeyCode::Char('s') => {
+                    self.answer_quit(true);
+                    return true;
+                }
+                KeyCode::Char('k') => {
+                    self.answer_quit(false);
+                    return true;
+                }
+                KeyCode::Char('r') => {
+                    if let Some(question) = &mut self.quit_question {
+                        question.remember = !question.remember;
+                    }
+                }
+                _ => {}
             }
             return false;
         }
@@ -1012,7 +1134,7 @@ impl App {
             return false;
         }
         match key.code {
-            KeyCode::Char('q') => return true,
+            KeyCode::Char('q') => return self.begin_quit(),
             KeyCode::Char('c') => {
                 if self.model.owner_available {
                     self.disconnect_connection();
@@ -1196,6 +1318,7 @@ impl App {
                 Mode::ConfirmEtsImport => "Review the ETS import preview".into(),
                 Mode::EtsImportCommitting => "ETS import in progress… input is disabled".into(),
                 Mode::SkillOffer => "AI tools: y install · n not here · Esc ask next time".into(),
+                Mode::QuitQuestion => "Quit: s stop the daemon · k leave it running · r remember · Esc cancel".into(),
             };
             let notice = self.model.notices.last().map_or("", String::as_str);
             let notice_style = if self.color_enabled {
@@ -1212,6 +1335,7 @@ impl App {
 
             self.draw_ets_import_overlay(frame);
             self.draw_skill_offer_overlay(frame);
+            self.draw_quit_overlay(frame);
         })?;
         Ok(())
     }
@@ -1441,18 +1565,23 @@ pub fn run(
         &<crate::Cli as clap::CommandFactory>::command(),
     ));
     install_panic_hook();
-    let _guard = TerminalGuard::enter()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    loop {
-        app.poll();
-        app.draw(&mut terminal)?;
-        if event::poll(Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-            && app.key(key)
-        {
-            break;
+    {
+        let _guard = TerminalGuard::enter()?;
+        let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        loop {
+            app.poll();
+            app.draw(&mut terminal)?;
+            if event::poll(Duration::from_millis(100))?
+                && let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+                && app.key(key)
+            {
+                break;
+            }
         }
+    }
+    if let Some(message) = app.exit_message.take() {
+        eprintln!("{message}");
     }
     Ok(())
 }
@@ -1568,6 +1697,121 @@ mod tests {
         app.submit();
         assert_eq!(app.model.filter, "light");
         app.draw(&mut terminal).unwrap();
+    }
+
+    fn quit_view() -> interface::DaemonView {
+        interface::DaemonView {
+            sessions: vec![devknx::control::SessionInfo {
+                endpoint: "tunnel://192.0.2.1:3671".into(),
+                database: PathBuf::from("capture.sqlite"),
+                max_events: Some(10),
+            }],
+            leases: vec![
+                devknx::lifecycle::LeaseKind::Tui,
+                devknx::lifecycle::LeaseKind::Mcp,
+            ],
+            rest: devknx::control::RestStatus {
+                enabled: true,
+                endpoint: None,
+                bind: Some("127.0.0.1:8765".parse().unwrap()),
+                allow_remote_writes: false,
+            },
+        }
+    }
+
+    fn quit_app(
+        view: Option<interface::DaemonView>,
+    ) -> (
+        App,
+        tempfile::TempDir,
+        std::sync::Arc<std::sync::Mutex<Vec<interface::DaemonRequest>>>,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("capture.sqlite");
+        drop(CaptureStore::open(&database, NonZeroU32::new(10).unwrap()).unwrap());
+        let mut app = App::new(database, true, None).unwrap();
+        let (control, asked) = interface::fake_daemon_control(view);
+        app.daemon = control;
+        app.settings_file = Some(directory.path().join("settings.json"));
+        (app, directory, asked)
+    }
+
+    /// Quitting with a daemon running asks what to do with it, names what
+    /// stopping would end, and stops it on `s`, remembering the answer on
+    /// request.
+    #[test]
+    fn quitting_asks_about_the_daemon_and_stops_it_on_request() {
+        use interface::DaemonRequest::{Stop, View};
+        let (mut app, directory, asked) = quit_app(Some(quit_view()));
+        assert!(
+            !press(&mut app, KeyCode::Char('q')),
+            "asking must not quit yet"
+        );
+        assert_eq!(app.mode, Mode::QuitQuestion);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 32)).unwrap();
+        app.draw(&mut terminal).unwrap();
+        let screen = read_screen(&terminal);
+        assert!(screen.contains("Stop the daemon too?"), "{screen}");
+        assert!(
+            screen.contains("tunnel://192.0.2.1:3671 stops capturing."),
+            "{screen}"
+        );
+        // Its own lease is not "also attached"; the MCP server is.
+        assert!(screen.contains("Also attached: MCP server."), "{screen}");
+        assert!(screen.contains("127.0.0.1:8765 goes away"), "{screen}");
+
+        assert!(!press(&mut app, KeyCode::Char('r')));
+        assert!(press(&mut app, KeyCode::Char('s')));
+        assert_eq!(*asked.lock().unwrap(), vec![View, Stop]);
+        let saved = devknx::settings::Settings::load_from(&directory.path().join("settings.json"));
+        assert_eq!(saved.unwrap().on_quit, devknx::settings::OnQuit::Stop);
+    }
+
+    /// `k` leaves the daemon running, Esc goes back to the monitor, and
+    /// without a daemon there is nothing to ask.
+    #[test]
+    fn quitting_can_leave_the_daemon_or_be_cancelled() {
+        use interface::DaemonRequest::View;
+        let (mut app, _directory, asked) = quit_app(Some(quit_view()));
+        assert!(!press(&mut app, KeyCode::Char('q')));
+        assert!(!press(&mut app, KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.quit_question.is_none());
+        assert!(!press(&mut app, KeyCode::Char('q')));
+        assert!(press(&mut app, KeyCode::Char('k')));
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![View, View],
+            "nothing was stopped"
+        );
+
+        let (mut app, _directory, asked) = quit_app(None);
+        assert!(
+            press(&mut app, KeyCode::Char('q')),
+            "no daemon, nothing to ask"
+        );
+        assert_eq!(*asked.lock().unwrap(), vec![View]);
+    }
+
+    /// A remembered answer is followed without asking.
+    #[test]
+    fn a_remembered_answer_quits_without_asking() {
+        use interface::DaemonRequest::Stop;
+        let (mut app, directory, asked) = quit_app(Some(quit_view()));
+        let path = directory.path().join("settings.json");
+        devknx::settings::Settings::save_on_quit(&path, devknx::settings::OnQuit::Keep).unwrap();
+        assert!(press(&mut app, KeyCode::Char('q')));
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "keep asks the daemon nothing"
+        );
+
+        devknx::settings::Settings::save_on_quit(&path, devknx::settings::OnQuit::Stop).unwrap();
+        assert!(app.key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        assert_eq!(*asked.lock().unwrap(), vec![Stop]);
     }
 
     /// A daemon of another build is marked in the title bar and said in full

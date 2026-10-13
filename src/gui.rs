@@ -76,6 +76,8 @@ pub fn run(
     } else {
         devknx::agent_skill::Offer::for_this_user(&<crate::Cli as clap::CommandFactory>::command())
     };
+    // Held while the window is open, so the daemon does not stop under it.
+    let _lease = devknx::lifecycle::LeaseKeeper::start(devknx::lifecycle::LeaseKind::Gui);
     eframe::run_native(
         "devknx",
         options,

@@ -276,6 +276,37 @@ bounded search and exact-address write opt-in.
 
 `history --after ... --limit ... --filter ...` filters one bounded CLI page.
 
+### When the daemon stops by itself
+
+The daemon stops once it has been idle for its idle period, 15 minutes unless
+set otherwise. Idle means no KNX session is configured, no request arrived,
+and no long-lived client is attached. A configured session holds the daemon
+until it is disconnected, whether or not the gateway currently answers. The
+window, the terminal monitor, an MCP server, `monitor` and `follow` hold it
+while they run, by renewing a lease every minute; a client that ends without
+saying so stops holding it after three minutes. A REST listener alone does not
+hold it. The next command that needs the daemon starts it again.
+
+```sh
+devknx daemon --status                  # running? which build, idle period, what holds it
+devknx daemon --idle-timeout 2h         # run in the foreground with another period
+devknx daemon --set-idle-timeout 30m    # change it on the running daemon until it stops
+devknx daemon --idle-timeout 0          # never stop by itself
+```
+
+The period can also be set for every daemon start in `settings.json` in the
+data directory (`~/Library/Application Support/devknx` on macOS,
+`$XDG_DATA_HOME/devknx` or `~/.local/share/devknx` on Linux,
+`%LOCALAPPDATA%\devknx` on Windows):
+
+```json
+{ "idle_timeout": "1h" }
+```
+
+`--idle-timeout` takes precedence over the file. A request that reaches a
+daemon while it stops is answered with "stopping" rather than acted on, and
+the client starts a new daemon and sends it again.
+
 ### When the daemon is another build
 
 Every client talks to whatever daemon answers, and that can be another build:

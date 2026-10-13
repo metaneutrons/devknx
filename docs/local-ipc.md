@@ -9,7 +9,20 @@ and `stop`. `identify` returns the daemon's build (version, commit, whether
 the tree was modified, a build stamp and the executable path), so a client can
 warn when the daemon is another build; a daemon that predates it answers
 `invalid control request`. `list` reports each session's retention limit as
-`max_events`, so `daemon --restart` can connect it again as it was. Connect identifies a canonical endpoint and optional database
+`max_events`, so `daemon --restart` can connect it again as it was.
+
+`renew_lease` (`client`, `kind`) and `release_lease` (`client`) let a
+long-lived client hold the daemon while no KNX session does; a lease lapses
+three minutes after its last renewal. `set_idle_timeout` (`seconds`, `0` for
+never) changes the idle period until the daemon stops, and `get_lifecycle`
+reports it with its source, the seconds until an idle stop, the number of
+sessions and the leases held. `ping`, `identify`, `get_lifecycle` and
+`renew_lease` do not count as activity. Once the daemon decides to stop, it
+removes its endpoint (Unix) and answers every request still on its way with
+`stopping`, without acting on it; a client then starts a new daemon and sends
+the request again. That daemon waits for the old one to give up the endpoint. A request that
+reaches the daemon after its control loop has ended is answered `stopping`
+too. Connect identifies a canonical endpoint and optional database
 override. Disconnect identifies one endpoint; `disconnect_scoped` atomically
 selects the session by capture database. Stop ends all sessions and the daemon.
 REST status omits its bearer token. CLI offline commands and status queries do

@@ -68,7 +68,49 @@ pub enum ControlRequest {
     },
     RestDisable,
     RestStatus,
+    /// Create or extend a long-lived client's lease, which holds the daemon
+    /// while no KNX session does. It lapses after
+    /// [`LEASE_TTL`](crate::lifecycle::LEASE_TTL) without renewal.
+    RenewLease {
+        client: String,
+        kind: crate::lifecycle::LeaseKind,
+    },
+    /// End a lease before it lapses, when the client quits normally.
+    ReleaseLease {
+        client: String,
+    },
+    /// Change the running daemon's idle period. `0` means never stop by
+    /// itself. Lasts until this daemon stops.
+    SetIdleTimeout {
+        seconds: u64,
+    },
+    /// The daemon's idle period, its source, and what holds it.
+    GetLifecycle,
     Stop,
+}
+
+impl ControlRequest {
+    /// Whether sending the request twice does what sending it once does.
+    ///
+    /// Connecting an endpoint that is connected answers with its session, and
+    /// the others only read or set an absolute value. Disconnecting is not on
+    /// the list: its second answer would be an error for the session the first
+    /// one removed.
+    #[must_use]
+    pub const fn is_repeatable(&self) -> bool {
+        matches!(
+            self,
+            Self::Ping
+                | Self::Identify
+                | Self::List
+                | Self::Connect { .. }
+                | Self::RestStatus
+                | Self::RenewLease { .. }
+                | Self::ReleaseLease { .. }
+                | Self::SetIdleTimeout { .. }
+                | Self::GetLifecycle
+        )
+    }
 }
 
 /// Result returned by the daemon for one control request.
@@ -90,6 +132,12 @@ pub enum ControlResponse {
     Identity {
         identity: crate::identity::BuildIdentity,
     },
+    Lifecycle {
+        state: crate::lifecycle::LifecycleState,
+    },
+    /// The daemon is stopping and did not act on the request. A client
+    /// starts a new daemon and sends the request again.
+    Stopping,
     Error {
         reason: String,
     },
@@ -219,10 +267,35 @@ impl ControlClient {
     ///
     /// Returns a local IPC, timeout, serialization, or startup error.
     pub async fn request(request: ControlRequest) -> io::Result<ControlResponse> {
-        if !matches!(request, ControlRequest::Stop) {
-            Self::ensure_daemon().await?;
+        if matches!(request, ControlRequest::Stop) {
+            return Self::request_existing(request).await;
         }
-        Self::request_existing(request).await
+        // A daemon can stop between the check and the request, through its
+        // idle stop. It then refuses the connection or answers `Stopping`;
+        // either way it did not act on the request, so starting a new daemon
+        // and sending once more is safe whatever the request does. A daemon
+        // that is already going away can also close a connection it accepted
+        // without an answer, which Windows reports as an unexpected end of the
+        // stream. The request may have been carried out then, so it is sent
+        // again only when sending it twice does no harm. Any other failure is
+        // returned as it is: the daemon may have acted on it.
+        let deadline = Instant::now() + DAEMON_START_TIMEOUT;
+        loop {
+            Self::ensure_daemon().await?;
+            match Self::request_existing(request.clone()).await {
+                Ok(ControlResponse::Stopping) => {}
+                Err(error) if daemon_unavailable(&error) => {}
+                Err(error) if request.is_repeatable() && ended_without_answer(&error) => {}
+                other => return other,
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the daemon kept stopping for ten seconds",
+                ));
+            }
+            tokio::time::sleep(DAEMON_POLL_INTERVAL).await;
+        }
     }
 
     /// Send one request without starting a daemon.
@@ -245,6 +318,8 @@ impl ControlClient {
     pub async fn ensure_daemon() -> io::Result<()> {
         match Self::request_existing(ControlRequest::Ping).await {
             Ok(ControlResponse::Pong) => return Ok(()),
+            // A stopping daemon gives up the endpoint; the new one waits for it.
+            Ok(ControlResponse::Stopping) => {}
             Ok(_) => return Err(invalid_data("daemon returned an unexpected Ping response")),
             Err(error) if daemon_unavailable(&error) => {}
             Err(error) => return Err(error),
@@ -255,6 +330,7 @@ impl ControlClient {
         loop {
             match Self::request_existing(ControlRequest::Ping).await {
                 Ok(ControlResponse::Pong) => return Ok(()),
+                Ok(ControlResponse::Stopping) => {}
                 Ok(_) => {
                     return Err(invalid_data("daemon returned an unexpected Ping response"));
                 }
@@ -450,15 +526,9 @@ where
     .await
     {
         Ok(Ok(())) => {}
-        Ok(Err(_)) => {
-            return write_frame(
-                &mut stream,
-                &ControlResponse::Error {
-                    reason: "daemon control loop stopped".to_owned(),
-                },
-            )
-            .await;
-        }
+        // The control loop is gone: the daemon stopped, and did not act on
+        // the request. Saying so lets the client send it to a new daemon.
+        Ok(Err(_)) => return write_frame(&mut stream, &ControlResponse::Stopping).await,
         Err(_) => {
             return write_frame(
                 &mut stream,
@@ -471,9 +541,9 @@ where
     }
     let response = match tokio::time::timeout(IO_TIMEOUT, response_rx).await {
         Ok(Ok(response)) => response,
-        Ok(Err(_)) => ControlResponse::Error {
-            reason: "daemon did not return a control response".to_owned(),
-        },
+        // The loop dropped the request without answering it, as it does when
+        // it ends: the daemon is stopping and did not act on it.
+        Ok(Err(_)) => ControlResponse::Stopping,
         Err(_) => ControlResponse::Error {
             reason: "daemon control response timed out".to_owned(),
         },
@@ -550,6 +620,17 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
+/// Whether the connection ended before an answer came.
+fn ended_without_answer(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+    )
+}
+
 fn daemon_unavailable(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -559,12 +640,30 @@ fn daemon_unavailable(error: &io::Error) -> bool {
     )
 }
 
+/// Remove the control endpoint so a late client's connect fails at once.
+///
+/// Only the daemon that owns the endpoint calls this, while it still holds
+/// the owner lock, so no other daemon can have bound the path yet. On
+/// Windows the pipe goes when its listener does.
+#[cfg(unix)]
+pub fn release_endpoint() {
+    if let Ok(path) = socket_path(false) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Remove the control endpoint so a late client's connect fails at once.
+///
+/// Nothing to do on Windows: the pipe goes when its listener does.
+#[cfg(windows)]
+pub const fn release_endpoint() {}
+
 fn spawn_daemon() -> io::Result<()> {
     use std::process::{Command, Stdio};
 
     let mut command = Command::new(std::env::current_exe()?);
     command
-        .arg("daemon")
+        .args(["daemon", "--wait-for-endpoint"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -747,6 +846,35 @@ fn bind_windows(name: &str) -> io::Result<Listener> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn only_requests_that_do_no_harm_twice_are_repeated() {
+        assert!(
+            ControlRequest::Connect {
+                endpoint: "tunnel://127.0.0.1:3671".into(),
+                database: None,
+                max_events: 1,
+            }
+            .is_repeatable()
+        );
+        assert!(ControlRequest::List.is_repeatable());
+        // Counter-probes: a second disconnect, REST change or stop is not the
+        // same as the first.
+        assert!(
+            !ControlRequest::Disconnect {
+                endpoint: "tunnel://127.0.0.1:3671".into(),
+            }
+            .is_repeatable()
+        );
+        assert!(!ControlRequest::RestDisable.is_repeatable());
+        assert!(!ControlRequest::Stop.is_repeatable());
+        assert!(ended_without_answer(&io::Error::from(
+            io::ErrorKind::UnexpectedEof
+        )));
+        assert!(!ended_without_answer(&io::Error::from(
+            io::ErrorKind::TimedOut
+        )));
+    }
+
     #[tokio::test]
     async fn stop_reply_waits_for_the_complete_transport_frame() {
         let (mut client, stream) = tokio::io::duplex(1);
@@ -780,6 +908,58 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        transport.await.unwrap().unwrap();
+    }
+
+    /// A request that reaches a connection after the daemon's control loop has
+    /// ended is answered `Stopping`, not with an error that looks like a
+    /// failure of the request.
+    #[tokio::test]
+    async fn a_request_after_the_control_loop_ended_is_answered_stopping() {
+        // The loop is gone before the request arrives.
+        let (mut client, stream) = tokio::io::duplex(4096);
+        let (calls_tx, calls_rx) = mpsc::channel(1);
+        drop(calls_rx);
+        let transport = tokio::spawn(handle_client(stream, calls_tx));
+        client
+            .write_all(&encode_frame(&ControlRequest::Ping).unwrap())
+            .await
+            .unwrap();
+        let answer: ControlResponse =
+            serde_json::from_slice(&read_frame(&mut client).await.unwrap()).unwrap();
+        assert_eq!(answer, ControlResponse::Stopping);
+        transport.await.unwrap().unwrap();
+
+        // The loop took the request and ended without answering it.
+        let (mut client, stream) = tokio::io::duplex(4096);
+        let (calls_tx, mut calls_rx) = mpsc::channel(1);
+        let transport = tokio::spawn(handle_client(stream, calls_tx));
+        client
+            .write_all(&encode_frame(&ControlRequest::Ping).unwrap())
+            .await
+            .unwrap();
+        drop(calls_rx.recv().await.unwrap());
+        let answer: ControlResponse =
+            serde_json::from_slice(&read_frame(&mut client).await.unwrap()).unwrap();
+        assert_eq!(answer, ControlResponse::Stopping);
+        transport.await.unwrap().unwrap();
+
+        // Counter-probe: a request the daemon answers is not turned into one.
+        let (mut client, stream) = tokio::io::duplex(4096);
+        let (calls_tx, mut calls_rx) = mpsc::channel(1);
+        let transport = tokio::spawn(handle_client(stream, calls_tx));
+        client
+            .write_all(&encode_frame(&ControlRequest::Ping).unwrap())
+            .await
+            .unwrap();
+        let call = calls_rx.recv().await.unwrap();
+        call.into_request_and_reply()
+            .1
+            .respond(ControlResponse::Pong)
+            .await;
+        let answer: ControlResponse =
+            serde_json::from_slice(&read_frame(&mut client).await.unwrap()).unwrap();
+        assert_eq!(answer, ControlResponse::Pong);
         transport.await.unwrap().unwrap();
     }
 

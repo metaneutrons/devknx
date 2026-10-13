@@ -13,7 +13,8 @@ use std::ffi::OsString;
 use std::io;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use knx_rs_ip::parse_url;
 use tokio::sync::{mpsc, oneshot};
@@ -22,22 +23,53 @@ use tokio::task::JoinHandle;
 use crate::api::{ApiConfig, ApiServer};
 use crate::control::{ControlRequest, ControlResponse, ControlServer, RestStatus, SessionInfo};
 use crate::ipc::IpcServer;
+use crate::lifecycle::{IdleSource, IdleTimeout, Lifecycle, SystemClock};
 use crate::paths;
 use crate::service::{CaptureService, ReconnectPolicy};
 use crate::storage::CaptureStore;
 
 const LIVE_EVENT_CAPACITY: usize = 1_024;
 
-/// Run the per-user daemon until its control API requests shutdown or Ctrl-C
-/// is pressed.
+/// The longest a stopping daemon answers requests that were already on their
+/// way, each with [`ControlResponse::Stopping`].
+const DRAIN: Duration = Duration::from_secs(5);
+
+/// How long the stopping daemon waits for one more queued request. A request
+/// already in the listener's queue arrives within this; after it, the
+/// endpoint is gone and a late client's connect fails cleanly. Windows takes
+/// queued pipe clients only while a listener is pending, so it does not wait.
+#[cfg(unix)]
+const QUEUE_QUIET: Duration = Duration::from_millis(50);
+#[cfg(windows)]
+const QUEUE_QUIET: Duration = Duration::ZERO;
+
+/// How long a daemon started by a client waits for a stopping daemon to give
+/// up the control endpoint: the drain plus stopping its sessions.
+const OWNER_WAIT: Duration = Duration::from_secs(10);
+
+/// How the daemon was started.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DaemonOptions {
+    /// The idle period from `--idle-timeout`, over the settings file's.
+    pub idle_timeout: Option<IdleTimeout>,
+    /// Wait for a stopping daemon to give up the control endpoint, rather
+    /// than fail at once. Set when a client starts the daemon.
+    pub wait_for_endpoint: bool,
+}
+
+/// Run the per-user daemon until its control API requests shutdown, it has
+/// been idle for its idle period, or Ctrl-C is pressed.
 ///
 /// No KNX connection is started automatically.
 ///
 /// # Errors
 ///
 /// Returns an error if the control listener cannot start or stops unexpectedly.
-pub async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let control = ControlServer::bind().map_err(|error| other_error(&error))?;
+pub async fn run(options: DaemonOptions) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let control = bind_control(options.wait_for_endpoint)
+        .await
+        .map_err(|error| other_error(&error))?;
+    let lifecycle = start_lifecycle(options.idle_timeout);
     let (calls_tx, mut calls_rx) = mpsc::channel(32);
     let mut control_task = tokio::spawn(control.run(calls_tx));
     let mut sessions = DaemonSessions::default();
@@ -60,15 +92,27 @@ pub async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                 break Some(Box::new(error) as Box<dyn Error + Send + Sync>);
             }
             _ = reap_timer.tick() => {
-                sessions.reap_finished().await;
+                sessions.reap_finished(&lifecycle).await;
+                if lifecycle.idle_expired(sessions.by_endpoint.len()) {
+                    let state = lifecycle.state(0);
+                    eprintln!(
+                        "idle for {} ({}), stopping",
+                        IdleTimeout(Duration::from_secs(state.idle_seconds)),
+                        state.source
+                    );
+                    break None;
+                }
             }
             call = calls_rx.recv() => {
                 let Some(call) = call else {
                     break Some(Box::new(io::Error::other("control channel closed")) as Box<dyn Error + Send + Sync>);
                 };
-                sessions.reap_finished().await;
+                sessions.reap_finished(&lifecycle).await;
                 let (request, reply) = call.into_request_and_reply();
-                let response = sessions.handle(request).await;
+                if is_activity(&request) {
+                    lifecycle.touch();
+                }
+                let response = sessions.handle(request, &lifecycle).await;
                 let stop = matches!(response, ControlResponse::Stopped);
                 reply.respond(response).await;
                 if stop {
@@ -78,6 +122,21 @@ pub async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
     };
 
+    // Nobody new gets in, and every request already on its way is answered
+    // with `Stopping`, which tells its client the daemon did not act on it.
+    // Only then do the sessions stop and the endpoint lock go, so a daemon a
+    // client starts meanwhile takes over a clean endpoint.
+    crate::control::release_endpoint();
+    let deadline = Instant::now() + DRAIN;
+    while let Ok(Some(call)) = tokio::time::timeout(
+        QUEUE_QUIET.min(deadline.saturating_duration_since(Instant::now())),
+        calls_rx.recv(),
+    )
+    .await
+    {
+        let (_, reply) = call.into_request_and_reply();
+        reply.respond(ControlResponse::Stopping).await;
+    }
     sessions.stop_all().await;
     control_task.abort();
     let _ = control_task.await;
@@ -86,6 +145,57 @@ pub async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         return Err(error);
     }
     Ok(())
+}
+
+/// Bind the control endpoint, waiting for a stopping daemon to give it up
+/// when asked to.
+async fn bind_control(wait: bool) -> io::Result<ControlServer> {
+    let deadline = Instant::now() + OWNER_WAIT;
+    loop {
+        match ControlServer::bind() {
+            Ok(control) => return Ok(control),
+            Err(error) if wait && error.kind() == io::ErrorKind::AddrInUse => {
+                if Instant::now() >= deadline {
+                    return Err(error);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// The idle timer, with its period from the start flag, the settings file,
+/// or the default, in that order.
+fn start_lifecycle(flag: Option<IdleTimeout>) -> Lifecycle {
+    let (period, source) = flag.map_or_else(
+        || match crate::settings::Settings::load() {
+            Ok(crate::settings::Settings {
+                idle_timeout: Some(timeout),
+                ..
+            }) => (timeout.0, IdleSource::Settings),
+            Ok(_) => (crate::lifecycle::DEFAULT_IDLE, IdleSource::Default),
+            Err(error) => {
+                eprintln!("{error}; using the default idle period");
+                (crate::lifecycle::DEFAULT_IDLE, IdleSource::Default)
+            }
+        },
+        |timeout| (timeout.0, IdleSource::StartFlag),
+    );
+    Lifecycle::new(period, source, Arc::new(SystemClock))
+}
+
+/// Whether a request is something happening, which starts the idle period
+/// again. Questions about the daemon itself are not: checking whether it
+/// would stop must not keep it running. Leases hold the daemon on their own.
+const fn is_activity(request: &ControlRequest) -> bool {
+    !matches!(
+        request,
+        ControlRequest::Ping
+            | ControlRequest::Identify
+            | ControlRequest::GetLifecycle
+            | ControlRequest::RenewLease { .. }
+    )
 }
 
 #[derive(Default)]
@@ -122,9 +232,22 @@ enum DatabaseIdentity {
 }
 
 impl DaemonSessions {
-    async fn handle(&mut self, request: ControlRequest) -> ControlResponse {
+    async fn handle(&mut self, request: ControlRequest, lifecycle: &Lifecycle) -> ControlResponse {
         self.reap_rest().await;
         match request {
+            ControlRequest::RenewLease { client, kind } => {
+                lifecycle.renew(&client, kind);
+                self.lifecycle(lifecycle)
+            }
+            ControlRequest::ReleaseLease { client } => {
+                lifecycle.release(&client);
+                self.lifecycle(lifecycle)
+            }
+            ControlRequest::SetIdleTimeout { seconds } => {
+                lifecycle.set_period(Duration::from_secs(seconds), IdleSource::Runtime);
+                self.lifecycle(lifecycle)
+            }
+            ControlRequest::GetLifecycle => self.lifecycle(lifecycle),
             ControlRequest::Ping => ControlResponse::Pong,
             ControlRequest::Identify => ControlResponse::Identity {
                 identity: crate::identity::BuildIdentity::current(),
@@ -454,13 +577,29 @@ impl DaemonSessions {
         ControlResponse::Rest { status }
     }
 
+    fn lifecycle(&self, lifecycle: &Lifecycle) -> ControlResponse {
+        ControlResponse::Lifecycle {
+            state: lifecycle.state(self.by_endpoint.len()),
+        }
+    }
+
     fn rest_status(&self) -> RestStatus {
         self.rest
             .as_ref()
             .map_or_else(disabled_rest_status, |rest| rest.status.clone())
     }
 
-    async fn reap_finished(&mut self) {
+    /// Remove sessions that ended by themselves. The idle period starts when
+    /// the last one ends, not when it was connected.
+    async fn reap_finished(&mut self, lifecycle: &Lifecycle) {
+        let before = self.by_endpoint.len();
+        self.reap().await;
+        if self.by_endpoint.len() < before {
+            lifecycle.touch();
+        }
+    }
+
+    async fn reap(&mut self) {
         self.reap_rest().await;
         let finished = self
             .by_endpoint

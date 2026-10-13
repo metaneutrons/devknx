@@ -231,6 +231,7 @@ disconnected or the daemon stops. Select a connection's default database with
 
 ```sh
 devknx daemon --status
+devknx daemon --restart
 devknx connect tunnel://192.0.2.1:3671
 devknx sessions
 devknx status --endpoint tunnel://192.0.2.1:3671
@@ -274,6 +275,27 @@ default. See the [MCP guide](docs/mcp.md) for tool names, structured results,
 bounded search and exact-address write opt-in.
 
 `history --after ... --limit ... --filter ...` filters one bounded CLI page.
+
+### When the daemon is another build
+
+Every client talks to whatever daemon answers, and that can be another build:
+a daemon started from a development build keeps running after you go back to
+the installed release, and both may report the same version number. Each build
+therefore knows its commit and whether it was built from a modified tree, and a
+client compares itself with the daemon. `daemon --status` reports the daemon's
+build. When they differ, a CLI command that uses the daemon prints one line on
+stderr, so stdout stays clean JSON. The window marks it in the bottom bar, the
+terminal monitor in its title bar, and the MCP server adds the warning to its
+next tool result, where the AI tool can pass it on. A daemon too old to
+identify itself counts as another build.
+
+Nothing restarts the daemon on its own, because a restart interrupts the
+captures. `devknx daemon --restart` stops it, starts one from the calling
+binary, and connects its KNX sessions again with their databases and retention
+limits. A REST listener is not restored, because the daemon does not keep its
+bearer token. The restart says so, and `rest --enable` starts it again. Set
+`DEVKNX_NO_VERSION_WARNING=1` to silence the warning while you run another
+build as the daemon on purpose.
 
 ### Capture and loss diagnostics
 

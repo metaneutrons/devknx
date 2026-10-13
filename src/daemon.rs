@@ -126,6 +126,9 @@ impl DaemonSessions {
         self.reap_rest().await;
         match request {
             ControlRequest::Ping => ControlResponse::Pong,
+            ControlRequest::Identify => ControlResponse::Identity {
+                identity: crate::identity::BuildIdentity::current(),
+            },
             ControlRequest::List => {
                 let mut sessions = self
                     .by_endpoint
@@ -329,6 +332,7 @@ impl DaemonSessions {
         let info = SessionInfo {
             endpoint: endpoint.clone(),
             database,
+            max_events: Some(max_events),
         };
         let (shutdown, shutdown_rx) = oneshot::channel();
         let task = tokio::spawn(run_session(service, ipc, shutdown_rx));

@@ -578,18 +578,40 @@ pub fn disconnect_owner(database: &Path) -> Result<String, String> {
     }
 }
 
+/// The warning when the running daemon is another build than this window or
+/// terminal monitor, or `None` when it is the same build or none runs.
+#[must_use]
+pub fn build_warning() -> Option<String> {
+    block_on(ControlClient::build_warning()).ok().flatten()
+}
+
 fn control_request(request: ControlRequest) -> io::Result<ControlResponse> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(ControlClient::request_existing(request))
+    block_on(ControlClient::request_existing(request))?
 }
 
 fn control_request_start(request: ControlRequest) -> io::Result<ControlResponse> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(ControlClient::request(request))
+    block_on(ControlClient::request(request))?
+}
+
+/// Drive `future` to completion on a runtime of its own, on a thread of its
+/// own. The monitors call some requests from their main thread, which
+/// `#[tokio::main]` already drives, and a runtime cannot block inside another.
+fn block_on<F>(future: F) -> io::Result<F::Output>
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                Ok(runtime.block_on(future))
+            })
+            .join()
+            .map_err(|_| io::Error::other("a daemon request panicked"))?
+    })
 }
 
 pub fn rest_status() -> Result<RestStatus, String> {
@@ -821,6 +843,21 @@ pub fn discover_gateways() -> Result<Vec<GatewayInfo>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request made from a thread a runtime already drives, as the
+    /// monitors' main thread is, completes rather than panicking.
+    #[tokio::test]
+    async fn a_daemon_request_works_inside_a_runtime() {
+        assert_eq!(block_on(async { 7 }).unwrap(), 7);
+        // Counter-probe: blocking on a second runtime right here panics.
+        let direct = std::panic::catch_unwind(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(async { 7 })
+        });
+        assert!(direct.is_err());
+    }
     use devknx::capture::{CaptureEndpoint, CaptureEvent};
     use devknx::ets::{CsvEncoding, EtsCatalog, EtsFormat};
     use devknx::ipc::IpcServer;

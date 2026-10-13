@@ -96,7 +96,8 @@ pub async fn run(
     selected_endpoint: Option<String>,
     allowed_write_addresses: Vec<u16>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut adapter = McpServer::with_write_addresses(database, allowed_write_addresses);
+    let mut adapter = McpServer::with_write_addresses(database, allowed_write_addresses)
+        .with_notice(crate::control::ControlClient::build_warning().await);
     adapter.selected_endpoint = selected_endpoint;
     let service = adapter.serve(stdio()).await?;
     service.waiting().await?;
@@ -111,6 +112,8 @@ pub struct McpServer {
     selected_endpoint: Option<String>,
     rate: Arc<Mutex<RateState>>,
     allowed_write_addresses: BTreeSet<u16>,
+    /// A note for the user, passed on with the next tool result once.
+    notice: Arc<Mutex<Option<String>>>,
 }
 
 impl McpServer {
@@ -118,6 +121,31 @@ impl McpServer {
     #[must_use]
     pub fn new(database: PathBuf) -> Self {
         Self::with_write_addresses(database, [])
+    }
+
+    /// The same adapter, passing `notice` on with the next tool result.
+    ///
+    /// An MCP client shows its user what a tool returns, not what the server
+    /// writes to stderr, so a daemon of another build is reported here.
+    #[must_use]
+    pub fn with_notice(self, notice: Option<String>) -> Self {
+        if let Ok(mut slot) = self.notice.lock() {
+            *slot = notice;
+        }
+        self
+    }
+
+    /// Add the pending notice to a tool result, once.
+    fn deliver_notice(&self, response: &mut rmcp::model::CallToolResponse) {
+        let rmcp::model::CallToolResponse::Complete(result) = response else {
+            return;
+        };
+        let pending = self.notice.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(notice) = pending {
+            result.content.push(rmcp::model::ContentBlock::text(format!(
+                "Note for the user from devknx: {notice}"
+            )));
+        }
     }
 
     /// Construct an adapter with an explicit exact-address typed-write allowlist.
@@ -137,6 +165,7 @@ impl McpServer {
             selected_endpoint: None,
             rate: Arc::new(Mutex::new(RateState::default())),
             allowed_write_addresses,
+            notice: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -734,6 +763,17 @@ impl McpServer {
     reason = "rmcp tool_handler generates an async trait method"
 )]
 impl ServerHandler for McpServer {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        let call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let mut response = self.tool_router.call(call).await?;
+        self.deliver_notice(&mut response);
+        Ok(response)
+    }
+
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("devknx", env!("CARGO_PKG_VERSION")))
@@ -962,6 +1002,28 @@ mod tests {
     use knx_rs_core::types::Priority;
     use knx_rs_ip::RoutingLostMessage;
 
+    /// A daemon of another build is reported with the next tool result, once.
+    #[test]
+    fn a_notice_rides_on_the_next_tool_result_once() {
+        use rmcp::model::{CallToolResponse, CallToolResult, ContentBlock};
+        let server = McpServer::new(PathBuf::from("unused.sqlite"))
+            .with_notice(Some("the daemon is another build".to_owned()));
+        let text = |response: &CallToolResponse| match response {
+            CallToolResponse::Complete(result) => {
+                serde_json::to_string(&result.content).expect("json")
+            }
+            _ => String::new(),
+        };
+        let mut first = CallToolResult::success(vec![ContentBlock::text("ok")]).into();
+        server.deliver_notice(&mut first);
+        let said = text(&first);
+        assert!(said.contains("the daemon is another build"), "{said}");
+        let mut second = CallToolResult::success(vec![ContentBlock::text("ok")]).into();
+        server.deliver_notice(&mut second);
+        let said = text(&second);
+        assert!(!said.contains("another build"), "{said}");
+    }
+
     #[test]
     fn tool_vocabulary_is_structured_and_has_no_raw_write() {
         let router = McpServer::tools();
@@ -1081,10 +1143,12 @@ mod tests {
             SessionInfo {
                 endpoint: "tunnel://192.0.2.1:3671".into(),
                 database: first.clone(),
+                max_events: None,
             },
             SessionInfo {
                 endpoint: "tunnel://192.0.2.2:3671".into(),
                 database: second,
+                max_events: None,
             },
         ];
         let normalized_spelling = directory.path().join("nested/../first.sqlite");

@@ -89,12 +89,19 @@ struct OptionalCaptureSelector {
 enum Command {
     /// Discover KNXnet/IP gateways on the local network.
     Discover,
-    /// Run the connection-independent daemon, or inspect/stop an existing daemon.
+    /// Run the connection-independent daemon, or inspect, stop or restart an
+    /// existing daemon.
     Daemon {
-        #[arg(long, conflicts_with = "stop")]
+        /// Report whether the daemon runs and which build it is.
+        #[arg(long, conflicts_with_all = ["stop", "restart"])]
         status: bool,
-        #[arg(long)]
+        /// Stop the running daemon.
+        #[arg(long, conflicts_with = "restart")]
         stop: bool,
+        /// Replace the running daemon with one from this executable and
+        /// connect its KNX sessions again.
+        #[arg(long)]
+        restart: bool,
     },
     /// Start one KNX session in the per-user daemon.
     Connect {
@@ -376,6 +383,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if runs_for_a_while(cli.command.as_ref()) {
         devknx::agent_skill::update_in_background(&Cli::command());
     }
+    if talks_to_daemon(cli.command.as_ref())
+        && let Some(warning) = ControlClient::build_warning().await
+    {
+        eprintln!("{warning}");
+    }
     match cli.command {
         Some(Command::Discover) => {
             let gateways = discovery::discover(Ipv4Addr::UNSPECIFIED).await?;
@@ -383,10 +395,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{gateway:?}");
             }
         }
-        Some(Command::Daemon { status, stop }) => {
+        Some(Command::Daemon {
+            status,
+            stop,
+            restart,
+        }) => {
             if status {
-                match ControlClient::request_existing(ControlRequest::Ping).await {
-                    Ok(ControlResponse::Pong) => println!("{{\"running\":true}}"),
+                match ControlClient::request_existing(ControlRequest::Identify).await {
+                    Ok(ControlResponse::Identity { identity }) => println!(
+                        "{}",
+                        serde_json::json!({ "running": true, "build": identity })
+                    ),
+                    // A daemon from before the build identity refuses the request.
+                    Ok(ControlResponse::Error { .. }) => {
+                        println!("{{\"running\":true,\"build\":null}}");
+                    }
                     Ok(response) => print_control_response(&response)?,
                     Err(error)
                         if matches!(
@@ -404,6 +427,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 print_control_response(
                     &ControlClient::request_existing(ControlRequest::Stop).await?,
                 )?;
+            } else if restart {
+                let restart = ControlClient::restart().await?;
+                if restart.rest_was_enabled {
+                    eprintln!(
+                        "The REST listener was not restored: the daemon does not keep its token. \
+                         Enable it again with: devknx rest --enable"
+                    );
+                }
+                for failed in &restart.failed {
+                    eprintln!(
+                        "Could not connect {} again: {}",
+                        failed.session.endpoint, failed.reason
+                    );
+                }
+                println!("{}", serde_json::to_string(&restart)?);
             } else {
                 daemon::run()
                     .await
@@ -894,13 +932,41 @@ async fn wait_connected(database: &std::path::Path) -> io::Result<()> {
 const fn runs_for_a_while(command: Option<&Command>) -> bool {
     match command {
         None | Some(Command::Mcp { .. }) => true,
-        Some(Command::Daemon { status, stop }) => !*status && !*stop,
+        Some(Command::Daemon {
+            status,
+            stop,
+            restart,
+        }) => !*status && !*stop && !*restart,
         #[cfg(feature = "gui")]
         Some(Command::Gui { .. }) => true,
         #[cfg(feature = "tui")]
         Some(Command::Tui { .. }) => true,
         _ => false,
     }
+}
+
+/// Whether the command uses the running daemon, so a daemon of another build
+/// is worth a warning on stderr. Commands that read a capture database
+/// directly, run their own service, or show the warning in their own surface
+/// (MCP, GUI, TUI) are left out, and so are the daemon commands other than
+/// `--status`.
+const fn talks_to_daemon(command: Option<&Command>) -> bool {
+    matches!(
+        command,
+        Some(
+            Command::Daemon { status: true, .. }
+                | Command::Connect { .. }
+                | Command::Disconnect { .. }
+                | Command::Sessions
+                | Command::Rest { .. }
+                | Command::Monitor { .. }
+                | Command::Status { .. }
+                | Command::Follow { .. }
+                | Command::Write { .. }
+                | Command::WriteRaw { .. }
+                | Command::Read { .. }
+        )
+    )
 }
 
 /// What `devknx skill` was asked to do.

@@ -4,8 +4,12 @@ One per-user `devknx daemon` owns zero or more configured KNXnet/IP sessions.
 Starting it alone does not connect to KNX. Each connected session owns one
 SQLite writer and retains a database-scoped capture IPC endpoint. A separate
 current-user control endpoint accepts bounded JSON-line requests: `ping`,
-`list`, `connect`, `disconnect`, `disconnect_scoped`, `rest_enable`, `rest_disable`, `rest_status`,
-and `stop`. Connect identifies a canonical endpoint and optional database
+`identify`, `list`, `connect`, `disconnect`, `disconnect_scoped`, `rest_enable`, `rest_disable`, `rest_status`,
+and `stop`. `identify` returns the daemon's build (version, commit, whether
+the tree was modified, a build stamp and the executable path), so a client can
+warn when the daemon is another build; a daemon that predates it answers
+`invalid control request`. `list` reports each session's retention limit as
+`max_events`, so `daemon --restart` can connect it again as it was. Connect identifies a canonical endpoint and optional database
 override. Disconnect identifies one endpoint; `disconnect_scoped` atomically
 selects the session by capture database. Stop ends all sessions and the daemon.
 REST status omits its bearer token. CLI offline commands and status queries do

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/metaneutrons/devknx/compare/v0.3.0...v0.3.1) (2026-10-13)
+
+
+### Bug Fixes
+
+* **daemon:** do not warn about a daemon of the same build without git ([#75](https://github.com/metaneutrons/devknx/issues/75)) ([b2c64fa](https://github.com/metaneutrons/devknx/commit/b2c64fa52f3f70f1bd02d464889cdd0738c6bfa2))
+
 ## [0.3.0](https://github.com/metaneutrons/devknx/compare/v0.2.0...v0.3.0) (2026-10-13)
 
 

@@ -18,7 +18,7 @@
 </p>
 
 > [!IMPORTANT]
-> **Initial release: 0.1.0.** The daemon can run without a KNX connection. GUI and TUI connect only when requested. Group writes can affect a live installation; qualify them on an isolated test network first. Live receive has been hardware-tested; typed read/write operations have loopback tests, not production hardware qualification.
+> **Status.** The daemon can run without a KNX connection. GUI and TUI connect only when requested. Group writes can affect a live installation; qualify them on an isolated test network first. Live receive has been hardware-tested; typed read/write operations have loopback tests, not production hardware qualification.
 
 ## What devknx does
 
@@ -45,9 +45,9 @@ explicitly supplied), and its preview is the exact frame sent by the capture
 owner. A read reports transmission separately from a matching response or
 timeout; transmission alone does not establish an actuator state change.
 
-devknx 0.1.0 targets KNXnet/IP. The older
+devknx targets KNXnet/IP. The older
 [`KnxMonitor`](https://github.com/metaneutrons/KnxMonitor) also supports KNX-USB;
-**USB is not part of devknx's initial release**. Keep KnxMonitor if you need
+**USB is not supported by devknx yet**. Keep KnxMonitor if you need
 KNX-USB; devknx is not yet a replacement for that connection type.
 
 ## Installation

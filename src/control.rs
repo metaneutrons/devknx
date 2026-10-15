@@ -35,7 +35,16 @@ use crate::paths;
 const MAX_MESSAGE_SIZE: usize = 16 * 1024;
 const MAX_CLIENTS: usize = 32;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
-const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a client waits for a daemon it started, or for one to stop.
+///
+/// It has to cover a stopping daemon's drain and the closing of its sessions,
+/// which the daemon started in its place waits for (`daemon` has the same
+/// bound), and a start that is slow on a loaded machine.
+pub const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(20);
+/// How many daemons a client starts while it waits: the first, and another when
+/// the one it started has ended without answering, as one does that gave up
+/// waiting for a stopping daemon's endpoint.
+const MAX_DAEMON_SPAWNS: u32 = 4;
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// One request sent to the current user's daemon.
@@ -315,7 +324,10 @@ impl ControlClient {
             if Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "the daemon kept stopping for ten seconds",
+                    format!(
+                        "the daemon kept stopping for {} seconds",
+                        DAEMON_START_TIMEOUT.as_secs()
+                    ),
                 ));
             }
             tokio::time::sleep(DAEMON_POLL_INTERVAL).await;
@@ -352,7 +364,8 @@ impl ControlClient {
             Err(error) => return Err(error),
         }
 
-        spawn_daemon()?;
+        let mut child = spawn_daemon()?;
+        let mut spawned = 1_u32;
         let deadline = Instant::now() + DAEMON_START_TIMEOUT;
         loop {
             match Self::request_existing(ControlRequest::Ping).await {
@@ -364,10 +377,23 @@ impl ControlClient {
                 Err(error) if daemon_unavailable(&error) || ended_without_answer(&error) => {}
                 Err(error) => return Err(error),
             }
+            // The daemon started here can be gone before it answered: it gave
+            // up waiting for a stopping daemon's endpoint, or it lost the race
+            // to another that is not answering yet. Nothing answers, so start
+            // another, a few times at most. A daemon that lost the race to one
+            // that answers is not seen here: the ping above would have
+            // returned.
+            if should_respawn(child.try_wait()?.is_some(), spawned) {
+                child = spawn_daemon()?;
+                spawned += 1;
+            }
             if Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "daemon did not become available within ten seconds",
+                    format!(
+                        "daemon did not become available within {} seconds",
+                        DAEMON_START_TIMEOUT.as_secs()
+                    ),
                 ));
             }
             tokio::time::sleep(DAEMON_POLL_INTERVAL).await;
@@ -473,7 +499,10 @@ impl ControlClient {
                 _ if Instant::now() >= deadline => {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
-                        "the daemon did not stop within ten seconds",
+                        format!(
+                            "the daemon did not stop within {} seconds",
+                            DAEMON_START_TIMEOUT.as_secs()
+                        ),
                     ));
                 }
                 _ => tokio::time::sleep(DAEMON_POLL_INTERVAL).await,
@@ -685,15 +714,43 @@ pub fn release_endpoint() {
 #[cfg(windows)]
 pub const fn release_endpoint() {}
 
-fn spawn_daemon() -> io::Result<()> {
+/// Whether a client that waits for a daemon starts another: the one it started
+/// has ended, and it has not started too many.
+const fn should_respawn(ended: bool, spawned: u32) -> bool {
+    ended && spawned < MAX_DAEMON_SPAWNS
+}
+
+/// Where the daemon started by a client writes what it prints, so a test can
+/// show it when something goes wrong. Only debug builds read this; a release
+/// build always discards the output.
+#[cfg(debug_assertions)]
+fn daemon_log() -> Option<std::fs::File> {
+    let path = std::env::var_os("DEVKNX_DAEMON_LOG").filter(|path| !path.is_empty())?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
+
+#[cfg(not(debug_assertions))]
+const fn daemon_log() -> Option<std::fs::File> {
+    None
+}
+
+fn spawn_daemon() -> io::Result<std::process::Child> {
     use std::process::{Command, Stdio};
 
+    let (stdout, stderr) = match daemon_log().map(|log| log.try_clone().map(|copy| (log, copy))) {
+        Some(Ok((out, err))) => (Stdio::from(out), Stdio::from(err)),
+        _ => (Stdio::null(), Stdio::null()),
+    };
     let mut command = Command::new(std::env::current_exe()?);
     command
         .args(["daemon", "--wait-for-endpoint"])
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(stdout)
+        .stderr(stderr);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -705,8 +762,7 @@ fn spawn_daemon() -> io::Result<()> {
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         command.creation_flags(DETACHED_PROCESS);
     }
-    drop(command.spawn()?);
-    Ok(())
+    command.spawn()
 }
 
 #[cfg(unix)]
@@ -872,6 +928,18 @@ fn bind_windows(name: &str) -> io::Result<Listener> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn another_daemon_is_started_only_when_the_last_has_ended_and_not_too_often() {
+        assert!(
+            !should_respawn(false, 1),
+            "a daemon that still runs is waited for"
+        );
+        assert!(should_respawn(true, 1));
+        assert!(should_respawn(true, MAX_DAEMON_SPAWNS - 1));
+        // Counter-probe: after the last allowed start the client only waits.
+        assert!(!should_respawn(true, MAX_DAEMON_SPAWNS));
+    }
 
     #[test]
     fn only_requests_that_do_no_harm_twice_are_repeated() {

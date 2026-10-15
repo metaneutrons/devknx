@@ -50,8 +50,11 @@ const QUEUE_QUIET: Duration = Duration::from_millis(50);
 const QUEUE_QUIET: Duration = Duration::ZERO;
 
 /// How long a daemon started by a client waits for a stopping daemon to give
-/// up the control endpoint: the drain plus stopping its sessions.
-const OWNER_WAIT: Duration = Duration::from_secs(10);
+/// up the control endpoint: the drain plus stopping its sessions. At least as
+/// long as a client waits for a daemon it started
+/// ([`crate::control`] has that bound), or the client would give up while the
+/// daemon it started is still waiting.
+const OWNER_WAIT: Duration = Duration::from_secs(20);
 
 /// How the daemon was started.
 #[derive(Clone, Copy, Debug, Default)]
@@ -1043,5 +1046,12 @@ mod tests {
             "{refused:?}"
         );
         sessions.stop_all().await;
+    }
+
+    /// A daemon a client starts waits for the endpoint at least as long as the
+    /// client waits for that daemon, or the client gives up first.
+    #[test]
+    fn a_started_daemon_waits_as_long_as_its_client() {
+        assert!(OWNER_WAIT >= crate::control::DAEMON_START_TIMEOUT);
     }
 }

@@ -148,6 +148,8 @@ The GUI opens its own capture history automatically. Use **Open…** (or
 the system file dialog; **Live capture** returns to the active history. A
 pre-connection `captures.sqlite` is offered as a previous capture, not
 automatically attributed to a gateway.
+`Cmd+F` (View > Filter Captures on macOS, `Ctrl+F` on Windows and Linux) puts the
+cursor in the filter field and selects its text, so typing replaces it.
 
 The capture table includes source and destination addresses, service, value,
 DPT, and ETS group name. A value is decoded only when a supported, unambiguous

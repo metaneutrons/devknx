@@ -132,6 +132,14 @@ impl MonitorModel {
         Ok(())
     }
 
+    /// The capture was cleared in the daemon: drop what is loaded here too.
+    /// Ids go on counting there, so the newest id seen stays.
+    pub fn cleared(&mut self, message: String) {
+        self.rows.clear();
+        self.router_lost_messages = 0;
+        self.notice(message);
+    }
+
     /// Reinterpret all loaded rows without losing older pages, raw data or view state.
     pub fn refresh_ets(&mut self) -> Result<(), String> {
         let enrichments = self
@@ -751,6 +759,106 @@ pub fn fake_daemon_control(
     let control: DaemonControl = Arc::new(move |request| {
         log.lock().unwrap().push(request);
         Ok(view.clone())
+    });
+    (control, asked)
+}
+
+/// What a monitor asks of the capture it shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CaptureRequest {
+    /// How much the capture holds.
+    Counts,
+    /// Delete it, after a copy in the archive directory when `archive` is set.
+    Clear { archive: bool },
+}
+
+/// What the daemon answered about a capture.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CaptureAnswer {
+    /// What the capture holds.
+    Counts { events: u64, losses: u64 },
+    /// What it held before it was cleared, and where the copy went.
+    Cleared {
+        events: u64,
+        losses: u64,
+        archive: Option<PathBuf>,
+    },
+}
+
+/// Counts and clears the capture in a database through the daemon, which is
+/// the one writer of it. Tests put a fake in its place, so no test can clear
+/// a capture of the user running it.
+pub type CaptureControl =
+    Arc<dyn Fn(&Path, CaptureRequest) -> Result<CaptureAnswer, String> + Send + Sync>;
+
+/// The daemon of the current user.
+///
+/// Nothing here starts a daemon: a capture is cleared by the session that
+/// records it, so without a daemon there is nothing to ask.
+#[must_use]
+#[cfg_attr(test, expect(dead_code, reason = "tests use a fake daemon instead"))]
+pub fn capture_control() -> CaptureControl {
+    Arc::new(|database, request| {
+        let database = database.to_path_buf();
+        let request = match request {
+            CaptureRequest::Counts => ControlRequest::CaptureCounts { database },
+            CaptureRequest::Clear { archive } => ControlRequest::ClearCapture { database, archive },
+        };
+        match control_request(request) {
+            Ok(ControlResponse::CaptureCounts { events, losses }) => {
+                Ok(CaptureAnswer::Counts { events, losses })
+            }
+            Ok(ControlResponse::CaptureCleared {
+                events,
+                losses,
+                archive,
+            }) => Ok(CaptureAnswer::Cleared {
+                events,
+                losses,
+                archive,
+            }),
+            Ok(ControlResponse::Error { reason }) => Err(reason),
+            Ok(_) => Err("unexpected answer from the daemon".to_owned()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                Err("no daemon is running, so nothing is recording this capture".to_owned())
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    })
+}
+
+/// What a fake capture control was asked: the capture, and the request.
+#[cfg(test)]
+pub type CaptureLog = Arc<std::sync::Mutex<Vec<(PathBuf, CaptureRequest)>>>;
+
+/// A capture control for tests: it answers from a fixed capture, records what
+/// it was asked, and never deletes anything.
+#[cfg(test)]
+pub fn fake_capture_control(events: u64, fail: bool) -> (CaptureControl, CaptureLog) {
+    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = Arc::clone(&asked);
+    let control: CaptureControl = Arc::new(move |database, request| {
+        log.lock()
+            .unwrap()
+            .push((database.to_path_buf(), request.clone()));
+        if fail && request != CaptureRequest::Counts {
+            return Err("the daemon refused".to_owned());
+        }
+        // An empty capture has no loss reports either.
+        let losses = if events == 0 { 0 } else { 2 };
+        Ok(match request {
+            CaptureRequest::Counts => CaptureAnswer::Counts { events, losses },
+            CaptureRequest::Clear { archive } => CaptureAnswer::Cleared {
+                events,
+                losses,
+                archive: archive.then(|| PathBuf::from("/archive/capture.sqlite")),
+            },
+        })
     });
     (control, asked)
 }

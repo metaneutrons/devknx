@@ -86,6 +86,18 @@ pub enum ControlRequest {
     },
     /// The daemon's idle period, its source, and what holds it.
     GetLifecycle,
+    /// How much the capture in `database` holds. The daemon answers only for a
+    /// capture one of its sessions is recording.
+    CaptureCounts {
+        database: PathBuf,
+    },
+    /// Delete the capture in `database`, after a copy in the archive
+    /// directory when `archive` is set. The session that records it does the
+    /// deleting, between two telegrams.
+    ClearCapture {
+        database: PathBuf,
+        archive: bool,
+    },
     Stop,
 }
 
@@ -109,6 +121,7 @@ impl ControlRequest {
                 | Self::ReleaseLease { .. }
                 | Self::SetIdleTimeout { .. }
                 | Self::GetLifecycle
+                | Self::CaptureCounts { .. }
         )
     }
 }
@@ -134,6 +147,17 @@ pub enum ControlResponse {
     },
     Lifecycle {
         state: crate::lifecycle::LifecycleState,
+    },
+    /// What a capture holds.
+    CaptureCounts {
+        events: u64,
+        losses: u64,
+    },
+    /// A capture was cleared: this is what it held, and where the copy went.
+    CaptureCleared {
+        events: u64,
+        losses: u64,
+        archive: Option<PathBuf>,
     },
     /// The daemon is stopping and did not act on the request. A client
     /// starts a new daemon and sends the request again.

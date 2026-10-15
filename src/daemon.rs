@@ -25,13 +25,19 @@ use crate::control::{ControlRequest, ControlResponse, ControlServer, RestStatus,
 use crate::ipc::IpcServer;
 use crate::lifecycle::{IdleSource, IdleTimeout, Lifecycle, SystemClock};
 use crate::paths;
-use crate::service::{CaptureService, ReconnectPolicy};
+use crate::service::{
+    CaptureService, MaintenanceEnvelope, MaintenanceReceipt, MaintenanceRequest, ReconnectPolicy,
+};
 use crate::storage::CaptureStore;
 
 const LIVE_EVENT_CAPACITY: usize = 1_024;
 
 /// The longest a stopping daemon answers requests that were already on their
 /// way, each with [`ControlResponse::Stopping`].
+/// How long a request to a session's store may take: a copy and a compaction of a
+/// large capture are not instant.
+const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(120);
+
 const DRAIN: Duration = Duration::from_secs(5);
 
 /// How long the stopping daemon waits for one more queued request. A request
@@ -203,6 +209,9 @@ struct DaemonSessions {
     by_endpoint: HashMap<String, ActiveSession>,
     by_database: HashMap<DatabaseIdentity, String>,
     rest: Option<ActiveRest>,
+    /// Where a copy made before a clear goes; the data directory's `archive`
+    /// when not set.
+    archive_dir: Option<PathBuf>,
 }
 
 struct ActiveSession {
@@ -210,6 +219,8 @@ struct ActiveSession {
     database_identity: DatabaseIdentity,
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<Result<(), String>>,
+    /// The way to the service that owns this session's capture store.
+    maintenance: mpsc::Sender<MaintenanceEnvelope>,
 }
 
 struct ActiveRest {
@@ -299,6 +310,8 @@ impl DaemonSessions {
                 self.disconnect(&endpoint).await;
                 ControlResponse::Disconnected
             }
+            request @ (ControlRequest::CaptureCounts { .. }
+            | ControlRequest::ClearCapture { .. }) => self.capture_request(request).await,
             ControlRequest::Stop => {
                 self.stop_all().await;
                 ControlResponse::Stopped
@@ -457,6 +470,7 @@ impl DaemonSessions {
             database,
             max_events: Some(max_events),
         };
+        let maintenance = service.maintenance_sender();
         let (shutdown, shutdown_rx) = oneshot::channel();
         let task = tokio::spawn(run_session(service, ipc, shutdown_rx));
 
@@ -468,9 +482,89 @@ impl DaemonSessions {
                 database_identity: identity,
                 shutdown: Some(shutdown),
                 task,
+                maintenance,
             },
         );
         ControlResponse::Session { session: info }
+    }
+
+    /// Count or clear the capture a session records.
+    async fn capture_request(&self, request: ControlRequest) -> ControlResponse {
+        match request {
+            ControlRequest::CaptureCounts { database } => {
+                match self.maintain(&database, MaintenanceRequest::Counts).await {
+                    Ok(receipt) => ControlResponse::CaptureCounts {
+                        events: receipt.counts.events,
+                        losses: receipt.counts.losses,
+                    },
+                    Err(reason) => ControlResponse::Error { reason },
+                }
+            }
+            ControlRequest::ClearCapture { database, archive } => {
+                let now = std::time::SystemTime::now();
+                let archive = if archive {
+                    let path = self.archive_dir.as_ref().map_or_else(
+                        || paths::archive_path(&database, now),
+                        |directory| Ok(paths::archive_path_in(directory, &database, now)),
+                    );
+                    match path {
+                        Ok(path) => Some(path),
+                        Err(reason) => return ControlResponse::Error { reason },
+                    }
+                } else {
+                    None
+                };
+                match self
+                    .maintain(&database, MaintenanceRequest::Clear { archive })
+                    .await
+                {
+                    Ok(receipt) => ControlResponse::CaptureCleared {
+                        events: receipt.counts.events,
+                        losses: receipt.counts.losses,
+                        archive: receipt.archive,
+                    },
+                    Err(reason) => ControlResponse::Error { reason },
+                }
+            }
+            // Not formatted: the request type deliberately has no `Debug`, as
+            // some of its variants carry a token.
+            _ => ControlResponse::Error {
+                reason: "not a capture request".to_owned(),
+            },
+        }
+    }
+
+    /// Ask the session that records `database` to do something to its capture.
+    ///
+    /// Only a capture a session of this daemon is recording is answered: its
+    /// store has one writer, and the session is it.
+    async fn maintain(
+        &self,
+        database: &Path,
+        request: MaintenanceRequest,
+    ) -> Result<MaintenanceReceipt, String> {
+        let database = resolve_database_path(database)
+            .map_err(|error| format!("invalid capture database path: {error}"))?;
+        let identity = database_identity(&database)
+            .map_err(|error| format!("invalid capture database path: {error}"))?;
+        let session = self
+            .by_database
+            .get(&identity)
+            .and_then(|endpoint| self.by_endpoint.get(endpoint))
+            .ok_or_else(|| {
+                "this capture is not being recorded by the daemon, so it cannot be changed here"
+                    .to_owned()
+            })?;
+        let (response, receiver) = oneshot::channel();
+        session
+            .maintenance
+            .send(MaintenanceEnvelope { request, response })
+            .await
+            .map_err(|_| "the session that records this capture has ended".to_owned())?;
+        tokio::time::timeout(MAINTENANCE_TIMEOUT, receiver)
+            .await
+            .map_err(|_| "the session did not answer in time".to_owned())?
+            .map_err(|_| "the session ended before it answered".to_owned())?
     }
 
     async fn disconnect(&mut self, endpoint: &str) {
@@ -843,5 +937,111 @@ mod tests {
         let second =
             resolve_database_path(&alias.join("capture.sqlite")).expect("resolve alias path");
         assert_eq!(first, second);
+    }
+
+    /// A lifecycle that nothing here waits on.
+    fn lifecycle() -> Lifecycle {
+        Lifecycle::new(Duration::ZERO, IdleSource::Default, Arc::new(SystemClock))
+    }
+
+    /// The daemon asks the session that records a capture to count and clear
+    /// it, with a copy first, and refuses a capture no session records.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_daemon_counts_and_clears_a_capture_through_its_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("capture.sqlite");
+        let archive_dir = directory.path().join("archive");
+        let gateway = knx_rs_ip::DeviceServer::start_at("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let endpoint = format!("tunnel://{}", gateway.local_addr());
+        let mut sessions = DaemonSessions {
+            archive_dir: Some(archive_dir.clone()),
+            ..DaemonSessions::default()
+        };
+        let lifecycle = lifecycle();
+        let connected = sessions
+            .handle(
+                ControlRequest::Connect {
+                    endpoint,
+                    database: Some(database.clone()),
+                    max_events: 100,
+                },
+                &lifecycle,
+            )
+            .await;
+        assert!(
+            matches!(connected, ControlResponse::Session { .. }),
+            "{connected:?}"
+        );
+
+        let counted = sessions
+            .handle(
+                ControlRequest::CaptureCounts {
+                    database: database.clone(),
+                },
+                &lifecycle,
+            )
+            .await;
+        assert_eq!(
+            counted,
+            ControlResponse::CaptureCounts {
+                events: 0,
+                losses: 0
+            }
+        );
+
+        let cleared = sessions
+            .handle(
+                ControlRequest::ClearCapture {
+                    database: database.clone(),
+                    archive: true,
+                },
+                &lifecycle,
+            )
+            .await;
+        let ControlResponse::CaptureCleared { archive, .. } = cleared else {
+            panic!("not cleared: {cleared:?}");
+        };
+        let archive = archive.expect("a copy was asked for");
+        assert!(archive.starts_with(&archive_dir), "{archive:?}");
+        assert!(archive.exists(), "the copy is not at {archive:?}");
+
+        // Without a copy there is no file to look for, and nothing is made.
+        let before = std::fs::read_dir(&archive_dir).unwrap().count();
+        let cleared = sessions
+            .handle(
+                ControlRequest::ClearCapture {
+                    database: database.clone(),
+                    archive: false,
+                },
+                &lifecycle,
+            )
+            .await;
+        assert!(
+            matches!(
+                cleared,
+                ControlResponse::CaptureCleared { archive: None, .. }
+            ),
+            "{cleared:?}"
+        );
+        assert_eq!(std::fs::read_dir(&archive_dir).unwrap().count(), before);
+
+        // Counter-probe: a capture no session records is refused.
+        let other = directory.path().join("another.sqlite");
+        let refused = sessions
+            .handle(
+                ControlRequest::ClearCapture {
+                    database: other,
+                    archive: false,
+                },
+                &lifecycle,
+            )
+            .await;
+        assert!(
+            matches!(&refused, ControlResponse::Error { reason } if reason.contains("not being recorded")),
+            "{refused:?}"
+        );
+        sessions.stop_all().await;
     }
 }

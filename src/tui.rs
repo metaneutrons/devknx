@@ -77,12 +77,20 @@ enum Mode {
     SkillOffer,
     /// Asking whether quitting should stop the daemon too.
     QuitQuestion,
+    /// Asking before the stored capture is cleared.
+    ClearCapture,
 }
 
 /// The question on quit, with what stopping the daemon would end.
 struct QuitQuestion {
     view: interface::DaemonView,
     remember: bool,
+}
+
+/// The question before the stored capture is cleared: what it holds, or why
+/// that could not be read.
+struct ClearCaptureQuestion {
+    counts: Result<(u64, u64), String>,
 }
 
 #[expect(
@@ -128,6 +136,9 @@ struct App {
     /// Where the answer to the quit question is remembered.
     settings_file: Option<PathBuf>,
     quit_question: Option<QuitQuestion>,
+    /// Counts and clears the capture through the daemon.
+    capture: interface::CaptureControl,
+    clear_capture: Option<ClearCaptureQuestion>,
     /// Said on stderr once the terminal is restored.
     exit_message: Option<String>,
 }
@@ -259,8 +270,107 @@ impl App {
             #[cfg(test)]
             settings_file: None,
             quit_question: None,
+            // Tests never clear a capture of the user running them.
+            #[cfg(not(test))]
+            capture: interface::capture_control(),
+            #[cfg(test)]
+            capture: interface::fake_capture_control(0, false).0,
+            clear_capture: None,
             exit_message: None,
         })
+    }
+
+    /// Count what the capture holds and show the question before it is cleared.
+    fn begin_clear_capture(&mut self) {
+        use interface::{CaptureAnswer, CaptureRequest};
+        if !self.model.owner_available {
+            self.model
+                .notice("Nothing is recording this capture, so it cannot be cleared here".into());
+            return;
+        }
+        let counts = match (self.capture)(&self.model.database, CaptureRequest::Counts) {
+            Ok(CaptureAnswer::Counts { events, losses }) => Ok((events, losses)),
+            Ok(CaptureAnswer::Cleared { .. }) => Err("unexpected answer from the daemon".into()),
+            Err(error) => Err(error),
+        };
+        self.clear_capture = Some(ClearCaptureQuestion { counts });
+        self.mode = Mode::ClearCapture;
+    }
+
+    /// Clear the capture, with a copy first or not, and say what happened.
+    /// What is loaded stays when the daemon refuses.
+    fn answer_clear_capture(&mut self, archive: bool) {
+        use interface::{CaptureAnswer, CaptureRequest};
+        let deletable = self.clear_capture.as_ref().is_some_and(
+            |question| matches!(question.counts, Ok((events, losses)) if events + losses > 0),
+        );
+        if !deletable {
+            return;
+        }
+        self.clear_capture = None;
+        self.mode = Mode::Normal;
+        match (self.capture)(&self.model.database, CaptureRequest::Clear { archive }) {
+            Ok(CaptureAnswer::Cleared {
+                events,
+                losses,
+                archive,
+            }) => {
+                let copy = archive
+                    .as_ref()
+                    .map_or_else(String::new, |path| format!(", copy in {}", path.display()));
+                self.model.cleared(format!(
+                    "Cleared {events} telegrams and {losses} loss reports{copy}"
+                ));
+                self.selected = 0;
+                self.follow_tail = true;
+            }
+            Ok(CaptureAnswer::Counts { .. }) => self
+                .model
+                .notice("Clearing the capture: unexpected answer from the daemon".into()),
+            Err(error) => self
+                .model
+                .notice(format!("Clearing the capture failed: {error}")),
+        }
+    }
+
+    fn draw_clear_overlay(&self, frame: &mut Frame<'_>) {
+        let Some(question) = self
+            .clear_capture
+            .as_ref()
+            .filter(|_| self.mode == Mode::ClearCapture)
+        else {
+            return;
+        };
+        let area = import_overlay_area(frame.area());
+        frame.render_widget(Clear, area);
+        let mut lines = Vec::new();
+        match &question.counts {
+            Ok((0, 0)) => lines.push(Line::raw("The capture is empty.")),
+            Ok((events, losses)) => {
+                lines.push(Line::styled(
+                    format!("Delete {events} telegrams and {losses} loss reports?"),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ));
+                lines.push(Line::raw(""));
+                lines.push(Line::raw("It is the record of what the bus carried. Once"));
+                lines.push(Line::raw("deleted it can only come back from the copy."));
+            }
+            Err(error) => lines.push(Line::raw(format!("The capture could not be read: {error}"))),
+        }
+        lines.push(Line::raw(""));
+        if matches!(question.counts, Ok((events, losses)) if events + losses > 0) {
+            lines.push(Line::raw("a  copy it to the archive folder, then clear it"));
+            lines.push(Line::raw("d  clear it without a copy"));
+        }
+        lines.push(Line::raw("Esc  keep it"));
+        frame.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+                Block::default()
+                    .title(" Clear capture ")
+                    .borders(Borders::ALL),
+            ),
+            area,
+        );
     }
 
     /// Quitting was asked for: quit now, or ask about the daemon first.
@@ -941,7 +1051,8 @@ impl App {
             | Mode::ConfirmEtsImport
             | Mode::EtsImportCommitting
             | Mode::SkillOffer
-            | Mode::QuitQuestion => {}
+            | Mode::QuitQuestion
+            | Mode::ClearCapture => {}
         }
     }
 
@@ -975,6 +1086,17 @@ impl App {
                 self.mode = Mode::Normal;
                 self.input.clear();
                 self.quit_question = None;
+                self.clear_capture = None;
+            }
+            return false;
+        }
+        if self.mode == Mode::ClearCapture {
+            // Deleting takes a letter of its own: Enter does nothing here, and
+            // so does any other key.
+            match key.code {
+                KeyCode::Char('a') => self.answer_clear_capture(true),
+                KeyCode::Char('d') => self.answer_clear_capture(false),
+                _ => {}
             }
             return false;
         }
@@ -1135,6 +1257,7 @@ impl App {
         }
         match key.code {
             KeyCode::Char('q') => return self.begin_quit(),
+            KeyCode::Char('X') => self.begin_clear_capture(),
             KeyCode::Char('c') => {
                 if self.model.owner_available {
                     self.disconnect_connection();
@@ -1319,6 +1442,7 @@ impl App {
                 Mode::EtsImportCommitting => "ETS import in progress… input is disabled".into(),
                 Mode::SkillOffer => "AI tools: y install · n not here · Esc ask next time".into(),
                 Mode::QuitQuestion => "Quit: s stop the daemon · k leave it running · r remember · Esc cancel".into(),
+                Mode::ClearCapture => "Clear capture: a copy it first, then clear · d clear without a copy · Esc keep it".into(),
             };
             let notice = self.model.notices.last().map_or("", String::as_str);
             let notice_style = if self.color_enabled {
@@ -1336,6 +1460,7 @@ impl App {
             self.draw_ets_import_overlay(frame);
             self.draw_skill_offer_overlay(frame);
             self.draw_quit_overlay(frame);
+            self.draw_clear_overlay(frame);
         })?;
         Ok(())
     }
@@ -2283,5 +2408,118 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         assert!(screen.contains("kitchen light"));
+    }
+
+    /// A terminal monitor showing `rows` rows of a capture a daemon records,
+    /// with a fake daemon behind it.
+    fn app_with_capture(
+        rows: u64,
+        fail: bool,
+    ) -> (App, interface::CaptureLog, PathBuf, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("capture.sqlite");
+        drop(CaptureStore::open(&database, NonZeroU32::new(100).unwrap()).unwrap());
+        let mut app = App::new(database.clone(), true, None).unwrap();
+        for id in 1..=i64::try_from(rows).unwrap() {
+            app.model.rows.push(interface::DisplayCapture {
+                id: Some(id),
+                timestamp_ms: u64::try_from(id).unwrap(),
+                direction: "in".into(),
+                source: "1.1.1".into(),
+                destination: "1/1/1".into(),
+                service: "GroupValueWrite".into(),
+                label: None,
+                dpts: Vec::new(),
+                value: None,
+                raw_cemi: "29 00".into(),
+            });
+        }
+        app.model.owner_available = true;
+        let (control, asked) = interface::fake_capture_control(rows, fail);
+        app.capture = control;
+        (app, asked, database, directory)
+    }
+
+    #[test]
+    fn the_question_counts_and_deletes_nothing_until_a_letter_answers() {
+        use interface::CaptureRequest;
+        let (mut app, asked, database, _directory) = app_with_capture(5, false);
+        assert!(!press(&mut app, KeyCode::Char('X')));
+        assert_eq!(app.mode, Mode::ClearCapture);
+        assert!(matches!(
+            app.clear_capture.as_ref().unwrap().counts,
+            Ok((5, 2))
+        ));
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![(database, CaptureRequest::Counts)]
+        );
+
+        // Enter and any other key do nothing, and the question stays.
+        for key in [KeyCode::Enter, KeyCode::Char('y'), KeyCode::Char('x')] {
+            assert!(!press(&mut app, key));
+        }
+        assert_eq!(app.mode, Mode::ClearCapture);
+        assert_eq!(asked.lock().unwrap().len(), 1);
+        assert_eq!(app.model.rows.len(), 5);
+
+        // Esc keeps the capture.
+        assert!(!press(&mut app, KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.clear_capture.is_none());
+        assert_eq!(asked.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_letter_clears_with_or_without_a_copy_and_empties_the_view() {
+        use interface::CaptureRequest;
+        for (letter, archive) in [('a', true), ('d', false)] {
+            let (mut app, asked, database, _directory) = app_with_capture(5, false);
+            press(&mut app, KeyCode::Char('X'));
+            press(&mut app, KeyCode::Char(letter));
+            assert_eq!(
+                asked.lock().unwrap().last().cloned(),
+                Some((database, CaptureRequest::Clear { archive }))
+            );
+            assert_eq!(app.mode, Mode::Normal);
+            assert!(app.model.rows.is_empty());
+            let notice = app.model.notices.last().expect("a notice");
+            assert!(
+                notice.starts_with("Cleared 5 telegrams and 2 loss reports"),
+                "{notice}"
+            );
+            assert_eq!(notice.contains("copy in"), archive);
+        }
+    }
+
+    #[test]
+    fn a_refusal_is_reported_and_the_view_stays() {
+        let (mut app, _, _, _directory) = app_with_capture(5, true);
+        press(&mut app, KeyCode::Char('X'));
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.model.rows.len(), 5);
+        let notice = app.model.notices.last().expect("a notice");
+        assert!(notice.contains("failed"), "{notice}");
+    }
+
+    #[test]
+    fn an_empty_capture_and_a_capture_nobody_records_offer_nothing() {
+        let (mut app, asked, _, _directory) = app_with_capture(0, false);
+        press(&mut app, KeyCode::Char('X'));
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(asked.lock().unwrap().len(), 1, "only the count was asked");
+
+        let (mut app, asked, _, _directory) = app_with_capture(5, false);
+        app.model.owner_available = false;
+        press(&mut app, KeyCode::Char('X'));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(asked.lock().unwrap().is_empty());
+        assert!(
+            app.model
+                .notices
+                .last()
+                .is_some_and(|n| n.contains("Nothing is recording"))
+        );
     }
 }

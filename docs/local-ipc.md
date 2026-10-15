@@ -5,11 +5,25 @@ Starting it alone does not connect to KNX. Each connected session owns one
 SQLite writer and retains a database-scoped capture IPC endpoint. A separate
 current-user control endpoint accepts bounded JSON-line requests: `ping`,
 `identify`, `list`, `connect`, `disconnect`, `disconnect_scoped`, `rest_enable`, `rest_disable`, `rest_status`,
-and `stop`. `identify` returns the daemon's build (version, commit, whether
+`capture_counts`, `clear_capture` and `stop`. `identify` returns the daemon's build (version, commit, whether
 the tree was modified, a build stamp and the executable path), so a client can
 warn when the daemon is another build; a daemon that predates it answers
 `invalid control request`. `list` reports each session's retention limit as
 `max_events`, so `daemon --restart` can connect it again as it was.
+
+`capture_counts` (`database`) and `clear_capture` (`database`, `archive`) look at
+and empty the capture in a database. The daemon answers only for a capture one
+of its sessions records, because that session is the one writer of the store; it
+does the work between two telegrams, whatever the state of the connection, and
+refuses any other database. `capture_counts` answers `capture_counts` with
+`events` and `losses`. `clear_capture` first makes a copy in the `archive`
+folder of the data directory when `archive` is set, named after the capture and
+the moment in UTC, and deletes nothing if the copy fails. It then deletes every
+telegram and loss report, compacts the file and empties the write-ahead log, and
+answers `capture_cleared` with what was deleted and the path of the copy. The
+imported ETS group addresses, the audit of the operations sent from here and the
+binding to the endpoint stay, and ids keep counting. `capture_counts` can be
+sent again to a new daemon; `clear_capture` cannot.
 
 `renew_lease` (`client`, `kind`) and `release_lease` (`client`) let a
 long-lived client hold the daemon while no KNX session does; a lease lapses

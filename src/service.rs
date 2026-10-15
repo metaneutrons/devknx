@@ -21,7 +21,9 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::capture::{CaptureEndpoint, CaptureEvent, RoutingLossEvent};
 use crate::operations::{OperationRequest, prepare};
-use crate::storage::{CaptureStore, StorageError};
+use std::path::PathBuf;
+
+use crate::storage::{CaptureCounts, CaptureStore, StorageError};
 
 /// Current lifecycle state of one configured connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,6 +95,36 @@ pub struct OperationReceipt {
     pub raw_cemi: Vec<u8>,
 }
 
+/// A request to the owner of the capture store that is not a KNX operation.
+///
+/// The store has one writer, and it is this service. Whatever changes the
+/// capture as a whole is therefore asked of it, and runs between two telegrams,
+/// whatever the state of the connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MaintenanceRequest {
+    /// What the capture holds.
+    Counts,
+    /// Delete the capture, after a copy at `archive` when one is given.
+    Clear { archive: Option<PathBuf> },
+}
+
+/// A request for maintenance with the way back to its asker.
+pub struct MaintenanceEnvelope {
+    /// What to do.
+    pub request: MaintenanceRequest,
+    /// What the capture held, and where the copy went, or why it was refused.
+    pub response: oneshot::Sender<Result<MaintenanceReceipt, String>>,
+}
+
+/// The outcome of a maintenance request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaintenanceReceipt {
+    /// What the capture held: for `Counts` now, for `Clear` before it was cleared.
+    pub counts: CaptureCounts,
+    /// The copy made before a clear.
+    pub archive: Option<PathBuf>,
+}
+
 /// Reconnection delay policy.
 #[derive(Clone, Copy, Debug)]
 pub struct ReconnectPolicy {
@@ -145,6 +177,8 @@ pub struct CaptureService {
     routing_losses_tx: broadcast::Sender<LiveRoutingLoss>,
     operations_tx: mpsc::Sender<OperationEnvelope>,
     operations_rx: mpsc::Receiver<OperationEnvelope>,
+    maintenance_tx: mpsc::Sender<MaintenanceEnvelope>,
+    maintenance_rx: mpsc::Receiver<MaintenanceEnvelope>,
 }
 
 impl CaptureService {
@@ -161,6 +195,7 @@ impl CaptureService {
         let (frames_tx, _) = broadcast::channel(event_capacity.get());
         let (routing_losses_tx, _) = broadcast::channel(event_capacity.get());
         let (operations_tx, operations_rx) = mpsc::channel(32);
+        let (maintenance_tx, maintenance_rx) = mpsc::channel(8);
         Self {
             spec,
             endpoint,
@@ -171,6 +206,8 @@ impl CaptureService {
             routing_losses_tx,
             operations_tx,
             operations_rx,
+            maintenance_tx,
+            maintenance_rx,
         }
     }
 
@@ -196,6 +233,49 @@ impl CaptureService {
     #[must_use]
     pub fn operation_sender(&self) -> mpsc::Sender<OperationEnvelope> {
         self.operations_tx.clone()
+    }
+
+    /// A bounded channel to ask the owner of the capture store for maintenance.
+    #[must_use]
+    pub fn maintenance_sender(&self) -> mpsc::Sender<MaintenanceEnvelope> {
+        self.maintenance_tx.clone()
+    }
+
+    /// Carry out one maintenance request on the store this service owns.
+    fn execute_maintenance(
+        &mut self,
+        request: MaintenanceRequest,
+    ) -> Result<MaintenanceReceipt, String> {
+        let Some(store) = self.store.as_mut() else {
+            return Err("there is no persistent capture store".to_owned());
+        };
+        match request {
+            MaintenanceRequest::Counts => Ok(MaintenanceReceipt {
+                counts: store.counts().map_err(|error| error.to_string())?,
+                archive: None,
+            }),
+            MaintenanceRequest::Clear { archive } => {
+                // The copy comes first, and nothing is deleted when it fails.
+                if let Some(path) = &archive {
+                    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                        std::fs::create_dir_all(parent).map_err(|error| {
+                            format!("cannot create {}: {error}", parent.display())
+                        })?;
+                    }
+                    store
+                        .backup_to(path)
+                        .map_err(|error| format!("cannot copy the capture first: {error}"))?;
+                }
+                let counts = store.clear().map_err(|error| error.to_string())?;
+                Ok(MaintenanceReceipt { counts, archive })
+            }
+        }
+    }
+
+    /// Answer a maintenance request that arrived in any state of the connection.
+    fn answer_maintenance(&mut self, envelope: MaintenanceEnvelope) {
+        let result = self.execute_maintenance(envelope.request);
+        let _ = envelope.response.send(result);
     }
 
     async fn execute_operation<C: KnxConnection + Sync>(
@@ -303,6 +383,11 @@ impl CaptureService {
                             let _ = operation.response.send(Err("KNXnet/IP connection is connecting".to_owned()));
                         }
                     }
+                    envelope = self.maintenance_rx.recv() => {
+                        if let Some(envelope) = envelope {
+                            self.answer_maintenance(envelope);
+                        }
+                    }
                     result = &mut connect_attempt => break result,
                 }
             };
@@ -336,6 +421,12 @@ impl CaptureService {
                                             return Err(error);
                                         }
                                     }
+                                }
+                                continue;
+                            }
+                            envelope = self.maintenance_rx.recv() => {
+                                if let Some(envelope) = envelope {
+                                    self.answer_maintenance(envelope);
                                 }
                                 continue;
                             }
@@ -404,6 +495,11 @@ impl CaptureService {
                     operation = self.operations_rx.recv() => {
                         if let Some(operation) = operation {
                             let _ = operation.response.send(Err("KNXnet/IP connection is disconnected".to_owned()));
+                        }
+                    }
+                    envelope = self.maintenance_rx.recv() => {
+                        if let Some(envelope) = envelope {
+                            self.answer_maintenance(envelope);
                         }
                     }
                     () = &mut sleep => break,
@@ -919,6 +1015,172 @@ mod tests {
             stop_tx.send(()).unwrap();
         };
         let (result, ()) = timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                service.run_with(connector, async {
+                    let _ = stop_rx.await;
+                }),
+                observer
+            )
+        })
+        .await
+        .unwrap();
+        result.unwrap();
+    }
+
+    /// Ask the owner of the store for maintenance and wait for the answer.
+    async fn maintain(
+        sender: &mpsc::Sender<MaintenanceEnvelope>,
+        request: MaintenanceRequest,
+    ) -> Result<MaintenanceReceipt, String> {
+        let (response, receiver) = oneshot::channel();
+        sender
+            .send(MaintenanceEnvelope { request, response })
+            .await
+            .unwrap();
+        receiver.await.unwrap()
+    }
+
+    /// The capture is counted and cleared by its owner while the connection is
+    /// up, with a copy first, and what arrives afterwards is stored as before.
+    #[tokio::test]
+    async fn the_owner_counts_and_clears_the_capture_while_connected() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("capture.sqlite");
+        let archive = directory.path().join("archive").join("copy.sqlite");
+        let mut store = CaptureStore::open(&path, NonZeroU32::new(10).unwrap()).unwrap();
+        for value in 0..3 {
+            store
+                .insert(&CaptureEvent::received(
+                    CaptureEndpoint::from(spec()),
+                    frame(value),
+                ))
+                .unwrap();
+        }
+        let mut service =
+            CaptureService::new(spec(), Some(store), ReconnectPolicy::default(), capacity(8));
+        let mut states = service.subscribe_state();
+        let maintenance = service.maintenance_sender();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let connector = || async {
+            Ok::<_, &'static str>(FakeEventConnection {
+                events: VecDeque::new(),
+                closed: Arc::new(AtomicUsize::new(0)),
+            })
+        };
+        let observer = async {
+            loop {
+                if matches!(
+                    &*states.borrow_and_update(),
+                    ConnectionState::Connected { .. }
+                ) {
+                    break;
+                }
+                states.changed().await.unwrap();
+            }
+            let counted = maintain(&maintenance, MaintenanceRequest::Counts)
+                .await
+                .unwrap();
+            assert_eq!((counted.counts.events, counted.counts.losses), (3, 0));
+
+            let cleared = maintain(
+                &maintenance,
+                MaintenanceRequest::Clear {
+                    archive: Some(archive.clone()),
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(cleared.counts.events, 3, "what it held before");
+            assert_eq!(cleared.archive.as_deref(), Some(archive.as_path()));
+            let counted = maintain(&maintenance, MaintenanceRequest::Counts)
+                .await
+                .unwrap();
+            assert_eq!(counted.counts.events, 0);
+            stop_tx.send(()).unwrap();
+        };
+        let (result, ()) = timeout(Duration::from_secs(3), async {
+            tokio::join!(
+                service.run_with(connector, async {
+                    let _ = stop_rx.await;
+                }),
+                observer
+            )
+        })
+        .await
+        .unwrap();
+        result.unwrap();
+        // The copy holds what was there before the clear.
+        let copy = CaptureStore::open_existing(&archive).unwrap();
+        assert_eq!(copy.counts().unwrap().events, 3);
+        // And the capture itself is empty.
+        let reader = CaptureStore::open_existing(&path).unwrap();
+        assert_eq!(reader.counts().unwrap().events, 0);
+    }
+
+    /// A copy that cannot be made leaves the capture alone.
+    #[tokio::test]
+    async fn a_copy_that_fails_deletes_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("capture.sqlite");
+        let mut store = CaptureStore::open(&path, NonZeroU32::new(10).unwrap()).unwrap();
+        store
+            .insert(&CaptureEvent::received(
+                CaptureEndpoint::from(spec()),
+                frame(1),
+            ))
+            .unwrap();
+        let existing = directory.path().join("taken.sqlite");
+        std::fs::write(&existing, b"in the way").unwrap();
+        let mut service =
+            CaptureService::new(spec(), Some(store), ReconnectPolicy::default(), capacity(8));
+        let refused = service.execute_maintenance(MaintenanceRequest::Clear {
+            archive: Some(existing),
+        });
+        assert!(refused.is_err(), "{refused:?}");
+        let counts = service
+            .execute_maintenance(MaintenanceRequest::Counts)
+            .unwrap();
+        assert_eq!(counts.counts.events, 1);
+    }
+
+    /// Maintenance is answered while the gateway is down, too: clearing the
+    /// capture does not wait for a connection.
+    #[tokio::test]
+    async fn maintenance_is_answered_while_waiting_to_reconnect() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("capture.sqlite");
+        let store = CaptureStore::open(&path, NonZeroU32::new(10).unwrap()).unwrap();
+        let policy =
+            ReconnectPolicy::new(Duration::from_millis(100), Duration::from_millis(100)).unwrap();
+        let mut service = CaptureService::new(spec(), Some(store), policy, capacity(1));
+        let mut states = service.subscribe_state();
+        let maintenance = service.maintenance_sender();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let connector = || async {
+            Ok::<_, &'static str>(FakeConnection {
+                frames: VecDeque::new(),
+                close_when_empty: true,
+                closed: Arc::new(AtomicUsize::new(0)),
+                received: Arc::new(AtomicUsize::new(0)),
+            })
+        };
+        let observer = async {
+            loop {
+                states.changed().await.unwrap();
+                if matches!(
+                    &*states.borrow_and_update(),
+                    ConnectionState::WaitingRetry { .. }
+                ) {
+                    break;
+                }
+            }
+            let counted = maintain(&maintenance, MaintenanceRequest::Counts)
+                .await
+                .unwrap();
+            assert_eq!(counted.counts.events, 0);
+            stop_tx.send(()).unwrap();
+        };
+        let (result, ()) = timeout(Duration::from_secs(3), async {
             tokio::join!(
                 service.run_with(connector, async {
                     let _ = stop_rx.await;

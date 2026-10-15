@@ -319,6 +319,17 @@ struct QuitQuestion {
     remember: bool,
 }
 
+/// The question before the stored capture is cleared.
+struct ClearCaptureQuestion {
+    /// The capture it is about, which may no longer be the one on screen when
+    /// the answer comes.
+    database: PathBuf,
+    /// Telegrams and loss reports it holds, or why that could not be read.
+    counts: Result<(u64, u64), String>,
+    /// Copy it to the archive folder first. On unless turned off.
+    archive: bool,
+}
+
 #[derive(Default)]
 #[expect(
     clippy::struct_excessive_bools,
@@ -330,6 +341,9 @@ struct MonitorApp {
     /// Where the answer to the quit question is remembered.
     settings_file: Option<PathBuf>,
     quit_question: Option<QuitQuestion>,
+    /// Counts and clears a capture through the daemon; `None` in tests.
+    capture_control: Option<interface::CaptureControl>,
+    clear_capture: Option<ClearCaptureQuestion>,
     /// Quitting is decided; the next close goes through.
     quit_resolved: bool,
     /// The agent skill offered at start, until it is answered.
@@ -407,6 +421,8 @@ impl MonitorApp {
             // Tests never reach the daemon of the user running them.
             #[cfg(not(test))]
             quit_daemon: Some(interface::daemon_control()),
+            #[cfg(not(test))]
+            capture_control: Some(interface::capture_control()),
             #[cfg(not(test))]
             settings_file: devknx::settings::Settings::path().ok(),
             ..Self::default()
@@ -1326,6 +1342,7 @@ impl MonitorApp {
     fn dialogs(&mut self, ctx: &egui::Context) {
         self.skill_offer_window(ctx);
         self.quit_window(ctx);
+        self.clear_capture_window(ctx);
         if self.show_settings {
             let mut open = self.show_settings;
             let mut save = false;
@@ -1822,6 +1839,157 @@ impl MonitorApp {
             .clicked()
         {
             self.show_export = true;
+        }
+        let recorded = !self.offline_capture
+            && self
+                .model
+                .as_ref()
+                .is_some_and(|model| model.owner_available);
+        if ui
+            .add_enabled(recorded, egui::Button::new("Clear…"))
+            .on_hover_text("Delete the stored capture, after asking")
+            .clicked()
+        {
+            self.open_clear_capture();
+        }
+    }
+
+    /// Count what the capture holds and open the question before it is cleared.
+    fn open_clear_capture(&mut self) {
+        use interface::{CaptureAnswer, CaptureRequest};
+        let Some(database) = self.model.as_ref().map(|model| model.database.clone()) else {
+            return;
+        };
+        let Some(control) = self.capture_control.clone() else {
+            self.error = Some("No daemon is behind this window, so nothing can be cleared".into());
+            return;
+        };
+        let counts = match control(&database, CaptureRequest::Counts) {
+            Ok(CaptureAnswer::Counts { events, losses }) => Ok((events, losses)),
+            Ok(CaptureAnswer::Cleared { .. }) => Err("unexpected answer from the daemon".into()),
+            Err(error) => Err(error),
+        };
+        self.clear_capture = Some(ClearCaptureQuestion {
+            database,
+            counts,
+            archive: true,
+        });
+    }
+
+    /// Close the question without deleting anything.
+    fn cancel_clear_capture(&mut self) {
+        self.clear_capture = None;
+    }
+
+    /// Clear the capture and say what happened. A failure is shown and what is
+    /// loaded stays.
+    fn confirm_clear_capture(&mut self) {
+        use interface::{CaptureAnswer, CaptureRequest};
+        let Some(question) = self.clear_capture.take() else {
+            return;
+        };
+        let Some(control) = self.capture_control.clone() else {
+            return;
+        };
+        match control(
+            &question.database,
+            CaptureRequest::Clear {
+                archive: question.archive,
+            },
+        ) {
+            Ok(CaptureAnswer::Cleared {
+                events,
+                losses,
+                archive,
+            }) => {
+                let copy = archive
+                    .as_ref()
+                    .map_or_else(String::new, |path| format!(", copy in {}", path.display()));
+                let message = format!("Cleared {events} telegrams and {losses} loss reports{copy}");
+                if let Some(model) = self
+                    .model
+                    .as_mut()
+                    .filter(|model| model.database == question.database)
+                {
+                    model.cleared(message);
+                }
+            }
+            Ok(CaptureAnswer::Counts { .. }) => {
+                self.error = Some("Clearing the capture: unexpected answer from the daemon".into());
+            }
+            Err(error) => self.error = Some(format!("Clearing the capture failed: {error}")),
+        }
+    }
+
+    /// The question before the capture is cleared. Cancel has the focus, so
+    /// Enter deletes nothing; deleting is a click on its own button.
+    fn clear_capture_window(&mut self, ctx: &egui::Context) {
+        let Some(question) = self.clear_capture.as_mut() else {
+            return;
+        };
+        let mut confirm = false;
+        let mut cancel = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        let deletable = matches!(question.counts, Ok((events, losses)) if events + losses > 0);
+        egui::Window::new("Clear capture")
+            .resizable(false)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                match &question.counts {
+                    Ok((0, 0)) => {
+                        ui.label("The capture is empty.");
+                    }
+                    Ok((events, losses)) => {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Delete {events} telegrams and {losses} loss reports?"
+                            ))
+                            .strong(),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            "The capture is the record of what the bus carried. Once \
+                             deleted it can only come back from the copy. The imported \
+                             group addresses and the log of what was sent from here stay.",
+                        );
+                    }
+                    Err(error) => {
+                        ui.colored_label(
+                            egui::Color32::LIGHT_RED,
+                            format!("The capture could not be read: {error}"),
+                        );
+                    }
+                }
+                ui.add_space(8.0);
+                ui.add_enabled(
+                    deletable,
+                    egui::Checkbox::new(
+                        &mut question.archive,
+                        "Copy it to the archive folder first (recommended)",
+                    ),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let cancel_button = ui.button("Cancel");
+                    if !ui.memory(|memory| memory.focused().is_some()) {
+                        cancel_button.request_focus();
+                    }
+                    if cancel_button.clicked() {
+                        cancel = true;
+                    }
+                    let delete = egui::Button::new(
+                        egui::RichText::new("Clear capture").color(egui::Color32::WHITE),
+                    )
+                    .fill(egui::Color32::from_rgb(180, 50, 50));
+                    if ui.add_enabled(deletable, delete).clicked() {
+                        confirm = true;
+                    }
+                });
+            });
+        if cancel {
+            self.cancel_clear_capture();
+        } else if confirm {
+            self.confirm_clear_capture();
         }
     }
 
@@ -2796,5 +2964,131 @@ mod tests {
             egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(5)),
             "the text should be selected from start to end"
         );
+    }
+
+    /// An app showing a capture with `rows` rows, owned by a daemon that is
+    /// asked through a fake control.
+    fn app_with_capture(
+        rows: u64,
+        fail: bool,
+    ) -> (
+        MonitorApp,
+        crate::interface::CaptureLog,
+        PathBuf,
+        tempfile::TempDir,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("capture.sqlite");
+        drop(CaptureStore::open(&database, NonZeroU32::new(2_000).unwrap()).unwrap());
+        let mut model = MonitorModel::open(database.clone()).unwrap();
+        append_rows(&mut model, 1, i64::try_from(rows).unwrap());
+        model.owner_available = true;
+        let (control, asked) = crate::interface::fake_capture_control(rows, fail);
+        let app = MonitorApp {
+            model: Some(model),
+            capture_control: Some(control),
+            ..Default::default()
+        };
+        (app, asked, database, directory)
+    }
+
+    #[test]
+    fn the_question_counts_the_capture_and_proposes_a_copy() {
+        use crate::interface::CaptureRequest;
+        let (mut app, asked, database, _directory) = app_with_capture(5, false);
+        app.open_clear_capture();
+        let question = app.clear_capture.as_ref().expect("a question");
+        assert!(
+            matches!(question.counts, Ok((5, 2))),
+            "{:?}",
+            question.counts
+        );
+        assert!(
+            question.archive,
+            "the copy is on unless the user turns it off"
+        );
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![(database, CaptureRequest::Counts)]
+        );
+        // Cancelling deletes nothing and keeps what is loaded.
+        app.cancel_clear_capture();
+        assert!(app.clear_capture.is_none());
+        assert_eq!(asked.lock().unwrap().len(), 1);
+        assert_eq!(app.model.as_ref().unwrap().rows.len(), 5);
+    }
+
+    #[test]
+    fn confirming_clears_with_the_copy_the_box_says_and_empties_the_view() {
+        use crate::interface::CaptureRequest;
+        for archive in [true, false] {
+            let (mut app, asked, database, _directory) = app_with_capture(5, false);
+            app.open_clear_capture();
+            app.clear_capture.as_mut().unwrap().archive = archive;
+            app.confirm_clear_capture();
+            assert_eq!(
+                asked.lock().unwrap().last().cloned(),
+                Some((database, CaptureRequest::Clear { archive }))
+            );
+            assert!(app.clear_capture.is_none());
+            let model = app.model.as_ref().unwrap();
+            assert!(model.rows.is_empty(), "the loaded rows are dropped too");
+            let notice = model.notices.last().expect("a notice");
+            assert!(
+                notice.starts_with("Cleared 5 telegrams and 2 loss reports"),
+                "{notice}"
+            );
+            assert_eq!(notice.contains("copy in"), archive, "{notice}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_is_reported_and_the_view_stays() {
+        let (mut app, _, _, _directory) = app_with_capture(5, true);
+        app.open_clear_capture();
+        app.confirm_clear_capture();
+        let error = app.error.clone().expect("an error");
+        assert!(error.contains("failed"), "{error}");
+        assert_eq!(app.model.as_ref().unwrap().rows.len(), 5);
+    }
+
+    /// An answer that comes after the window moved to another capture does
+    /// not empty the one on screen.
+    #[test]
+    fn the_answer_does_not_empty_another_capture() {
+        let (mut app, _, _, _directory) = app_with_capture(5, false);
+        app.open_clear_capture();
+        app.clear_capture.as_mut().unwrap().database = PathBuf::from("/elsewhere/other.sqlite");
+        app.confirm_clear_capture();
+        assert_eq!(app.model.as_ref().unwrap().rows.len(), 5);
+    }
+
+    #[test]
+    fn without_a_control_no_question_opens() {
+        let (mut app, asked, _, _directory) = app_with_capture(5, false);
+        app.capture_control = None;
+        app.open_clear_capture();
+        assert!(app.clear_capture.is_none());
+        assert!(app.error.is_some());
+        assert!(asked.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_question_draws_for_a_full_an_empty_and_an_unreadable_capture() {
+        for counts in [Ok((5, 2)), Ok((0, 0)), Err("no answer".to_string())] {
+            let (mut app, asked, database, _directory) = app_with_capture(5, false);
+            app.clear_capture = Some(ClearCaptureQuestion {
+                database,
+                counts,
+                archive: true,
+            });
+            let ctx = egui::Context::default();
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                app.clear_capture_window(ui.ctx());
+            });
+            output.textures_delta.clear();
+            assert!(app.clear_capture.is_some(), "drawing closed the question");
+            assert!(asked.lock().unwrap().is_empty(), "drawing asked the daemon");
+        }
     }
 }

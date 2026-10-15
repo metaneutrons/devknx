@@ -39,8 +39,19 @@ impl Sandbox {
             .env("XDG_DATA_HOME", self.directory.path())
             .env("LOCALAPPDATA", self.directory.path())
             .env("DEVKNX_NO_VERSION_WARNING", "1")
+            // What a daemon started by a client prints, for a failure to show.
+            .env("DEVKNX_DAEMON_LOG", self.daemon_log_path())
             .stdin(Stdio::null());
         command
+    }
+
+    fn daemon_log_path(&self) -> std::path::PathBuf {
+        self.directory.path().join("daemon.log")
+    }
+
+    /// What the daemons started by clients printed so far.
+    fn daemon_log(&self) -> String {
+        std::fs::read_to_string(self.daemon_log_path()).unwrap_or_default()
     }
 
     /// Start a command with its output going to files, not pipes: a daemon
@@ -273,10 +284,11 @@ async fn requests_during_a_stop_reach_a_daemon() {
             let output = client.finish();
             assert!(
                 output.status.success(),
-                "round {round}: {:?}\nstdout: {}\nstderr: {}",
+                "round {round}: {:?}\nstdout: {}\nstderr: {}\ndaemons started by clients:\n{}",
                 output.status,
                 String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&output.stderr),
+                sandbox.daemon_log()
             );
             let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(reply["result"], "session", "round {round}: {reply}");

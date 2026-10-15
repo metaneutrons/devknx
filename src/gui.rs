@@ -11,6 +11,7 @@ use devknx::control::RestStatus;
 use devknx::ets::{CsvEncoding, EtsFormat};
 use devknx::ipc::WireState;
 use devknx::paths;
+use devknx::storage::CaptureSide;
 use eframe::egui;
 use knx_rs_ip::discovery::GatewayInfo;
 
@@ -330,6 +331,21 @@ struct ClearCaptureQuestion {
     archive: bool,
 }
 
+/// The question before the telegrams on one side of a telegram are deleted.
+struct DeleteAroundQuestion {
+    /// The capture it is about, which may no longer be the one on screen when
+    /// the answer comes.
+    database: PathBuf,
+    /// Which telegrams, around which one.
+    span: devknx::storage::CaptureSpan,
+    /// The telegram that stays, as the row shows it.
+    line: String,
+    /// Telegrams and loss reports the span holds, or why that could not be read.
+    counts: Result<(u64, u64), String>,
+    /// Copy the capture to the archive folder first. On unless turned off.
+    archive: bool,
+}
+
 #[derive(Default)]
 #[expect(
     clippy::struct_excessive_bools,
@@ -344,6 +360,7 @@ struct MonitorApp {
     /// Counts and clears a capture through the daemon; `None` in tests.
     capture_control: Option<interface::CaptureControl>,
     clear_capture: Option<ClearCaptureQuestion>,
+    delete_around: Option<DeleteAroundQuestion>,
     /// Quitting is decided; the next close goes through.
     quit_resolved: bool,
     /// The agent skill offered at start, until it is answered.
@@ -1343,6 +1360,7 @@ impl MonitorApp {
         self.skill_offer_window(ctx);
         self.quit_window(ctx);
         self.clear_capture_window(ctx);
+        self.delete_around_window(ctx);
         if self.show_settings {
             let mut open = self.show_settings;
             let mut save = false;
@@ -1866,7 +1884,7 @@ impl MonitorApp {
         };
         let counts = match control(&database, CaptureRequest::Counts) {
             Ok(CaptureAnswer::Counts { events, losses }) => Ok((events, losses)),
-            Ok(CaptureAnswer::Cleared { .. }) => Err("unexpected answer from the daemon".into()),
+            Ok(_) => Err("unexpected answer from the daemon".into()),
             Err(error) => Err(error),
         };
         self.clear_capture = Some(ClearCaptureQuestion {
@@ -1874,6 +1892,173 @@ impl MonitorApp {
             counts,
             archive: true,
         });
+    }
+
+    /// Count the telegrams on one side of a telegram and open the question
+    /// before they are deleted.
+    fn open_delete_around(&mut self, side: CaptureSide, id: i64, destination: &str) {
+        use interface::{CaptureAnswer, CaptureRequest};
+        let Some(model) = self.model.as_ref() else {
+            return;
+        };
+        let database = model.database.clone();
+        // A deletion below a telegram stops at the newest one this window has
+        // seen, so telegrams that arrive while the question is open are not
+        // taken.
+        let span = devknx::storage::CaptureSpan {
+            side,
+            line: id,
+            through: (side == CaptureSide::Below).then(|| model.newest_id()),
+        };
+        let Some(control) = self.capture_control.clone() else {
+            self.error = Some("No daemon is behind this window, so nothing can be deleted".into());
+            return;
+        };
+        let counts = match control(&database, CaptureRequest::CountAround { span }) {
+            Ok(CaptureAnswer::SpanCounts { events, losses }) => Ok((events, losses)),
+            Ok(_) => Err("unexpected answer from the daemon".into()),
+            Err(error) => Err(error),
+        };
+        self.delete_around = Some(DeleteAroundQuestion {
+            database,
+            span,
+            line: format!("{id} ({destination})"),
+            counts,
+            archive: true,
+        });
+    }
+
+    /// Close the question without deleting anything.
+    fn cancel_delete_around(&mut self) {
+        self.delete_around = None;
+    }
+
+    /// Delete the telegrams and say what happened. A failure is shown and what
+    /// is loaded stays.
+    fn confirm_delete_around(&mut self) {
+        use interface::{CaptureAnswer, CaptureRequest};
+        let Some(question) = self.delete_around.take() else {
+            return;
+        };
+        let Some(control) = self.capture_control.clone() else {
+            return;
+        };
+        match control(
+            &question.database,
+            CaptureRequest::DeleteAround {
+                span: question.span,
+                archive: question.archive,
+            },
+        ) {
+            Ok(CaptureAnswer::Deleted {
+                events,
+                losses,
+                archive,
+            }) => {
+                let copy = archive
+                    .as_ref()
+                    .map_or_else(String::new, |path| format!(", copy in {}", path.display()));
+                let side = match question.span.side {
+                    CaptureSide::Above => "above",
+                    CaptureSide::Below => "below",
+                };
+                let message = format!(
+                    "Deleted {events} telegrams and {losses} loss reports {side} telegram {}{copy}",
+                    question.span.line
+                );
+                if let Some(model) = self
+                    .model
+                    .as_mut()
+                    .filter(|model| model.database == question.database)
+                {
+                    model.deleted_around(question.span, message);
+                }
+            }
+            Ok(_) => {
+                self.error = Some("Deleting telegrams: unexpected answer from the daemon".into());
+            }
+            Err(error) => self.error = Some(format!("Deleting telegrams failed: {error}")),
+        }
+    }
+
+    /// The question before telegrams are deleted around a telegram. Cancel has
+    /// the focus, so Enter deletes nothing; deleting is a click on its own
+    /// button.
+    fn delete_around_window(&mut self, ctx: &egui::Context) {
+        let Some(question) = self.delete_around.as_mut() else {
+            return;
+        };
+        let mut confirm = false;
+        let mut cancel = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        let deletable = matches!(question.counts, Ok((events, losses)) if events + losses > 0);
+        let side = match question.span.side {
+            CaptureSide::Above => "above",
+            CaptureSide::Below => "below",
+        };
+        egui::Window::new("Delete telegrams")
+            .resizable(false)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                match &question.counts {
+                    Ok((0, 0)) => {
+                        ui.label(format!("There is nothing {side} this telegram."));
+                    }
+                    Ok((events, losses)) => {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Delete {events} telegrams and {losses} loss reports {side} telegram {}?",
+                                question.line
+                            ))
+                            .strong(),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            "The telegram itself stays. The capture is the record of what \
+                             the bus carried; once deleted it can only come back from the \
+                             copy. The imported group addresses and the log of what was \
+                             sent from here stay, including the entry for a telegram that \
+                             goes.",
+                        );
+                    }
+                    Err(error) => {
+                        ui.colored_label(
+                            egui::Color32::LIGHT_RED,
+                            format!("The telegrams could not be counted: {error}"),
+                        );
+                    }
+                }
+                ui.add_space(8.0);
+                ui.add_enabled(
+                    deletable,
+                    egui::Checkbox::new(
+                        &mut question.archive,
+                        "Copy the capture to the archive folder first (recommended)",
+                    ),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let cancel_button = ui.button("Cancel");
+                    if !ui.memory(|memory| memory.focused().is_some()) {
+                        cancel_button.request_focus();
+                    }
+                    if cancel_button.clicked() {
+                        cancel = true;
+                    }
+                    let delete = egui::Button::new(
+                        egui::RichText::new("Delete telegrams").color(egui::Color32::WHITE),
+                    )
+                    .fill(egui::Color32::from_rgb(180, 50, 50));
+                    if ui.add_enabled(deletable, delete).clicked() {
+                        confirm = true;
+                    }
+                });
+            });
+        if cancel {
+            self.cancel_delete_around();
+        } else if confirm {
+            self.confirm_delete_around();
+        }
     }
 
     /// Close the question without deleting anything.
@@ -1914,7 +2099,7 @@ impl MonitorApp {
                     model.cleared(message);
                 }
             }
-            Ok(CaptureAnswer::Counts { .. }) => {
+            Ok(_) => {
                 self.error = Some("Clearing the capture: unexpected answer from the daemon".into());
             }
             Err(error) => self.error = Some(format!("Clearing the capture failed: {error}")),
@@ -2095,6 +2280,8 @@ impl MonitorApp {
             .filter(|row| row.matches(&model.filter))
             .collect();
         let mut selected = None;
+        let mut delete_around: Option<(CaptureSide, i64, String)> = None;
+        let can_delete = !self.offline_capture && model.owner_available;
         let pin_to_top = self
             .live_smoke
             .as_ref()
@@ -2170,8 +2357,25 @@ impl MonitorApp {
                 if response.clicked() {
                     selected = Some((*row).clone());
                 }
+                // Only a telegram that is in the capture has an id to delete
+                // around, and only a capture a daemon records can be changed.
+                if let (Some(id), true) = (row.id, can_delete) {
+                    response.context_menu(|ui| {
+                        if ui.button("Delete Telegrams Above…").clicked() {
+                            delete_around = Some((CaptureSide::Above, id, row.destination.clone()));
+                            ui.close();
+                        }
+                        if ui.button("Delete Telegrams Below…").clicked() {
+                            delete_around = Some((CaptureSide::Below, id, row.destination.clone()));
+                            ui.close();
+                        }
+                    });
+                }
             }
         });
+        if let Some((side, id, destination)) = delete_around {
+            self.open_delete_around(side, id, &destination);
+        }
         if let Some(row) = selected {
             self.selected = Some(row);
         }
@@ -3088,6 +3292,149 @@ mod tests {
             });
             output.textures_delta.clear();
             assert!(app.clear_capture.is_some(), "drawing closed the question");
+            assert!(asked.lock().unwrap().is_empty(), "drawing asked the daemon");
+        }
+    }
+
+    #[test]
+    fn the_question_counts_around_a_telegram_and_proposes_a_copy() {
+        use crate::interface::CaptureRequest;
+        use devknx::storage::{CaptureSide, CaptureSpan};
+        let (mut app, asked, database, _directory) = app_with_capture(6, false);
+        app.open_delete_around(CaptureSide::Below, 2, "1/1/1");
+        let question = app.delete_around.as_ref().expect("a question");
+        assert!(
+            matches!(question.counts, Ok((3, 1))),
+            "{:?}",
+            question.counts
+        );
+        assert!(question.archive, "the copy is on unless it is turned off");
+        // Below a telegram the deletion ends at the newest one this window has
+        // seen, so telegrams that arrive meanwhile are not taken.
+        let span = CaptureSpan {
+            side: CaptureSide::Below,
+            line: 2,
+            through: Some(6),
+        };
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![(database, CaptureRequest::CountAround { span })]
+        );
+        // Cancelling deletes nothing and keeps what is loaded.
+        app.cancel_delete_around();
+        assert!(app.delete_around.is_none());
+        assert_eq!(asked.lock().unwrap().len(), 1);
+        assert_eq!(app.model.as_ref().unwrap().rows.len(), 6);
+    }
+
+    #[test]
+    fn above_a_telegram_has_no_end_to_stop_at() {
+        use crate::interface::CaptureRequest;
+        use devknx::storage::{CaptureSide, CaptureSpan};
+        let (mut app, asked, database, _directory) = app_with_capture(6, false);
+        app.open_delete_around(CaptureSide::Above, 4, "1/1/1");
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![(
+                database,
+                CaptureRequest::CountAround {
+                    span: CaptureSpan {
+                        side: CaptureSide::Above,
+                        line: 4,
+                        through: None,
+                    }
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn confirming_deletes_with_the_copy_the_box_says_and_trims_the_view() {
+        use crate::interface::CaptureRequest;
+        use devknx::storage::{CaptureSide, CaptureSpan};
+        for archive in [true, false] {
+            let (mut app, asked, database, _directory) = app_with_capture(6, false);
+            app.open_delete_around(CaptureSide::Below, 2, "1/1/1");
+            app.delete_around.as_mut().unwrap().archive = archive;
+            app.confirm_delete_around();
+            let span = CaptureSpan {
+                side: CaptureSide::Below,
+                line: 2,
+                through: Some(6),
+            };
+            assert_eq!(
+                asked.lock().unwrap().last().cloned(),
+                Some((database, CaptureRequest::DeleteAround { span, archive }))
+            );
+            assert!(app.delete_around.is_none());
+            let model = app.model.as_ref().unwrap();
+            let ids: Vec<Option<i64>> = model.rows.iter().map(|row| row.id).collect();
+            assert_eq!(ids, [Some(1), Some(2)], "telegram 2 itself stays");
+            let notice = model.notices.last().expect("a notice");
+            assert!(
+                notice.starts_with("Deleted 3 telegrams and 1 loss reports below telegram 2"),
+                "{notice}"
+            );
+            assert_eq!(notice.contains("copy in"), archive, "{notice}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_to_delete_is_reported_and_the_view_stays() {
+        use devknx::storage::CaptureSide;
+        let (mut app, _, _, _directory) = app_with_capture(6, true);
+        app.open_delete_around(CaptureSide::Above, 4, "1/1/1");
+        app.confirm_delete_around();
+        let error = app.error.clone().expect("an error");
+        assert!(error.contains("failed"), "{error}");
+        assert_eq!(app.model.as_ref().unwrap().rows.len(), 6);
+    }
+
+    /// An answer that comes after the window moved to another capture does not
+    /// trim the one on screen.
+    #[test]
+    fn the_answer_does_not_trim_another_capture() {
+        use devknx::storage::CaptureSide;
+        let (mut app, _, _, _directory) = app_with_capture(6, false);
+        app.open_delete_around(CaptureSide::Above, 4, "1/1/1");
+        app.delete_around.as_mut().unwrap().database = PathBuf::from("/elsewhere/other.sqlite");
+        app.confirm_delete_around();
+        assert_eq!(app.model.as_ref().unwrap().rows.len(), 6);
+    }
+
+    #[test]
+    fn without_a_control_no_deletion_question_opens() {
+        use devknx::storage::CaptureSide;
+        let (mut app, asked, _, _directory) = app_with_capture(6, false);
+        app.capture_control = None;
+        app.open_delete_around(CaptureSide::Above, 4, "1/1/1");
+        assert!(app.delete_around.is_none());
+        assert!(app.error.is_some());
+        assert!(asked.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_deletion_question_draws_for_a_count_none_and_an_error() {
+        use devknx::storage::{CaptureSide, CaptureSpan};
+        for counts in [Ok((3, 1)), Ok((0, 0)), Err("no answer".to_string())] {
+            let (mut app, asked, database, _directory) = app_with_capture(6, false);
+            app.delete_around = Some(DeleteAroundQuestion {
+                database,
+                span: CaptureSpan {
+                    side: CaptureSide::Above,
+                    line: 4,
+                    through: None,
+                },
+                line: "4 (1/1/1)".into(),
+                counts,
+                archive: true,
+            });
+            let ctx = egui::Context::default();
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                app.delete_around_window(ui.ctx());
+            });
+            output.textures_delta.clear();
+            assert!(app.delete_around.is_some(), "drawing closed the question");
             assert!(asked.lock().unwrap().is_empty(), "drawing asked the daemon");
         }
     }

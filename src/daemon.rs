@@ -314,7 +314,9 @@ impl DaemonSessions {
                 ControlResponse::Disconnected
             }
             request @ (ControlRequest::CaptureCounts { .. }
-            | ControlRequest::ClearCapture { .. }) => self.capture_request(request).await,
+            | ControlRequest::ClearCapture { .. }
+            | ControlRequest::CaptureCountsAround { .. }
+            | ControlRequest::DeleteAround { .. }) => self.capture_request(request).await,
             ControlRequest::Stop => {
                 self.stop_all().await;
                 ControlResponse::Stopped
@@ -504,13 +506,8 @@ impl DaemonSessions {
                 }
             }
             ControlRequest::ClearCapture { database, archive } => {
-                let now = std::time::SystemTime::now();
                 let archive = if archive {
-                    let path = self.archive_dir.as_ref().map_or_else(
-                        || paths::archive_path(&database, now),
-                        |directory| Ok(paths::archive_path_in(directory, &database, now)),
-                    );
-                    match path {
+                    match self.archive_target(&database) {
                         Ok(path) => Some(path),
                         Err(reason) => return ControlResponse::Error { reason },
                     }
@@ -529,12 +526,61 @@ impl DaemonSessions {
                     Err(reason) => ControlResponse::Error { reason },
                 }
             }
+            ControlRequest::CaptureCountsAround { database, span } => {
+                match self
+                    .maintain(&database, MaintenanceRequest::CountAround { span })
+                    .await
+                {
+                    Ok(receipt) => ControlResponse::CaptureSpanCounts {
+                        events: receipt.counts.events,
+                        losses: receipt.counts.losses,
+                    },
+                    Err(reason) => ControlResponse::Error { reason },
+                }
+            }
+            ControlRequest::DeleteAround {
+                database,
+                span,
+                archive,
+            } => {
+                let archive = if archive {
+                    match self.archive_target(&database) {
+                        Ok(path) => Some(path),
+                        Err(reason) => return ControlResponse::Error { reason },
+                    }
+                } else {
+                    None
+                };
+                match self
+                    .maintain(
+                        &database,
+                        MaintenanceRequest::DeleteAround { span, archive },
+                    )
+                    .await
+                {
+                    Ok(receipt) => ControlResponse::CaptureDeleted {
+                        events: receipt.counts.events,
+                        losses: receipt.counts.losses,
+                        archive: receipt.archive,
+                    },
+                    Err(reason) => ControlResponse::Error { reason },
+                }
+            }
             // Not formatted: the request type deliberately has no `Debug`, as
             // some of its variants carry a token.
             _ => ControlResponse::Error {
                 reason: "not a capture request".to_owned(),
             },
         }
+    }
+
+    /// Where the copy of `database` made before a deletion goes.
+    fn archive_target(&self, database: &Path) -> Result<PathBuf, String> {
+        let now = std::time::SystemTime::now();
+        self.archive_dir.as_ref().map_or_else(
+            || paths::archive_path(database, now),
+            |directory| Ok(paths::archive_path_in(directory, database, now)),
+        )
     }
 
     /// Ask the session that records `database` to do something to its capture.
@@ -1053,5 +1099,152 @@ mod tests {
     #[test]
     fn a_started_daemon_waits_as_long_as_its_client() {
         assert!(OWNER_WAIT >= crate::control::DAEMON_START_TIMEOUT);
+    }
+
+    /// A capture bound to `endpoint` that holds `count` telegrams, closed again
+    /// so a session can take over as its writer.
+    fn capture_with_telegrams(
+        database: &Path,
+        endpoint: &str,
+        gateway: std::net::SocketAddr,
+        count: u8,
+    ) {
+        use crate::capture::{CaptureEndpoint, CaptureEvent};
+        use knx_rs_core::address::{DestinationAddress, GroupAddress, IndividualAddress};
+        use knx_rs_core::cemi::CemiFrame;
+        use knx_rs_core::message::MessageCode;
+        use knx_rs_core::types::Priority;
+
+        let mut store =
+            CaptureStore::open_bound(database, std::num::NonZeroU32::new(100).unwrap(), endpoint)
+                .unwrap();
+        for value in 1..=count {
+            let frame = CemiFrame::new_l_data(
+                MessageCode::LDataInd,
+                IndividualAddress::from_raw(0x1101),
+                DestinationAddress::Group(GroupAddress::from_raw(0x0801)),
+                Priority::Low,
+                &[0x00, 0x80, value],
+            );
+            store
+                .insert(&CaptureEvent::received(
+                    CaptureEndpoint::Tunnel(gateway),
+                    frame,
+                ))
+                .unwrap();
+        }
+    }
+
+    /// The daemon counts and deletes around a telegram through the session that
+    /// records the capture, with a copy first, and refuses a capture no session
+    /// records.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_daemon_deletes_around_a_telegram_through_its_session() {
+        use crate::storage::{CaptureSide, CaptureSpan};
+
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("capture.sqlite");
+        let archive_dir = directory.path().join("archive");
+        let gateway = knx_rs_ip::DeviceServer::start_at("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let endpoint = format!("tunnel://{}", gateway.local_addr());
+        // Telegrams 1 to 5 are in the capture before the session records it.
+        capture_with_telegrams(&database, &endpoint, gateway.local_addr(), 5);
+        let mut sessions = DaemonSessions {
+            archive_dir: Some(archive_dir.clone()),
+            ..DaemonSessions::default()
+        };
+        let lifecycle = lifecycle();
+        let connected = sessions
+            .handle(
+                ControlRequest::Connect {
+                    endpoint,
+                    database: Some(database.clone()),
+                    max_events: 100,
+                },
+                &lifecycle,
+            )
+            .await;
+        assert!(
+            matches!(connected, ControlResponse::Session { .. }),
+            "{connected:?}"
+        );
+        let span = CaptureSpan {
+            side: CaptureSide::Below,
+            line: 2,
+            through: Some(4),
+        };
+
+        let counted = sessions
+            .handle(
+                ControlRequest::CaptureCountsAround {
+                    database: database.clone(),
+                    span,
+                },
+                &lifecycle,
+            )
+            .await;
+        assert_eq!(
+            counted,
+            ControlResponse::CaptureSpanCounts {
+                events: 2,
+                losses: 0
+            }
+        );
+
+        let deleted = sessions
+            .handle(
+                ControlRequest::DeleteAround {
+                    database: database.clone(),
+                    span,
+                    archive: true,
+                },
+                &lifecycle,
+            )
+            .await;
+        let ControlResponse::CaptureDeleted {
+            events, archive, ..
+        } = deleted
+        else {
+            panic!("not deleted: {deleted:?}");
+        };
+        assert_eq!(events, 2);
+        let archive = archive.expect("a copy was asked for");
+        assert!(archive.starts_with(&archive_dir), "{archive:?}");
+        assert!(archive.exists(), "the copy is not at {archive:?}");
+
+        let after = sessions
+            .handle(
+                ControlRequest::CaptureCounts {
+                    database: database.clone(),
+                },
+                &lifecycle,
+            )
+            .await;
+        assert_eq!(
+            after,
+            ControlResponse::CaptureCounts {
+                events: 3,
+                losses: 0
+            }
+        );
+
+        // Counter-probe: a capture no session records is refused.
+        let refused = sessions
+            .handle(
+                ControlRequest::DeleteAround {
+                    database: directory.path().join("another.sqlite"),
+                    span,
+                    archive: false,
+                },
+                &lifecycle,
+            )
+            .await;
+        assert!(
+            matches!(&refused, ControlResponse::Error { reason } if reason.contains("not being recorded")),
+            "{refused:?}"
+        );
+        sessions.stop_all().await;
     }
 }

@@ -20,7 +20,7 @@ use devknx::ipc::{IpcClient, IpcMessage, WireState};
 use devknx::operations::{OperationRequest, prepare};
 use devknx::paths;
 use devknx::service::LiveCapture;
-use devknx::storage::CaptureStore;
+use devknx::storage::{CaptureSide, CaptureSpan, CaptureStore};
 use knx_rs_ip::discovery::{self, GatewayInfo};
 use knx_rs_ip::{ConnectionSpec, parse_url};
 use serde::{Deserialize, Serialize};
@@ -130,6 +130,28 @@ impl MonitorModel {
             }));
         }
         Ok(())
+    }
+
+    /// The newest capture id this model has seen or shows, 0 when there is none.
+    #[must_use]
+    pub fn newest_id(&self) -> i64 {
+        self.rows
+            .iter()
+            .filter_map(|row| row.id)
+            .max()
+            .map_or(self.last_seen_id, |shown| shown.max(self.last_seen_id))
+    }
+
+    /// Telegrams around one telegram were deleted in the daemon: take them off
+    /// the screen too. A row without an id is not in the capture and stays.
+    pub fn deleted_around(&mut self, span: CaptureSpan, message: String) {
+        self.rows.retain(|row| {
+            row.id.is_none_or(|id| match span.side {
+                CaptureSide::Above => id >= span.line,
+                CaptureSide::Below => id <= span.line || id > span.through.unwrap_or(i64::MAX),
+            })
+        });
+        self.notice(message);
     }
 
     /// The capture was cleared in the daemon: drop what is loaded here too.
@@ -770,6 +792,11 @@ pub enum CaptureRequest {
     Counts,
     /// Delete it, after a copy in the archive directory when `archive` is set.
     Clear { archive: bool },
+    /// How much a span around one telegram holds.
+    CountAround { span: CaptureSpan },
+    /// Delete a span around one telegram, which stays, after a copy of the
+    /// capture in the archive directory when `archive` is set.
+    DeleteAround { span: CaptureSpan, archive: bool },
 }
 
 /// What the daemon answered about a capture.
@@ -779,6 +806,15 @@ pub enum CaptureAnswer {
     Counts { events: u64, losses: u64 },
     /// What it held before it was cleared, and where the copy went.
     Cleared {
+        events: u64,
+        losses: u64,
+        archive: Option<PathBuf>,
+    },
+    /// What a span around a telegram holds.
+    SpanCounts { events: u64, losses: u64 },
+    /// What a span around a telegram held before it was deleted, and where the
+    /// copy of the capture went.
+    Deleted {
         events: u64,
         losses: u64,
         archive: Option<PathBuf>,
@@ -803,6 +839,14 @@ pub fn capture_control() -> CaptureControl {
         let request = match request {
             CaptureRequest::Counts => ControlRequest::CaptureCounts { database },
             CaptureRequest::Clear { archive } => ControlRequest::ClearCapture { database, archive },
+            CaptureRequest::CountAround { span } => {
+                ControlRequest::CaptureCountsAround { database, span }
+            }
+            CaptureRequest::DeleteAround { span, archive } => ControlRequest::DeleteAround {
+                database,
+                span,
+                archive,
+            },
         };
         match control_request(request) {
             Ok(ControlResponse::CaptureCounts { events, losses }) => {
@@ -813,6 +857,18 @@ pub fn capture_control() -> CaptureControl {
                 losses,
                 archive,
             }) => Ok(CaptureAnswer::Cleared {
+                events,
+                losses,
+                archive,
+            }),
+            Ok(ControlResponse::CaptureSpanCounts { events, losses }) => {
+                Ok(CaptureAnswer::SpanCounts { events, losses })
+            }
+            Ok(ControlResponse::CaptureDeleted {
+                events,
+                losses,
+                archive,
+            }) => Ok(CaptureAnswer::Deleted {
                 events,
                 losses,
                 archive,
@@ -846,7 +902,12 @@ pub fn fake_capture_control(events: u64, fail: bool) -> (CaptureControl, Capture
         log.lock()
             .unwrap()
             .push((database.to_path_buf(), request.clone()));
-        if fail && request != CaptureRequest::Counts {
+        if fail
+            && !matches!(
+                request,
+                CaptureRequest::Counts | CaptureRequest::CountAround { .. }
+            )
+        {
             return Err("the daemon refused".to_owned());
         }
         // An empty capture has no loss reports either.
@@ -856,6 +917,17 @@ pub fn fake_capture_control(events: u64, fail: bool) -> (CaptureControl, Capture
             CaptureRequest::Clear { archive } => CaptureAnswer::Cleared {
                 events,
                 losses,
+                archive: archive.then(|| PathBuf::from("/archive/capture.sqlite")),
+            },
+            // The fake holds `events` telegrams and says that half of them
+            // are around any telegram.
+            CaptureRequest::CountAround { .. } => CaptureAnswer::SpanCounts {
+                events: events / 2,
+                losses: losses / 2,
+            },
+            CaptureRequest::DeleteAround { archive, .. } => CaptureAnswer::Deleted {
+                events: events / 2,
+                losses: losses / 2,
                 archive: archive.then(|| PathBuf::from("/archive/capture.sqlite")),
             },
         })

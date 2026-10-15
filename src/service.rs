@@ -23,7 +23,7 @@ use crate::capture::{CaptureEndpoint, CaptureEvent, RoutingLossEvent};
 use crate::operations::{OperationRequest, prepare};
 use std::path::PathBuf;
 
-use crate::storage::{CaptureCounts, CaptureStore, StorageError};
+use crate::storage::{CaptureCounts, CaptureSpan, CaptureStore, StorageError};
 
 /// Current lifecycle state of one configured connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,6 +95,20 @@ pub struct OperationReceipt {
     pub raw_cemi: Vec<u8>,
 }
 
+/// Make the copy that comes before a deletion. Nothing is deleted when it fails.
+fn copy_first(store: &CaptureStore, archive: Option<&std::path::Path>) -> Result<(), String> {
+    let Some(path) = archive else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+    }
+    store
+        .backup_to(path)
+        .map_err(|error| format!("cannot copy the capture first: {error}"))
+}
+
 /// A request to the owner of the capture store that is not a KNX operation.
 ///
 /// The store has one writer, and it is this service. Whatever changes the
@@ -106,6 +120,14 @@ pub enum MaintenanceRequest {
     Counts,
     /// Delete the capture, after a copy at `archive` when one is given.
     Clear { archive: Option<PathBuf> },
+    /// What a span around one telegram holds.
+    CountAround { span: CaptureSpan },
+    /// Delete a span around one telegram, which stays, after a copy of the
+    /// whole capture at `archive` when one is given.
+    DeleteAround {
+        span: CaptureSpan,
+        archive: Option<PathBuf>,
+    },
 }
 
 /// A request for maintenance with the way back to its asker.
@@ -120,6 +142,7 @@ pub struct MaintenanceEnvelope {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MaintenanceReceipt {
     /// What the capture held: for `Counts` now, for `Clear` before it was cleared.
+    /// For the requests around a telegram, what the span holds or held.
     pub counts: CaptureCounts,
     /// The copy made before a clear.
     pub archive: Option<PathBuf>,
@@ -255,18 +278,21 @@ impl CaptureService {
                 archive: None,
             }),
             MaintenanceRequest::Clear { archive } => {
-                // The copy comes first, and nothing is deleted when it fails.
-                if let Some(path) = &archive {
-                    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                        std::fs::create_dir_all(parent).map_err(|error| {
-                            format!("cannot create {}: {error}", parent.display())
-                        })?;
-                    }
-                    store
-                        .backup_to(path)
-                        .map_err(|error| format!("cannot copy the capture first: {error}"))?;
-                }
+                copy_first(store, archive.as_deref())?;
                 let counts = store.clear().map_err(|error| error.to_string())?;
+                Ok(MaintenanceReceipt { counts, archive })
+            }
+            MaintenanceRequest::CountAround { span } => Ok(MaintenanceReceipt {
+                counts: store
+                    .count_around(span)
+                    .map_err(|error| error.to_string())?,
+                archive: None,
+            }),
+            MaintenanceRequest::DeleteAround { span, archive } => {
+                copy_first(store, archive.as_deref())?;
+                let counts = store
+                    .delete_around(span)
+                    .map_err(|error| error.to_string())?;
                 Ok(MaintenanceReceipt { counts, archive })
             }
         }
@@ -1141,6 +1167,95 @@ mod tests {
             .execute_maintenance(MaintenanceRequest::Counts)
             .unwrap();
         assert_eq!(counts.counts.events, 1);
+    }
+
+    /// The telegrams around one telegram are counted, and deleted with a copy
+    /// of the whole capture first. The telegram itself stays.
+    #[tokio::test]
+    async fn the_owner_deletes_around_a_telegram_after_a_copy() {
+        use crate::storage::{CaptureSide, CaptureSpan};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("capture.sqlite");
+        let archive = directory.path().join("archive").join("copy.sqlite");
+        let mut store = CaptureStore::open(&path, NonZeroU32::new(10).unwrap()).unwrap();
+        for value in 1..=5 {
+            store
+                .insert(&CaptureEvent::received(
+                    CaptureEndpoint::from(spec()),
+                    frame(value),
+                ))
+                .unwrap();
+        }
+        let mut service =
+            CaptureService::new(spec(), Some(store), ReconnectPolicy::default(), capacity(8));
+        let span = CaptureSpan {
+            side: CaptureSide::Below,
+            line: 2,
+            through: Some(4),
+        };
+
+        let counted = service
+            .execute_maintenance(MaintenanceRequest::CountAround { span })
+            .unwrap();
+        assert_eq!(counted.counts.events, 2, "telegrams 3 and 4");
+        assert_eq!(
+            service
+                .execute_maintenance(MaintenanceRequest::Counts)
+                .unwrap()
+                .counts
+                .events,
+            5
+        );
+
+        let deleted = service
+            .execute_maintenance(MaintenanceRequest::DeleteAround {
+                span,
+                archive: Some(archive.clone()),
+            })
+            .unwrap();
+        assert_eq!(deleted.counts.events, 2);
+        assert_eq!(deleted.archive.as_deref(), Some(archive.as_path()));
+        let after = service
+            .execute_maintenance(MaintenanceRequest::Counts)
+            .unwrap();
+        assert_eq!(after.counts.events, 3, "1, 2 and the later 5 stay");
+        // The copy is the whole capture as it was.
+        let copy = CaptureStore::open_existing(&archive).unwrap();
+        assert_eq!(copy.counts().unwrap().events, 5);
+    }
+
+    /// A copy that cannot be made leaves the telegrams around a telegram alone.
+    #[tokio::test]
+    async fn a_failed_copy_deletes_nothing_around_a_telegram() {
+        use crate::storage::{CaptureSide, CaptureSpan};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("capture.sqlite");
+        let mut store = CaptureStore::open(&path, NonZeroU32::new(10).unwrap()).unwrap();
+        for value in 1..=3 {
+            store
+                .insert(&CaptureEvent::received(
+                    CaptureEndpoint::from(spec()),
+                    frame(value),
+                ))
+                .unwrap();
+        }
+        let existing = directory.path().join("taken.sqlite");
+        std::fs::write(&existing, b"in the way").unwrap();
+        let mut service =
+            CaptureService::new(spec(), Some(store), ReconnectPolicy::default(), capacity(8));
+        let refused = service.execute_maintenance(MaintenanceRequest::DeleteAround {
+            span: CaptureSpan {
+                side: CaptureSide::Above,
+                line: 3,
+                through: None,
+            },
+            archive: Some(existing),
+        });
+        assert!(refused.is_err(), "{refused:?}");
+        let counts = service
+            .execute_maintenance(MaintenanceRequest::Counts)
+            .unwrap();
+        assert_eq!(counts.counts.events, 3);
     }
 
     /// Maintenance is answered while the gateway is down, too: clearing the

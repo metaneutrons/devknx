@@ -160,6 +160,18 @@ daemon does the deleting, in the session that records the capture, so it works
 while the gateway is down, and only for a capture that is being recorded. The
 imported group addresses and the log of what was sent from here stay.
 
+To delete only part of a capture, right-click a row in the GUI (**Delete
+Telegrams Above…** and **Delete Telegrams Below…**) or select a row in the
+terminal monitor and press `[` for the telegrams above it or `]` for those
+below. The telegram itself stays. The question is the same, with the count and
+the copy of the capture first (on by default), and a deletion below a telegram
+stops at the newest telegram the screen had seen, so telegrams that arrived in
+the meantime are not taken. Loss reports follow the time of the telegram: those
+observed before it go with a deletion above, those after it with a deletion
+below. The log of what was sent from here stays, so a telegram sent from here
+that is deleted leaves its entry in that log. Only a capture the daemon records
+can be changed, and there is a notice, not a marker line, saying what went.
+
 The capture table includes source and destination addresses, service, value,
 DPT, and ETS group name. A value is decoded only when a supported, unambiguous
 DPT is known. Otherwise, group-write and response payloads appear as `0x…`:

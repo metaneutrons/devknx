@@ -627,7 +627,11 @@ fn serve_rejects_a_second_capture_writer() {
     ]);
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 error");
-    assert!(stderr.contains("WriterBusy"), "{stderr}");
+    assert!(
+        stderr.contains("capture writer is already active"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("WriterBusy"), "{stderr}");
     drop(writer);
     CaptureStore::open(&path, NonZeroU32::new(10).expect("nonzero"))
         .expect("capture writer lock must be released after the first writer is dropped");

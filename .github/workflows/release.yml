@@ -914,7 +914,31 @@ jobs:
           printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$RUNNER_TEMP/ssh/key"
           printf '%s\n' "$AUR_SSH_KNOWN_HOSTS" > "$RUNNER_TEMP/ssh/known_hosts"
           export GIT_SSH_COMMAND="ssh -F /dev/null -i $RUNNER_TEMP/ssh/key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$RUNNER_TEMP/ssh/known_hosts"
-          git -c init.defaultBranch=master clone "ssh://aur@aur.archlinux.org/$PACKAGE.git" aur
+          # The AUR closes a connection now and then ("Connection closed by
+          # ... port 22"), as at the first clone of the devserial releases
+          # 0.2.13 and 0.2.14, which passed when the failed job was run again.
+          # A read of the repository is therefore repeated a few times. The
+          # last failure still fails the step, and the push is not repeated.
+          clone_aur() {
+            local directory=$1
+            shift
+            local attempt
+            for attempt in 1 2 3 4; do
+              rm -rf "$directory"
+              if git -c init.defaultBranch=master clone "$@" \
+                "ssh://aur@aur.archlinux.org/$PACKAGE.git" "$directory"; then
+                return 0
+              fi
+              if [[ "$attempt" == 4 ]]; then
+                echo "::error::cloning $PACKAGE from the AUR failed four times"
+                return 1
+              fi
+              echo "cloning from the AUR failed (attempt $attempt), waiting $(( attempt * 15 )) seconds"
+              sleep $(( attempt * 15 ))
+            done
+          }
+
+          clone_aur aur
           cd aur
           install -m 0644 "../candidate/$PACKAGE.PKGBUILD" PKGBUILD
           docker run --rm --user "$(id -u):$(id -g)" --env HOME=/tmp \
@@ -929,7 +953,7 @@ jobs:
             git push origin HEAD:master
           fi
           cd ..
-          git clone --depth 1 "ssh://aur@aur.archlinux.org/$PACKAGE.git" readback
+          clone_aur readback --depth 1
           cmp aur/PKGBUILD readback/PKGBUILD
           cmp aur/.SRCINFO readback/.SRCINFO
           for attempt in $(seq 1 40); do

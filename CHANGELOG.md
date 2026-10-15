@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/metaneutrons/devknx/compare/v0.4.0...v0.4.1) (2026-10-15)
+
+
+### Bug Fixes
+
+* **daemon:** start another daemon when the one a client started has ended, and wait longer ([#84](https://github.com/metaneutrons/devknx/issues/84)) ([e8d96ae](https://github.com/metaneutrons/devknx/commit/e8d96aebb07406fd73243c4f9ada5a50c703074a))
+
 ## [0.4.0](https://github.com/metaneutrons/devknx/compare/v0.3.1...v0.4.0) (2026-10-15)
 
 

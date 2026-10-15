@@ -1360,6 +1360,117 @@ fn format_routing_loss(event: &RoutingLossEvent, id: Option<i64>) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The commands the README shows, as the words a shell would pass: one
+    /// per `devknx ...` line in a fenced block, a trailing `\` joined with the
+    /// next line, quotes taken off, and everything from a pipe, a redirection,
+    /// a `;`, `&&` or a comment on cut away.
+    fn readme_commands(readme: &str) -> Vec<Vec<String>> {
+        let mut commands = Vec::new();
+        let mut in_block = false;
+        let mut pending = String::new();
+        for line in readme.lines() {
+            if line.trim_start().starts_with("```") {
+                in_block = !in_block;
+                pending.clear();
+                continue;
+            }
+            if !in_block {
+                continue;
+            }
+            let text = line.trim_start().trim_start_matches("$ ");
+            if pending.is_empty() && !text.starts_with("devknx") {
+                continue;
+            }
+            if let Some(head) = text.strip_suffix('\\') {
+                pending.push_str(head);
+                pending.push(' ');
+                continue;
+            }
+            pending.push_str(text);
+            commands.push(shell_words(&std::mem::take(&mut pending)));
+        }
+        commands
+    }
+
+    /// Split a command line the way the examples need: whitespace, single and
+    /// double quotes, and a stop at the first unquoted control token.
+    fn shell_words(line: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut word = String::new();
+        let mut quote: Option<char> = None;
+        let mut started = false;
+        for ch in line.chars() {
+            match (quote, ch) {
+                (Some(q), c) if c == q => quote = None,
+                (None, '\'' | '"') => {
+                    quote = Some(ch);
+                    started = true;
+                }
+                (None, c) if c.is_whitespace() => {
+                    if started || !word.is_empty() {
+                        words.push(std::mem::take(&mut word));
+                        started = false;
+                    }
+                }
+                // Inside a quote anything goes; outside one, anything else.
+                (Some(_) | None, c) => word.push(c),
+            }
+        }
+        if started || !word.is_empty() {
+            words.push(word);
+        }
+        let end = words
+            .iter()
+            .position(|w| {
+                w.starts_with('#') || matches!(w.as_str(), "|" | ">" | "<" | ">>" | ";" | "&&")
+            })
+            .unwrap_or(words.len());
+        words.truncate(end);
+        words
+    }
+
+    /// Every command the README shows is accepted by the real parser. A flag
+    /// that was renamed or removed, or an example that never matched the
+    /// program, fails here and not in front of a reader. This runs nothing: it
+    /// proves the words parse, not that the command does what the text says.
+    #[test]
+    fn every_command_in_the_readme_parses() {
+        let commands = readme_commands(include_str!("../README.md"));
+        assert!(
+            commands.len() >= 15,
+            "only {} commands found; the extraction has probably broken",
+            commands.len()
+        );
+        let mut refused = Vec::new();
+        for words in &commands {
+            if let Err(error) = Cli::try_parse_from(words) {
+                refused.push(format!("{}\n    {}", words.join(" "), error.render()));
+            }
+        }
+        assert!(
+            refused.is_empty(),
+            "the README shows:\n{}",
+            refused.join("\n")
+        );
+    }
+
+    /// The extraction sees what it is meant to: it follows a continued line
+    /// and cuts at a comment, and a command that does not parse is refused, so
+    /// the test above can fail.
+    #[test]
+    fn the_readme_extraction_reads_continuations_comments_and_a_bad_flag() {
+        let text = "```bash\ndevknx status --json   # state\ndevknx connect \\\n  tunnel://192.0.2.1:3671\ndevknx history | jq .\n```\nprose\n";
+        assert_eq!(
+            readme_commands(text),
+            vec![
+                vec!["devknx", "status", "--json"],
+                vec!["devknx", "connect", "tunnel://192.0.2.1:3671"],
+                vec!["devknx", "history"],
+            ]
+        );
+        assert!(Cli::try_parse_from(["devknx", "status", "--no-such-flag"]).is_err());
+    }
+
     use devknx::capture::CaptureEndpoint;
     use knx_rs_core::address::{DestinationAddress, GroupAddress, IndividualAddress};
     use knx_rs_core::cemi::CemiFrame;

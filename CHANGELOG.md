@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.0](https://github.com/metaneutrons/devknx/compare/v0.3.1...v0.4.0) (2026-10-15)
+
+
+### Features
+
+* **daemon:** clear the stored capture from the window and the terminal, with a copy first ([#81](https://github.com/metaneutrons/devknx/issues/81)) ([3d84e0a](https://github.com/metaneutrons/devknx/commit/3d84e0a6a9416ffe8b1f165fb2cac245944daedf))
+* **gui:** Cmd+F selects the text of the filter field and works off macOS ([#78](https://github.com/metaneutrons/devknx/issues/78)) ([e0f2ba8](https://github.com/metaneutrons/devknx/commit/e0f2ba8561f5fd77c97c4ecad2136dad215550f5))
+
 ## [0.3.1](https://github.com/metaneutrons/devknx/compare/v0.3.0...v0.3.1) (2026-10-13)
 
 

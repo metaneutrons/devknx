@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.5.0](https://github.com/metaneutrons/devknx/compare/v0.4.1...v0.5.0) (2026-10-15)
+
+
+### Features
+
+* **daemon:** delete the telegrams above or below a telegram from the window and the terminal ([#88](https://github.com/metaneutrons/devknx/issues/88)) ([eb20001](https://github.com/metaneutrons/devknx/commit/eb20001ff519f1b9e631664e5e876e299d75b50f))
+
+
+### Bug Fixes
+
+* **cli:** report a failed command as one line, not as the Debug form of its error ([#87](https://github.com/metaneutrons/devknx/issues/87)) ([2c3a0b9](https://github.com/metaneutrons/devknx/commit/2c3a0b9cdd4dab11463d61d32e4afb93c32ab266))
+
 ## [0.4.1](https://github.com/metaneutrons/devknx/compare/v0.4.0...v0.4.1) (2026-10-15)
 
 

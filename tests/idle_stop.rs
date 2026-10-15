@@ -273,7 +273,9 @@ async fn requests_during_a_stop_reach_a_daemon() {
             let output = client.finish();
             assert!(
                 output.status.success(),
-                "round {round}: {}",
+                "round {round}: {:?}\nstdout: {}\nstderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
             let reply: Value = serde_json::from_slice(&output.stdout).unwrap();

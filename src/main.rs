@@ -381,12 +381,25 @@ enum Command {
     },
 }
 
+/// Runs the command and reports a failure the way the other tools of this family do:
+/// one line on stderr, `devknx: <reason>`, and exit code 1. Returning the error from
+/// `main` instead would print its `Debug` form.
 #[tokio::main]
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("devknx: {error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "top-level CLI dispatch names each application command explicitly"
 )]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     color::set_cli_mode(if cli.no_color {
         color::ColorMode::Never

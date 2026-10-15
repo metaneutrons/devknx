@@ -126,6 +126,32 @@ fn database_selector_requires_exactly_one_source() {
 }
 
 #[test]
+fn a_failure_is_one_readable_line_on_stderr() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let output = devknx_with_data_dir(
+        &[
+            "write-preview",
+            "--endpoint",
+            "nonsense",
+            "--dpt",
+            "1.001",
+            "1/2/3",
+            "true",
+        ],
+        directory.path(),
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"");
+    let stderr = String::from_utf8(output.stderr).expect("utf-8 on stderr");
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.starts_with("devknx: "), "{stderr}");
+    assert!(
+        !stderr.contains("Custom {") && !stderr.contains("kind:"),
+        "the error must not be printed in its Debug form: {stderr}"
+    );
+}
+
+#[test]
 fn endpoint_selected_read_does_not_create_a_missing_database() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let endpoint = "tunnel://192.0.2.1:3671";

@@ -15,6 +15,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use devknx::storage::CaptureSide;
 use ratatui::buffer::CellWidth;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
@@ -79,6 +80,8 @@ enum Mode {
     QuitQuestion,
     /// Asking before the stored capture is cleared.
     ClearCapture,
+    /// Asking before the telegrams on one side of the selected one are deleted.
+    DeleteAround,
 }
 
 /// The question on quit, with what stopping the daemon would end.
@@ -90,6 +93,15 @@ struct QuitQuestion {
 /// The question before the stored capture is cleared: what it holds, or why
 /// that could not be read.
 struct ClearCaptureQuestion {
+    counts: Result<(u64, u64), String>,
+}
+
+/// The question before the telegrams on one side of a telegram are deleted.
+struct DeleteAroundQuestion {
+    span: devknx::storage::CaptureSpan,
+    /// The telegram that stays, as the row shows it.
+    line: String,
+    /// Telegrams and loss reports the span holds, or why that could not be read.
     counts: Result<(u64, u64), String>,
 }
 
@@ -139,6 +151,7 @@ struct App {
     /// Counts and clears the capture through the daemon.
     capture: interface::CaptureControl,
     clear_capture: Option<ClearCaptureQuestion>,
+    delete_around: Option<DeleteAroundQuestion>,
     /// Said on stderr once the terminal is restored.
     exit_message: Option<String>,
 }
@@ -276,6 +289,7 @@ impl App {
             #[cfg(test)]
             capture: interface::fake_capture_control(0, false).0,
             clear_capture: None,
+            delete_around: None,
             exit_message: None,
         })
     }
@@ -290,7 +304,7 @@ impl App {
         }
         let counts = match (self.capture)(&self.model.database, CaptureRequest::Counts) {
             Ok(CaptureAnswer::Counts { events, losses }) => Ok((events, losses)),
-            Ok(CaptureAnswer::Cleared { .. }) => Err("unexpected answer from the daemon".into()),
+            Ok(_) => Err("unexpected answer from the daemon".into()),
             Err(error) => Err(error),
         };
         self.clear_capture = Some(ClearCaptureQuestion { counts });
@@ -324,13 +338,176 @@ impl App {
                 self.selected = 0;
                 self.follow_tail = true;
             }
-            Ok(CaptureAnswer::Counts { .. }) => self
+            Ok(_) => self
                 .model
                 .notice("Clearing the capture: unexpected answer from the daemon".into()),
             Err(error) => self
                 .model
                 .notice(format!("Clearing the capture failed: {error}")),
         }
+    }
+
+    /// The selected row, counted among the rows the filter lets through.
+    fn selected_row(&self) -> Option<&interface::DisplayCapture> {
+        let shown = self.visible_count();
+        self.model
+            .rows
+            .iter()
+            .filter(|row| row.matches(&self.model.filter))
+            .nth(self.selected.min(shown.saturating_sub(1)))
+    }
+
+    /// Count the telegrams on one side of the selected one and show the
+    /// question before they are deleted.
+    fn begin_delete_around(&mut self, side: CaptureSide) {
+        use interface::{CaptureAnswer, CaptureRequest};
+        if !self.model.owner_available {
+            self.model.notice(
+                "Nothing is recording this capture, so telegrams cannot be deleted here".into(),
+            );
+            return;
+        }
+        let Some((id, destination)) = self
+            .selected_row()
+            .and_then(|row| Some((row.id?, row.destination.clone())))
+        else {
+            self.model
+                .notice("Select a telegram of the capture first".into());
+            return;
+        };
+        // A deletion below the telegram stops at the newest one this screen has
+        // seen, so telegrams that arrive while the question is open are not
+        // taken.
+        let span = devknx::storage::CaptureSpan {
+            side,
+            line: id,
+            through: (side == CaptureSide::Below).then(|| self.model.newest_id()),
+        };
+        let counts =
+            match (self.capture)(&self.model.database, CaptureRequest::CountAround { span }) {
+                Ok(CaptureAnswer::SpanCounts { events, losses }) => Ok((events, losses)),
+                Ok(_) => Err("unexpected answer from the daemon".into()),
+                Err(error) => Err(error),
+            };
+        self.delete_around = Some(DeleteAroundQuestion {
+            span,
+            line: format!("{id} ({destination})"),
+            counts,
+        });
+        self.mode = Mode::DeleteAround;
+    }
+
+    /// Delete the telegrams, with a copy first or not, and say what happened.
+    /// What is loaded stays when the daemon refuses.
+    fn answer_delete_around(&mut self, archive: bool) {
+        use interface::{CaptureAnswer, CaptureRequest};
+        let deletable = self.delete_around.as_ref().is_some_and(
+            |question| matches!(question.counts, Ok((events, losses)) if events + losses > 0),
+        );
+        if !deletable {
+            return;
+        }
+        let Some(question) = self.delete_around.take() else {
+            return;
+        };
+        self.mode = Mode::Normal;
+        match (self.capture)(
+            &self.model.database,
+            CaptureRequest::DeleteAround {
+                span: question.span,
+                archive,
+            },
+        ) {
+            Ok(CaptureAnswer::Deleted {
+                events,
+                losses,
+                archive,
+            }) => {
+                let copy = archive
+                    .as_ref()
+                    .map_or_else(String::new, |path| format!(", copy in {}", path.display()));
+                let side = match question.span.side {
+                    CaptureSide::Above => "above",
+                    CaptureSide::Below => "below",
+                };
+                self.model.deleted_around(
+                    question.span,
+                    format!(
+                        "Deleted {events} telegrams and {losses} loss reports {side} telegram {}{copy}",
+                        question.span.line
+                    ),
+                );
+                // The selection stays on the telegram that stayed, which is the
+                // row with that id among those still shown.
+                let position = self
+                    .model
+                    .rows
+                    .iter()
+                    .filter(|row| row.matches(&self.model.filter))
+                    .position(|row| row.id == Some(question.span.line));
+                self.selected = position.unwrap_or(0);
+                self.follow_tail = false;
+            }
+            Ok(_) => self
+                .model
+                .notice("Deleting telegrams: unexpected answer from the daemon".into()),
+            Err(error) => self
+                .model
+                .notice(format!("Deleting telegrams failed: {error}")),
+        }
+    }
+
+    fn draw_delete_around_overlay(&self, frame: &mut Frame<'_>) {
+        let Some(question) = self
+            .delete_around
+            .as_ref()
+            .filter(|_| self.mode == Mode::DeleteAround)
+        else {
+            return;
+        };
+        let side = match question.span.side {
+            CaptureSide::Above => "above",
+            CaptureSide::Below => "below",
+        };
+        let area = import_overlay_area(frame.area());
+        frame.render_widget(Clear, area);
+        let mut lines = Vec::new();
+        match &question.counts {
+            Ok((0, 0)) => lines.push(Line::raw(format!("There is nothing {side} this telegram."))),
+            Ok((events, losses)) => {
+                lines.push(Line::styled(
+                    format!(
+                        "Delete {events} telegrams and {losses} loss reports {side} telegram {}?",
+                        question.line
+                    ),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ));
+                lines.push(Line::raw(""));
+                lines.push(Line::raw(
+                    "The telegram itself stays. Once deleted, the rest",
+                ));
+                lines.push(Line::raw("can only come back from the copy."));
+            }
+            Err(error) => lines.push(Line::raw(format!(
+                "The telegrams could not be counted: {error}"
+            ))),
+        }
+        lines.push(Line::raw(""));
+        if matches!(question.counts, Ok((events, losses)) if events + losses > 0) {
+            lines.push(Line::raw(
+                "a  copy the capture to the archive folder, then delete",
+            ));
+            lines.push(Line::raw("d  delete without a copy"));
+        }
+        lines.push(Line::raw("Esc  keep them"));
+        frame.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+                Block::default()
+                    .title(" Delete telegrams ")
+                    .borders(Borders::ALL),
+            ),
+            area,
+        );
     }
 
     fn draw_clear_overlay(&self, frame: &mut Frame<'_>) {
@@ -1052,7 +1229,8 @@ impl App {
             | Mode::EtsImportCommitting
             | Mode::SkillOffer
             | Mode::QuitQuestion
-            | Mode::ClearCapture => {}
+            | Mode::ClearCapture
+            | Mode::DeleteAround => {}
         }
     }
 
@@ -1087,6 +1265,17 @@ impl App {
                 self.input.clear();
                 self.quit_question = None;
                 self.clear_capture = None;
+                self.delete_around = None;
+            }
+            return false;
+        }
+        if self.mode == Mode::DeleteAround {
+            // As with the whole capture: deleting takes a letter of its own,
+            // and Enter and every other key do nothing.
+            match key.code {
+                KeyCode::Char('a') => self.answer_delete_around(true),
+                KeyCode::Char('d') => self.answer_delete_around(false),
+                _ => {}
             }
             return false;
         }
@@ -1258,6 +1447,8 @@ impl App {
         match key.code {
             KeyCode::Char('q') => return self.begin_quit(),
             KeyCode::Char('X') => self.begin_clear_capture(),
+            KeyCode::Char('[') => self.begin_delete_around(CaptureSide::Above),
+            KeyCode::Char(']') => self.begin_delete_around(CaptureSide::Below),
             KeyCode::Char('c') => {
                 if self.model.owner_available {
                     self.disconnect_connection();
@@ -1424,7 +1615,7 @@ impl App {
                     row.value_text(), row.raw_cemi));
             frame.render_widget(Paragraph::new(detail).block(Block::default().title(" Details ").borders(Borders::ALL)), areas[2]);
             let prompt = match self.mode {
-                Mode::Normal => "c connect/disconnect · s endpoint · i ETS import · a REST · d discover · / filter · r read · w write · e export · h reload · F8 color · q quit".to_owned(),
+                Mode::Normal => "c connect/disconnect · s endpoint · i ETS import · a REST · d discover · / filter · r read · w write · e export · h reload · X clear · [ ] delete telegrams above/below · F8 color · q quit".to_owned(),
                 Mode::Filter => format!("Filter: {}", self.input),
                 Mode::Read => format!("Read group address: {}", self.input),
                 Mode::WriteAddress => format!("Write group address: {}", self.input),
@@ -1442,6 +1633,7 @@ impl App {
                 Mode::EtsImportCommitting => "ETS import in progress… input is disabled".into(),
                 Mode::SkillOffer => "AI tools: y install · n not here · Esc ask next time".into(),
                 Mode::QuitQuestion => "Quit: s stop the daemon · k leave it running · r remember · Esc cancel".into(),
+                Mode::DeleteAround => "Delete telegrams: a copy the capture first, then delete · d delete without a copy · Esc keep them".into(),
                 Mode::ClearCapture => "Clear capture: a copy it first, then clear · d clear without a copy · Esc keep it".into(),
             };
             let notice = self.model.notices.last().map_or("", String::as_str);
@@ -1461,6 +1653,7 @@ impl App {
             self.draw_skill_offer_overlay(frame);
             self.draw_quit_overlay(frame);
             self.draw_clear_overlay(frame);
+            self.draw_delete_around_overlay(frame);
         })?;
         Ok(())
     }
@@ -2520,6 +2713,205 @@ mod tests {
                 .notices
                 .last()
                 .is_some_and(|n| n.contains("Nothing is recording"))
+        );
+    }
+
+    /// With the selection on telegram `id` (1-based), as the arrows would put it.
+    fn select(app: &mut App, id: usize) {
+        app.selected = id - 1;
+        app.follow_tail = false;
+    }
+
+    #[test]
+    fn the_question_counts_around_the_selected_telegram_and_deletes_nothing_yet() {
+        use devknx::storage::{CaptureSide, CaptureSpan};
+        use interface::CaptureRequest;
+        let (mut app, asked, database, _directory) = app_with_capture(8, false);
+        select(&mut app, 3);
+        assert!(!press(&mut app, KeyCode::Char('[')));
+        assert_eq!(app.mode, Mode::DeleteAround);
+        let question = app.delete_around.as_ref().expect("a question");
+        assert!(
+            matches!(question.counts, Ok((4, 1))),
+            "{:?}",
+            question.counts
+        );
+        assert!(question.line.starts_with("3 "), "{}", question.line);
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![(
+                database,
+                CaptureRequest::CountAround {
+                    span: CaptureSpan {
+                        side: CaptureSide::Above,
+                        line: 3,
+                        through: None,
+                    }
+                }
+            )]
+        );
+
+        // Enter and any other key do nothing, and the question stays.
+        for key in [KeyCode::Enter, KeyCode::Char('y'), KeyCode::Char('x')] {
+            assert!(!press(&mut app, key));
+        }
+        assert_eq!(app.mode, Mode::DeleteAround);
+        assert_eq!(asked.lock().unwrap().len(), 1);
+        assert_eq!(app.model.rows.len(), 8);
+
+        // Esc keeps everything.
+        assert!(!press(&mut app, KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.delete_around.is_none());
+        assert_eq!(asked.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_deletion_below_stops_at_the_newest_telegram_this_screen_has_seen() {
+        use devknx::storage::{CaptureSide, CaptureSpan};
+        use interface::CaptureRequest;
+        let (mut app, asked, database, _directory) = app_with_capture(8, false);
+        select(&mut app, 3);
+        press(&mut app, KeyCode::Char(']'));
+        press(&mut app, KeyCode::Char('d'));
+        let span = CaptureSpan {
+            side: CaptureSide::Below,
+            line: 3,
+            through: Some(8),
+        };
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![
+                (database.clone(), CaptureRequest::CountAround { span }),
+                (
+                    database,
+                    CaptureRequest::DeleteAround {
+                        span,
+                        archive: false
+                    }
+                ),
+            ],
+            "the same span is counted and deleted"
+        );
+        assert!(span.through.is_some(), "a deletion below always has an end");
+    }
+
+    #[test]
+    fn a_letter_deletes_with_or_without_a_copy_and_takes_the_rows_off_the_screen() {
+        use interface::CaptureRequest;
+        for (letter, archive) in [('a', true), ('d', false)] {
+            let (mut app, asked, _, _directory) = app_with_capture(8, false);
+            select(&mut app, 3);
+            press(&mut app, KeyCode::Char('['));
+            press(&mut app, KeyCode::Char(letter));
+            let (_, request) = asked.lock().unwrap().last().cloned().unwrap();
+            assert!(
+                matches!(request, CaptureRequest::DeleteAround { archive: asked_archive, .. } if asked_archive == archive),
+                "{request:?}"
+            );
+            assert_eq!(app.mode, Mode::Normal);
+            let ids: Vec<Option<i64>> = app.model.rows.iter().map(|row| row.id).collect();
+            assert_eq!(
+                ids,
+                (3..=8).map(Some).collect::<Vec<_>>(),
+                "telegram 3 itself stays"
+            );
+            assert_eq!(app.selected, 0, "the selection stays on telegram 3");
+            let notice = app.model.notices.last().expect("a notice");
+            assert!(
+                notice.starts_with("Deleted 4 telegrams and 1 loss reports above telegram 3"),
+                "{notice}"
+            );
+            assert_eq!(notice.contains("copy in"), archive, "{notice}");
+        }
+    }
+
+    #[test]
+    fn rows_below_the_end_of_the_deletion_stay() {
+        use devknx::storage::{CaptureSide, CaptureSpan};
+        let (mut app, _, _, _directory) = app_with_capture(8, false);
+        // A deletion below 2 that ends at 5 takes 3 to 5 off the screen and
+        // leaves what arrived after.
+        app.model.deleted_around(
+            CaptureSpan {
+                side: CaptureSide::Below,
+                line: 2,
+                through: Some(5),
+            },
+            "done".into(),
+        );
+        let ids: Vec<Option<i64>> = app.model.rows.iter().map(|row| row.id).collect();
+        assert_eq!(ids, [1, 2, 6, 7, 8].map(Some).to_vec());
+    }
+
+    #[test]
+    fn a_refusal_is_reported_and_the_rows_stay() {
+        let (mut app, _, _, _directory) = app_with_capture(8, true);
+        select(&mut app, 3);
+        press(&mut app, KeyCode::Char('['));
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.model.rows.len(), 8);
+        let notice = app.model.notices.last().expect("a notice");
+        assert!(notice.contains("failed"), "{notice}");
+    }
+
+    #[test]
+    fn nothing_to_delete_nothing_selected_and_nobody_recording_offer_nothing() {
+        // Nothing on that side: only the count is asked.
+        let (mut app, asked, _, _directory) = app_with_capture(0, false);
+        assert_eq!(app.visible_count(), 0);
+        press(&mut app, KeyCode::Char('['));
+        assert_eq!(app.mode, Mode::Normal, "no telegram is selected");
+        assert!(asked.lock().unwrap().is_empty());
+
+        // A row that is not in the capture has no id to delete around.
+        let (mut app, asked, _, _directory) = app_with_capture(3, false);
+        app.model.rows[2].id = None;
+        select(&mut app, 3);
+        press(&mut app, KeyCode::Char('['));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(asked.lock().unwrap().is_empty());
+
+        // Nobody records the capture: nothing can be changed.
+        let (mut app, asked, _, _directory) = app_with_capture(5, false);
+        app.model.owner_available = false;
+        select(&mut app, 2);
+        press(&mut app, KeyCode::Char(']'));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(asked.lock().unwrap().is_empty());
+        assert!(
+            app.model
+                .notices
+                .last()
+                .is_some_and(|n| n.contains("Nothing is recording"))
+        );
+    }
+
+    #[test]
+    fn the_selection_counts_among_the_rows_the_filter_lets_through() {
+        use devknx::storage::{CaptureSide, CaptureSpan};
+        use interface::CaptureRequest;
+        let (mut app, asked, database, _directory) = app_with_capture(6, false);
+        // Only telegrams 4 and 6 match; the second shown row is telegram 6.
+        app.model.rows[3].destination = "9/9/9".into();
+        app.model.rows[5].destination = "9/9/9".into();
+        app.model.filter = "9/9/9".into();
+        select(&mut app, 2);
+        press(&mut app, KeyCode::Char('['));
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![(
+                database,
+                CaptureRequest::CountAround {
+                    span: CaptureSpan {
+                        side: CaptureSide::Above,
+                        line: 6,
+                        through: None,
+                    }
+                }
+            )],
+            "the id is the telegram's, not its place in the filtered list"
         );
     }
 }

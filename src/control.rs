@@ -107,6 +107,19 @@ pub enum ControlRequest {
         database: PathBuf,
         archive: bool,
     },
+    /// How much a span around one telegram of the capture in `database`
+    /// holds.
+    CaptureCountsAround {
+        database: PathBuf,
+        span: crate::storage::CaptureSpan,
+    },
+    /// Delete a span around one telegram, which stays, after a copy of the
+    /// capture in the archive directory when `archive` is set.
+    DeleteAround {
+        database: PathBuf,
+        span: crate::storage::CaptureSpan,
+        archive: bool,
+    },
     Stop,
 }
 
@@ -131,6 +144,7 @@ impl ControlRequest {
                 | Self::SetIdleTimeout { .. }
                 | Self::GetLifecycle
                 | Self::CaptureCounts { .. }
+                | Self::CaptureCountsAround { .. }
         )
     }
 }
@@ -161,6 +175,18 @@ pub enum ControlResponse {
     CaptureCounts {
         events: u64,
         losses: u64,
+    },
+    /// What a span around a telegram holds.
+    CaptureSpanCounts {
+        events: u64,
+        losses: u64,
+    },
+    /// A span around a telegram was deleted: this is what went, and where the
+    /// copy of the capture went.
+    CaptureDeleted {
+        events: u64,
+        losses: u64,
+        archive: Option<PathBuf>,
     },
     /// A capture was cleared: this is what it held, and where the copy went.
     CaptureCleared {

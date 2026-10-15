@@ -5,7 +5,7 @@ Starting it alone does not connect to KNX. Each connected session owns one
 SQLite writer and retains a database-scoped capture IPC endpoint. A separate
 current-user control endpoint accepts bounded JSON-line requests: `ping`,
 `identify`, `list`, `connect`, `disconnect`, `disconnect_scoped`, `rest_enable`, `rest_disable`, `rest_status`,
-`capture_counts`, `clear_capture` and `stop`. `identify` returns the daemon's build (version, commit, whether
+`capture_counts`, `clear_capture`, `capture_counts_around`, `delete_around` and `stop`. `identify` returns the daemon's build (version, commit, whether
 the tree was modified, a build stamp and the executable path), so a client can
 warn when the daemon is another build; a daemon that predates it answers
 `invalid control request`. `list` reports each session's retention limit as
@@ -24,6 +24,24 @@ answers `capture_cleared` with what was deleted and the path of the copy. The
 imported ETS group addresses, the audit of the operations sent from here and the
 binding to the endpoint stay, and ids keep counting. `capture_counts` can be
 sent again to a new daemon; `clear_capture` cannot.
+
+`capture_counts_around` and `delete_around` (`database`, `span`, and for
+`delete_around` also `archive`) do the same for the telegrams on one side of one
+telegram, which stays. `span` is `{"side": "above" | "below", "line": <id>,
+"through": <id>}`; `line` is the capture id of the telegram, and `through`, only
+for `below`, ends the span at that id, so telegrams that arrived after the asker
+looked are not taken. Loss reports have ids of their own and no place among the
+telegrams, so they follow the telegram's time: above it are the reports observed
+before it, below it those observed after it (and, with `through`, up to the time
+of the newest telegram at or before that id). A `line` that is not in the capture
+is refused. `capture_counts_around` answers `capture_span_counts` with `events`
+and `losses`; `delete_around` makes the same copy of the whole capture first,
+deletes nothing if it fails, deletes the span in one transaction, compacts the
+file and empties the write-ahead log, and answers `capture_deleted` with what
+was deleted and the path of the copy. The audit of the operations sent from
+here stays, so a telegram sent from here that is deleted leaves its entry
+behind. `capture_counts_around` can be sent again to a new daemon;
+`delete_around` cannot.
 
 `renew_lease` (`client`, `kind`) and `release_lease` (`client`) let a
 long-lived client hold the daemon while no KNX session does; a lease lapses

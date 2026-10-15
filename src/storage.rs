@@ -16,7 +16,7 @@ use knx_rs_ip::RoutingLostMessage;
 use rusqlite::{
     Connection, MAIN_DB, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::capture::{CaptureDirection, CaptureEndpoint, CaptureEvent, RoutingLossEvent};
@@ -173,6 +173,9 @@ pub enum StorageError {
         /// Validation failure.
         reason: String,
     },
+    /// The telegram a deletion is drawn around is not in the capture.
+    #[error("telegram {0} is not in the capture any more")]
+    LineNotFound(i64),
     /// An audit row was missing or already finalized.
     #[error("operation audit row {0} is missing or already finalized")]
     CorruptOperationAudit(i64),
@@ -234,6 +237,85 @@ pub struct CaptureCounts {
     pub events: u64,
     /// Stored routing-loss reports.
     pub losses: u64,
+}
+
+/// Which side of a telegram of the capture is meant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureSide {
+    /// The telegrams with a smaller id.
+    Above,
+    /// The telegrams with a larger id.
+    Below,
+}
+
+/// The telegrams on one side of a telegram, which itself stays.
+///
+/// Loss reports have ids of their own and no place among the telegrams, so
+/// they follow the telegram's time: above it are the reports observed before
+/// it, below it those observed after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureSpan {
+    /// Which side of the telegram.
+    pub side: CaptureSide,
+    /// The id of the telegram that stays.
+    pub line: i64,
+    /// With [`CaptureSide::Below`]: stop at this id, so telegrams that arrived
+    /// after the caller looked are not taken.
+    #[serde(default)]
+    pub through: Option<i64>,
+}
+
+/// The ids and times a [`CaptureSpan`] covers, both ends included.
+struct SpanBounds {
+    first_id: i64,
+    last_id: i64,
+    first_ms: i64,
+    last_ms: i64,
+}
+
+/// The ids and times a span covers.
+fn span_bounds(connection: &Connection, span: CaptureSpan) -> Result<SpanBounds, StorageError> {
+    let observed_at = |id: i64| -> Result<Option<i64>, StorageError> {
+        Ok(connection
+            .query_row(
+                "SELECT observed_at_ms FROM capture_events WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    };
+    let line_ms = observed_at(span.line)?.ok_or(StorageError::LineNotFound(span.line))?;
+    Ok(match span.side {
+        CaptureSide::Above => SpanBounds {
+            first_id: i64::MIN,
+            last_id: span.line.saturating_sub(1),
+            first_ms: 0,
+            last_ms: line_ms.saturating_sub(1),
+        },
+        CaptureSide::Below => {
+            let last_ms = match span.through {
+                None => i64::MAX,
+                // The newest telegram at or before `through` that is still
+                // stored. When none is left, nothing is below the line.
+                Some(through) => connection
+                    .query_row(
+                        "SELECT observed_at_ms FROM capture_events
+                         WHERE id <= ?1 ORDER BY id DESC LIMIT 1",
+                        [through],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or(line_ms),
+            };
+            SpanBounds {
+                first_id: span.line.saturating_add(1),
+                last_id: span.through.unwrap_or(i64::MAX),
+                first_ms: line_ms.saturating_add(1),
+                last_ms,
+            }
+        }
+    })
 }
 
 /// Release ownership explicitly: a concurrent fork may briefly retain a copy
@@ -658,6 +740,87 @@ impl CaptureStore {
         })
     }
 
+    /// How many telegrams and loss reports a span covers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the telegram is not in the capture or the database
+    /// cannot be read.
+    pub fn count_around(&self, span: CaptureSpan) -> Result<CaptureCounts, StorageError> {
+        let bounds = span_bounds(&self.connection, span)?;
+        let count = |sql: &str, first: i64, last: i64| -> Result<u64, StorageError> {
+            let rows: i64 = self
+                .connection
+                .query_row(sql, params![first, last], |row| row.get(0))?;
+            Ok(u64::try_from(rows).unwrap_or(0))
+        };
+        Ok(CaptureCounts {
+            events: count(
+                "SELECT COUNT(*) FROM capture_events WHERE id BETWEEN ?1 AND ?2",
+                bounds.first_id,
+                bounds.last_id,
+            )?,
+            losses: count(
+                "SELECT COUNT(*) FROM routing_loss_events WHERE observed_at_ms BETWEEN ?1 AND ?2",
+                bounds.first_ms,
+                bounds.last_ms,
+            )?,
+        })
+    }
+
+    /// Delete the telegrams and loss reports a span covers. The telegram it is
+    /// drawn around stays, and ids keep counting.
+    ///
+    /// What is not capture stays, as with [`clear`](Self::clear): the imported
+    /// ETS group addresses, the audit of the operations sent from here, and
+    /// the binding to the endpoint. A telegram sent from here that is deleted
+    /// therefore leaves its audit entry behind. Afterwards the file is
+    /// compacted and the write-ahead log emptied.
+    ///
+    /// Returns what was deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store is read-only, the telegram is not in the
+    /// capture, or the transaction fails.
+    pub fn delete_around(&mut self, span: CaptureSpan) -> Result<CaptureCounts, StorageError> {
+        if !self.writable {
+            return Err(StorageError::ReadOnly);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // The bounds are read inside the transaction that deletes, so what is
+        // counted is what goes.
+        let bounds = span_bounds(&transaction, span)?;
+        let events = transaction.execute(
+            "DELETE FROM capture_events WHERE id BETWEEN ?1 AND ?2",
+            params![bounds.first_id, bounds.last_id],
+        )?;
+        let losses = transaction.execute(
+            "DELETE FROM routing_loss_events WHERE observed_at_ms BETWEEN ?1 AND ?2",
+            params![bounds.first_ms, bounds.last_ms],
+        )?;
+        transaction.commit()?;
+        self.compact()?;
+        Ok(CaptureCounts {
+            events: u64::try_from(events).unwrap_or(0),
+            losses: u64::try_from(losses).unwrap_or(0),
+        })
+    }
+
+    /// Compact the file and empty the write-ahead log, so what was deleted does
+    /// not stay readable in free pages or in the log.
+    fn compact(&self) -> Result<(), StorageError> {
+        self.connection.execute_batch("VACUUM;")?;
+        // The checkpoint can be refused while a reader is busy; the deletion
+        // has happened either way, so that is not an error of the caller.
+        let _ = self
+            .connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        Ok(())
+    }
+
     /// Delete every telegram and loss report. Ids keep counting.
     ///
     /// What is not capture stays: the imported ETS group addresses, the audit
@@ -681,12 +844,7 @@ impl CaptureStore {
         transaction.execute("DELETE FROM capture_events", [])?;
         transaction.execute("DELETE FROM routing_loss_events", [])?;
         transaction.commit()?;
-        self.connection.execute_batch("VACUUM;")?;
-        // The checkpoint can be refused while a reader is busy; the deletion
-        // has happened either way, so that is not an error of this call.
-        let _ = self
-            .connection
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        self.compact()?;
         Ok(before)
     }
 
@@ -2122,6 +2280,240 @@ mod tests {
         assert!(store.ets_revision().unwrap().is_some());
         // Ids go on counting, so a cursor held by a reader stays valid.
         assert_eq!(store.insert(&event(tunnel(), 9)).unwrap(), 4);
+    }
+
+    /// A capture of telegrams 1 to 6 at 1000 ms steps, with loss reports at
+    /// 1500, 3500 and 5500 ms.
+    fn capture_with_losses(path: &Path) -> CaptureStore {
+        let mut store = CaptureStore::open(path, nz(100)).unwrap();
+        for value in 1..=6u8 {
+            store.insert(&event(tunnel(), value)).unwrap();
+        }
+        for count in 1..=3u16 {
+            store.insert_routing_loss(&routing_loss(count)).unwrap();
+        }
+        // Times worked out by hand rather than taken from the clock.
+        for id in 1..=6i64 {
+            store
+                .connection
+                .execute(
+                    "UPDATE capture_events SET observed_at_ms = ?1 WHERE id = ?2",
+                    params![id * 1_000, id],
+                )
+                .unwrap();
+        }
+        for (id, time) in [(1, 1_500), (2, 3_500), (3, 5_500)] {
+            store
+                .connection
+                .execute(
+                    "UPDATE routing_loss_events SET observed_at_ms = ?1 WHERE id = ?2",
+                    params![time, id],
+                )
+                .unwrap();
+        }
+        store
+    }
+
+    fn above(line: i64) -> CaptureSpan {
+        CaptureSpan {
+            side: CaptureSide::Above,
+            line,
+            through: None,
+        }
+    }
+
+    fn below(line: i64, through: Option<i64>) -> CaptureSpan {
+        CaptureSpan {
+            side: CaptureSide::Below,
+            line,
+            through,
+        }
+    }
+
+    fn ids(store: &CaptureStore) -> Vec<i64> {
+        store
+            .read_after(0, nz(100))
+            .unwrap()
+            .into_iter()
+            .map(|stored| stored.id)
+            .collect()
+    }
+
+    #[test]
+    fn counting_around_a_telegram_changes_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = capture_with_losses(&directory.path().join("c.sqlite"));
+        // Above telegram 4 (4000 ms): telegrams 1 to 3, reports at 1500 and 3500.
+        assert_eq!(
+            store.count_around(above(4)).unwrap(),
+            CaptureCounts {
+                events: 3,
+                losses: 2
+            }
+        );
+        // Below telegram 4: telegrams 5 and 6, the report at 5500.
+        assert_eq!(
+            store.count_around(below(4, None)).unwrap(),
+            CaptureCounts {
+                events: 2,
+                losses: 1
+            }
+        );
+        assert_eq!(
+            store.counts().unwrap(),
+            CaptureCounts {
+                events: 6,
+                losses: 3
+            }
+        );
+    }
+
+    #[test]
+    fn deleting_above_a_telegram_keeps_it_and_everything_below() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = capture_with_losses(&directory.path().join("c.sqlite"));
+        let deleted = store.delete_around(above(4)).unwrap();
+        assert_eq!(
+            deleted,
+            CaptureCounts {
+                events: 3,
+                losses: 2
+            }
+        );
+        assert_eq!(ids(&store), vec![4, 5, 6], "telegram 4 itself stays");
+        assert_eq!(
+            store.counts().unwrap().losses,
+            1,
+            "the report at 5500 stays"
+        );
+        // Ids go on counting.
+        assert_eq!(store.insert(&event(tunnel(), 9)).unwrap(), 7);
+    }
+
+    #[test]
+    fn a_deletion_below_a_telegram_stops_at_the_last_one_seen() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = capture_with_losses(&directory.path().join("c.sqlite"));
+        // The caller looked when 5 was the newest telegram; 6 and the report at
+        // 5500 arrived after.
+        let counted = store.count_around(below(2, Some(5))).unwrap();
+        let deleted = store.delete_around(below(2, Some(5))).unwrap();
+        assert_eq!(counted, deleted, "what is counted is what goes");
+        assert_eq!(
+            deleted,
+            CaptureCounts {
+                events: 3,
+                losses: 1
+            },
+            "telegrams 3 to 5 and the report at 3500"
+        );
+        assert_eq!(ids(&store), vec![1, 2, 6]);
+        assert_eq!(
+            store.counts().unwrap().losses,
+            2,
+            "the reports at 1500 and 5500 stay"
+        );
+    }
+
+    #[test]
+    fn a_telegram_that_is_gone_is_reported_and_nothing_is_deleted() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = capture_with_losses(&directory.path().join("c.sqlite"));
+        assert!(matches!(
+            store.delete_around(above(99)),
+            Err(StorageError::LineNotFound(99))
+        ));
+        assert!(matches!(
+            store.count_around(below(99, None)),
+            Err(StorageError::LineNotFound(99))
+        ));
+        assert_eq!(store.counts().unwrap().events, 6);
+    }
+
+    #[test]
+    fn the_first_and_the_last_telegram_have_nothing_beyond_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = capture_with_losses(&directory.path().join("c.sqlite"));
+        assert_eq!(store.delete_around(above(1)).unwrap().events, 0);
+        assert_eq!(store.delete_around(below(6, None)).unwrap().events, 0);
+        assert_eq!(ids(&store), vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn deleting_around_a_telegram_keeps_the_audit_and_the_ets_import() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = capture_with_losses(&directory.path().join("c.sqlite"));
+        store
+            .start_operation_audit("cli", "typed_write", 0x0801, Some("1.001"), &[1, 2])
+            .unwrap();
+        store.import_ets(&ets_fixture("Lamp")).unwrap();
+        store.delete_around(above(6)).unwrap();
+        assert_eq!(
+            store.read_operation_audit_after(0, nz(10)).unwrap().len(),
+            1
+        );
+        assert!(store.ets_revision().unwrap().is_some());
+    }
+
+    #[test]
+    fn a_read_only_capture_cannot_be_deleted_from() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("c.sqlite");
+        drop(capture_with_losses(&path));
+        let mut reader = CaptureStore::open_existing(&path).unwrap();
+        assert!(matches!(
+            reader.delete_around(above(4)),
+            Err(StorageError::ReadOnly)
+        ));
+        assert_eq!(reader.counts().unwrap().events, 6);
+    }
+
+    /// What is deleted around a telegram is not left readable in the file or in
+    /// its log, and what stays is.
+    #[test]
+    fn deleted_telegrams_are_gone_from_the_file_and_the_log() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("c.sqlite");
+        let mut store = CaptureStore::open(&path, nz(100)).unwrap();
+        let frame = |marker: [u8; 8]| {
+            CemiFrame::new_l_data(
+                MessageCode::LDataInd,
+                IndividualAddress::from_raw(0x1101),
+                DestinationAddress::Group(GroupAddress::from_raw(0x0801)),
+                Priority::Low,
+                &marker,
+            )
+        };
+        let secret = [0xDE, 0xAD, 0xBE, 0xEF, 0xC0, 0xFF, 0xEE, 0x42];
+        let kept = [0xFE, 0xED, 0xFA, 0xCE, 0xCA, 0xFE, 0xBA, 0xBE];
+        store
+            .insert(&CaptureEvent::received(tunnel(), frame(secret)))
+            .unwrap();
+        store
+            .insert(&CaptureEvent::received(tunnel(), frame(kept)))
+            .unwrap();
+        let on_disk = |path: &Path| -> Vec<u8> {
+            let mut bytes = std::fs::read(path).unwrap_or_default();
+            let mut log = path.as_os_str().to_owned();
+            log.push("-wal");
+            bytes.extend(std::fs::read(Path::new(&log)).unwrap_or_default());
+            bytes
+        };
+        let contains = |haystack: &[u8], needle: &[u8]| {
+            haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+        };
+        // Counter-probe: both are on disk before, so the check can find them.
+        assert!(contains(&on_disk(&path), &secret));
+        assert!(contains(&on_disk(&path), &kept));
+        store.delete_around(above(2)).unwrap();
+        let after = on_disk(&path);
+        assert!(
+            !contains(&after, &secret),
+            "the deleted payload is still on disk"
+        );
+        assert!(contains(&after, &kept), "the kept payload went with it");
     }
 
     #[test]

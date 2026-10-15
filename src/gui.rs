@@ -157,6 +157,30 @@ fn render_connection_form(
     .inner
 }
 
+/// Whether Cmd+F (Ctrl+F off macOS) was pressed, without Shift or Alt.
+fn filter_shortcut_pressed(input: &egui::InputState) -> bool {
+    input.modifiers.command
+        && !input.modifiers.shift
+        && !input.modifiers.alt
+        && input.key_pressed(egui::Key::F)
+}
+
+/// Give a text field the cursor and select what is in it, so that typing
+/// replaces the old text, as in the find field of other applications.
+fn focus_text_field(ctx: &egui::Context, id: egui::Id, text: &str) {
+    ctx.memory_mut(|memory| memory.request_focus(id));
+    if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
+        let end = text.chars().count();
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                egui::text::CCursor::new(end),
+            )));
+        state.store(ctx, id);
+    }
+}
+
 fn rest_indicator(status: Option<&RestStatus>, error: Option<&str>) -> String {
     if error.is_some() {
         return "REST unavailable".into();
@@ -1752,7 +1776,7 @@ impl MonitorApp {
             if let Some(model) = &mut self.model {
                 let id = egui::Id::new("capture-filter");
                 if focus_filter {
-                    ui.memory_mut(|memory| memory.request_focus(id));
+                    focus_text_field(ui.ctx(), id, &model.filter);
                 }
                 ui.add(
                     egui::TextEdit::singleline(&mut model.filter)
@@ -2091,7 +2115,9 @@ impl MonitorApp {
 impl eframe::App for MonitorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.process_background();
-        let focus_filter = self.process_menu();
+        // Cmd+F: on macOS the menu item gets the key and reports it; off
+        // macOS, where there is no menu bar, the shortcut is read here.
+        let focus_filter = self.process_menu() || ui.input(filter_shortcut_pressed);
         let ctx = ui.ctx().clone();
         self.process_quit(&ctx);
         self.smoke_step(&ctx);
@@ -2700,5 +2726,75 @@ mod tests {
         append_rows(app.model.as_mut().unwrap(), 151, 155);
         app.live_smoke_step(&ctx, Some(0.0));
         assert!(result.load(Ordering::Acquire));
+    }
+
+    /// Whether the shortcut sees this key press, in a frame of its own.
+    fn pressed(modifiers: egui::Modifiers, key: egui::Key) -> bool {
+        let mut raw = egui::RawInput::default();
+        // The frame's modifiers come from this event, not from the key's.
+        raw.events.push(egui::Event::ModifiersChanged(modifiers));
+        raw.events.push(egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers,
+        });
+        let mut seen = false;
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(raw, |ui| {
+            seen = ui.input(filter_shortcut_pressed);
+        });
+        // Nothing paints here, so the frame's textures are not wanted.
+        output.textures_delta.clear();
+        seen
+    }
+
+    #[test]
+    fn cmd_f_is_the_shortcut_and_nothing_near_it() {
+        let command = egui::Modifiers::COMMAND;
+        assert!(pressed(command, egui::Key::F));
+        // Counter-probes: F alone, another key with Cmd, and Cmd with Shift or
+        // Alt (other shortcuts) are not it.
+        assert!(!pressed(egui::Modifiers::NONE, egui::Key::F));
+        assert!(!pressed(command, egui::Key::G));
+        assert!(!pressed(command | egui::Modifiers::SHIFT, egui::Key::F));
+        assert!(!pressed(command | egui::Modifiers::ALT, egui::Key::F));
+    }
+
+    /// The field takes the cursor and its text is selected, so that typing
+    /// replaces it. A field that was not asked is left alone.
+    #[test]
+    fn the_filter_field_takes_the_cursor_with_its_text_selected() {
+        let id = egui::Id::new("filter-under-test");
+        let other = egui::Id::new("another-field");
+        let ctx = egui::Context::default();
+        let mut text = "0/1/2".to_string();
+        let mut other_text = String::new();
+        let frame = |text: &mut String, other_text: &mut String| {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.add(egui::TextEdit::singleline(text).id(id));
+                ui.add(egui::TextEdit::singleline(other_text).id(other));
+            });
+            output.textures_delta.clear();
+        };
+        // The first frames create the fields and their state.
+        frame(&mut text, &mut other_text);
+        frame(&mut text, &mut other_text);
+        assert!(!ctx.memory(|memory| memory.has_focus(id)));
+
+        focus_text_field(&ctx, id, &text);
+        frame(&mut text, &mut other_text);
+        frame(&mut text, &mut other_text);
+        assert!(ctx.memory(|memory| memory.has_focus(id)), "no focus");
+        assert!(!ctx.memory(|memory| memory.has_focus(other)));
+        let range = egui::TextEdit::load_state(&ctx, id)
+            .and_then(|state| state.cursor.char_range())
+            .expect("a cursor");
+        assert_eq!(
+            range,
+            egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(5)),
+            "the text should be selected from start to end"
+        );
     }
 }

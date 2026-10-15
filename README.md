@@ -150,6 +150,15 @@ pre-connection `captures.sqlite` is offered as a previous capture, not
 automatically attributed to a gateway.
 `Cmd+F` (View > Filter Captures on macOS, `Ctrl+F` on Windows and Linux) puts the
 cursor in the filter field and selects its text, so typing replaces it.
+**Clear…** in the GUI and `X` in the terminal monitor delete the stored capture,
+after asking. The question shows how many telegrams and loss reports would go
+and proposes a copy in the `archive` folder of the data directory (on by
+default, named after the capture and the moment). In the window Cancel has the
+focus, so Enter deletes nothing; in the terminal `a` copies and clears, `d`
+clears without a copy, `Esc` keeps it, and every other key does nothing. The
+daemon does the deleting, in the session that records the capture, so it works
+while the gateway is down, and only for a capture that is being recorded. The
+imported group addresses and the log of what was sent from here stay.
 
 The capture table includes source and destination addresses, service, value,
 DPT, and ETS group name. A value is decoded only when a supported, unambiguous

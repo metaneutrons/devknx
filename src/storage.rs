@@ -227,6 +227,15 @@ pub struct CaptureStore {
     _writer_lease: Option<WriterLease>,
 }
 
+/// What a capture holds: telegrams, and router-reported losses of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CaptureCounts {
+    /// Stored telegrams.
+    pub events: u64,
+    /// Stored routing-loss reports.
+    pub losses: u64,
+}
+
 /// Release ownership explicitly: a concurrent fork may briefly retain a copy
 /// of the file descriptor, so closing only this descriptor is insufficient.
 struct WriterLease(File);
@@ -627,6 +636,58 @@ impl CaptureStore {
             .persist_noclobber(destination)
             .map_err(|error| StorageError::Io(error.error))?;
         Ok(())
+    }
+
+    /// How many telegrams and loss reports the capture holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be read.
+    pub fn counts(&self) -> Result<CaptureCounts, StorageError> {
+        let count = |table: &str| -> Result<u64, StorageError> {
+            let rows: i64 =
+                self.connection
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })?;
+            Ok(u64::try_from(rows).unwrap_or(0))
+        };
+        Ok(CaptureCounts {
+            events: count("capture_events")?,
+            losses: count("routing_loss_events")?,
+        })
+    }
+
+    /// Delete every telegram and loss report. Ids keep counting.
+    ///
+    /// What is not capture stays: the imported ETS group addresses, the audit
+    /// of the operations sent from here, and the binding to the endpoint.
+    /// Afterwards the file is compacted and the write-ahead log emptied, so
+    /// what was deleted does not stay readable in free pages or in the log.
+    ///
+    /// Returns what was deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store is read-only or the transaction fails.
+    pub fn clear(&mut self) -> Result<CaptureCounts, StorageError> {
+        if !self.writable {
+            return Err(StorageError::ReadOnly);
+        }
+        let before = self.counts()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute("DELETE FROM capture_events", [])?;
+        transaction.execute("DELETE FROM routing_loss_events", [])?;
+        transaction.commit()?;
+        self.connection.execute_batch("VACUUM;")?;
+        // The checkpoint can be refused while a reader is busy; the deletion
+        // has happened either way, so that is not an error of this call.
+        let _ = self
+            .connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        Ok(before)
     }
 
     /// Atomically append a raw event and prune the oldest rows to the cap.
@@ -2017,5 +2078,100 @@ mod tests {
         symlink(&path, &link).unwrap();
         assert!(CaptureStore::open_existing(&link).is_err());
         assert!(CaptureStore::open(&link, nz(10)).is_err());
+    }
+
+    #[test]
+    fn clearing_removes_the_capture_and_keeps_the_rest() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("captures.sqlite");
+        let mut store = CaptureStore::open(&path, nz(100)).unwrap();
+        for value in 0..3 {
+            store.insert(&event(tunnel(), value)).unwrap();
+        }
+        store.insert_routing_loss(&routing_loss(4)).unwrap();
+        store
+            .start_operation_audit("cli", "typed_write", 0x0801, Some("1.001"), &[1, 2])
+            .unwrap();
+        store.import_ets(&ets_fixture("Lamp")).unwrap();
+        assert_eq!(
+            store.counts().unwrap(),
+            CaptureCounts {
+                events: 3,
+                losses: 1
+            }
+        );
+
+        let cleared = store.clear().unwrap();
+        assert_eq!(
+            cleared,
+            CaptureCounts {
+                events: 3,
+                losses: 1
+            }
+        );
+        assert_eq!(
+            store.counts().unwrap(),
+            CaptureCounts {
+                events: 0,
+                losses: 0
+            }
+        );
+        // The audit of what was sent, and the imported group addresses, stay.
+        let audit = store.read_operation_audit_after(0, nz(10)).unwrap();
+        assert_eq!(audit.len(), 1);
+        assert!(store.ets_revision().unwrap().is_some());
+        // Ids go on counting, so a cursor held by a reader stays valid.
+        assert_eq!(store.insert(&event(tunnel(), 9)).unwrap(), 4);
+    }
+
+    #[test]
+    fn a_read_only_capture_cannot_be_cleared() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("captures.sqlite");
+        let mut writer = CaptureStore::open(&path, nz(10)).unwrap();
+        writer.insert(&event(tunnel(), 1)).unwrap();
+        let mut reader = CaptureStore::open_existing(&path).unwrap();
+        assert!(matches!(reader.clear(), Err(StorageError::ReadOnly)));
+        assert_eq!(reader.counts().unwrap().events, 1);
+    }
+
+    /// What is cleared is not left readable in the file or in its log.
+    #[test]
+    fn cleared_telegrams_are_gone_from_the_file_and_the_log() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("captures.sqlite");
+        let mut store = CaptureStore::open(&path, nz(100)).unwrap();
+        // A payload that is easy to find in the raw bytes.
+        let marker = [0xDE, 0xAD, 0xBE, 0xEF, 0xC0, 0xFF, 0xEE, 0x42];
+        let frame = CemiFrame::new_l_data(
+            MessageCode::LDataInd,
+            IndividualAddress::from_raw(0x1101),
+            DestinationAddress::Group(GroupAddress::from_raw(0x0801)),
+            Priority::Low,
+            &marker,
+        );
+        store
+            .insert(&CaptureEvent::received(tunnel(), frame))
+            .unwrap();
+        let on_disk = |path: &Path| -> Vec<u8> {
+            let mut bytes = std::fs::read(path).unwrap_or_default();
+            let mut log = path.as_os_str().to_owned();
+            log.push("-wal");
+            bytes.extend(std::fs::read(Path::new(&log)).unwrap_or_default());
+            bytes
+        };
+        let contains = |haystack: &[u8]| {
+            haystack
+                .windows(marker.len())
+                .any(|window| window == marker)
+        };
+        // Counter-probe: before the clear the bytes are there, so the check
+        // below can find them.
+        assert!(contains(&on_disk(&path)), "the payload was never on disk");
+        store.clear().unwrap();
+        assert!(
+            !contains(&on_disk(&path)),
+            "the cleared payload is still in the file or the log"
+        );
     }
 }

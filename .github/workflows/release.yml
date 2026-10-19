@@ -397,7 +397,7 @@ jobs:
         with:
           name: final-candidate
           path: candidate
-      - uses: Homebrew/actions/setup-homebrew@e99025eb970cfa124b8284a35463d87426917478 # 2026.09.28.1
+      - uses: Homebrew/actions/setup-homebrew@eb02c69dbabdb66ff183c614f4ce7ab3c077592c # 2026.10.12.1
         with:
           core: false
           cask: false
@@ -616,7 +616,7 @@ jobs:
             fi
           done
           exit "$status"
-      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         id: tap-token
         with:
           client-id: ${{ vars.HOMEBREW_APP_CLIENT_ID }}
@@ -650,7 +650,7 @@ jobs:
             aur@aur.archlinux.org 2>&1 || true)
           printf '%s\n' "$out"
           printf '%s' "$out" | grep -Eq '^Welcome to AUR, .+!'
-      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         id: apt-token
         with:
           client-id: ${{ vars.ARCHIVE_DISPATCH_CLIENT_ID }}
@@ -784,7 +784,7 @@ jobs:
         with:
           name: final-candidate
           path: candidate
-      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         id: tap-token
         with:
           client-id: ${{ vars.HOMEBREW_APP_CLIENT_ID }}
@@ -852,7 +852,7 @@ jobs:
             echo "pr=$pr" >> "$GITHUB_OUTPUT"
             echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           fi
-      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         id: tap-merge-token
         with:
           client-id: ${{ vars.HOMEBREW_APP_CLIENT_ID }}
@@ -1031,7 +1031,7 @@ jobs:
     runs-on: ubuntu-24.04
     environment: release
     steps:
-      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         id: apt-token
         with:
           client-id: ${{ vars.ARCHIVE_DISPATCH_CLIENT_ID }}

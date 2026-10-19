@@ -73,7 +73,7 @@ tui = ["dep:ratatui", "dep:crossterm", "dep:chrono", "dep:same-file"]
 full = ["gui", "tui"]
 
 [target.'cfg(not(windows))'.dependencies]
-eframe = { version = "0.36", optional = true, default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+eframe = { version = "0.37", optional = true, default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 
 [target.'cfg(windows)'.dependencies]
 eframe = { version = "0.36", optional = true, default-features = false, features = ["default_fonts", "wgpu"] }

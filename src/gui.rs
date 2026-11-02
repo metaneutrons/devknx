@@ -1809,7 +1809,7 @@ impl MonitorApp {
             }
             ui.label("Filter");
             if let Some(model) = &mut self.model {
-                let id = egui::Id::new("capture-filter");
+                let id = egui::Id::unique("capture-filter");
                 if focus_filter {
                     focus_text_field(ui.ctx(), id, &model.filter);
                 }
@@ -2379,7 +2379,7 @@ impl MonitorApp {
         if let Some(row) = selected {
             self.selected = Some(row);
         }
-        Some(output.state.offset.y)
+        Some(output.state.clamped_offset().y)
     }
 
     fn render_capture_details(&self, ui: &mut egui::Ui) {
@@ -2929,6 +2929,7 @@ mod tests {
                             delta: egui::vec2(0.0, if frame == 1 { 240.0 } else { -240.0 }),
                             modifiers: egui::Modifiers::NONE,
                             phase: egui::TouchPhase::Move,
+                            source: egui::MouseWheelSource::Unknown,
                         },
                     ];
                 }
@@ -3138,8 +3139,8 @@ mod tests {
     /// replaces it. A field that was not asked is left alone.
     #[test]
     fn the_filter_field_takes_the_cursor_with_its_text_selected() {
-        let id = egui::Id::new("filter-under-test");
-        let other = egui::Id::new("another-field");
+        let id = egui::Id::unique("filter-under-test");
+        let other = egui::Id::unique("another-field");
         let ctx = egui::Context::default();
         let mut text = "0/1/2".to_string();
         let mut other_text = String::new();

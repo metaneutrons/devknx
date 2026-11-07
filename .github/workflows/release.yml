@@ -425,6 +425,11 @@ jobs:
             sleep 1
           done
           brew tap-new --no-git "$tap"
+          # Homebrew refuses to load anything from a tap it was not told to
+          # trust. This tap is created here, empty, moments before and holds
+          # only the candidate, so trusting it as a whole does not extend to
+          # any other tap.
+          brew trust --tap "$tap"
           formula="$(brew --repository "$tap")/Formula/devknx.rb"
           sed -E "s#https://github.com/[^\"]*/download/[^/\"]+#http://127.0.0.1:$port#g" \
             candidate/devknx.rb > "$formula"

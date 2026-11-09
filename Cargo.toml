@@ -50,7 +50,7 @@ csv = "1.4"
 futures-core = "0.3"
 image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 interprocess = { version = "2.4.4", features = ["tokio"] }
-knx-rs-core = "0.10.1"
+knx-rs-core = "0.14.0"
 knx-rs-ip = "0.10.1"
 quick-xml = "0.42"
 ratatui = { version = "0.30", optional = true }

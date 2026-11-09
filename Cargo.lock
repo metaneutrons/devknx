@@ -873,7 +873,7 @@ dependencies = [
  "futures-util",
  "image",
  "interprocess",
- "knx-rs-core",
+ "knx-rs-core 0.14.0",
  "knx-rs-ip",
  "quick-xml 0.42.0",
  "ratatui",
@@ -2004,12 +2004,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "knx-rs-core"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b028aebeda642d543b8d10eae2911e315a78bd38f1c31470d6e1709ff92cea09"
+dependencies = [
+ "libm",
+]
+
+[[package]]
 name = "knx-rs-ip"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "49c0f10980c4df1cf3898b2e37759e664dcdbd0df32220d465f6a959bde39445"
 dependencies = [
- "knx-rs-core",
+ "knx-rs-core 0.10.1",
  "socket2",
  "thiserror 2.0.21",
  "tokio",

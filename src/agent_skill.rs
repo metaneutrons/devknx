@@ -411,8 +411,7 @@ pub fn mcp_reference() -> String {
             .input_schema
             .get("required")
             .and_then(|value| value.as_array())
-            .map(|names| names.iter().filter_map(|name| name.as_str()).collect())
-            .unwrap_or_default();
+            .map_or_default(|names| names.iter().filter_map(|name| name.as_str()).collect());
         if let Some(properties) = tool
             .input_schema
             .get("properties")

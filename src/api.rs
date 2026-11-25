@@ -1227,21 +1227,17 @@ pub fn openapi_document() -> Value {
 #[must_use]
 pub fn routes() -> Vec<(String, Vec<String>)> {
     let document = openapi_document();
-    document["paths"]
-        .as_object()
-        .map(|paths| {
-            paths
-                .iter()
-                .map(|(path, item)| {
-                    let methods = item
-                        .as_object()
-                        .map(|ops| ops.keys().map(|method| method.to_uppercase()).collect())
-                        .unwrap_or_default();
-                    (path.clone(), methods)
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    document["paths"].as_object().map_or_default(|paths| {
+        paths
+            .iter()
+            .map(|(path, item)| {
+                let methods = item
+                    .as_object()
+                    .map_or_default(|ops| ops.keys().map(|method| method.to_uppercase()).collect());
+                (path.clone(), methods)
+            })
+            .collect()
+    })
 }
 
 async fn openapi(State(state): State<ApiState>) -> Json<Value> {

@@ -466,26 +466,25 @@ impl CaptureService {
                         match received {
                             KnxReceiveEvent::Frame(frame) => {
                                 // L_Data.con confirms a tunnel request; it is not a bus telegram.
-                                if frame.message_code_raw() == MessageCode::LDataCon as u8 {
-                                    continue;
+                                if frame.message_code_raw() != MessageCode::LDataCon as u8 {
+                                    let event = CaptureEvent::received(self.endpoint, frame);
+                                    let id = match self.store.as_mut() {
+                                        Some(store) => match store.insert(&event) {
+                                            Ok(id) => Some(id),
+                                            Err(error) => {
+                                                connection.close().await;
+                                                self.state_tx.send_replace(
+                                                    ConnectionState::StorageFailed {
+                                                        reason: error.to_string(),
+                                                    },
+                                                );
+                                                return Err(error.into());
+                                            }
+                                        },
+                                        None => None,
+                                    };
+                                    let _ = self.frames_tx.send(LiveCapture { id, event });
                                 }
-                                let event = CaptureEvent::received(self.endpoint, frame);
-                                let id = match self.store.as_mut() {
-                                    Some(store) => match store.insert(&event) {
-                                        Ok(id) => Some(id),
-                                        Err(error) => {
-                                            connection.close().await;
-                                            self.state_tx.send_replace(
-                                                ConnectionState::StorageFailed {
-                                                    reason: error.to_string(),
-                                                },
-                                            );
-                                            return Err(error.into());
-                                        }
-                                    },
-                                    None => None,
-                                };
-                                let _ = self.frames_tx.send(LiveCapture { id, event });
                             }
                             KnxReceiveEvent::RoutingLostMessage(report) => {
                                 let event = RoutingLossEvent::received(self.endpoint, report);

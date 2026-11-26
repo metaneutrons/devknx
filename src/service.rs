@@ -936,7 +936,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn reconnects_after_failure_and_commits_before_broadcast() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("service.sqlite");

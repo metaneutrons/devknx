@@ -152,9 +152,11 @@ mod gui_live {
         let directory = tempfile::tempdir().expect("temporary directory");
         let database = directory.path().join("gui-live.sqlite");
         let database_arg = database.to_str().expect("UTF-8 test path");
-        let server = DeviceServer::start_at("127.0.0.1:0".parse().expect("loopback address"))
+        let mut server_addr = "127.0.0.1:0".parse().expect("loopback address");
+        let mut server = DeviceServer::start_at(server_addr)
             .await
             .expect("start loopback KNX tunnel server");
+        server_addr = server.local_addr();
         let endpoint = format!("tunnel://{}", server.local_addr());
 
         let mut first_owner = ChildGuard::start(
@@ -195,6 +197,12 @@ mod gui_live {
         .await;
 
         first_owner.kill_and_wait();
+        // Do not send the next stimulus to the abruptly closed Windows UDP
+        // peer; a fresh server at the same address lets the owner reconnect.
+        server.shutdown().await;
+        server = DeviceServer::start_at(server_addr)
+            .await
+            .expect("restart loopback KNX tunnel server");
         wait_for_stage(
             &mut stage_receiver,
             &mut gui,

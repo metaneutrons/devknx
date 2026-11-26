@@ -727,8 +727,7 @@ pub enum QuitPlan {
 pub fn plan_quit(control: &DaemonControl, settings_file: Option<&Path>) -> QuitPlan {
     let on_quit = settings_file
         .and_then(|path| devknx::settings::Settings::load_from(path).ok())
-        .map(|settings| settings.on_quit)
-        .unwrap_or_default();
+        .map_or_default(|settings| settings.on_quit);
     match on_quit {
         devknx::settings::OnQuit::Keep => QuitPlan::Quit,
         devknx::settings::OnQuit::Stop => {

@@ -15,6 +15,7 @@ use std::future::Future;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
+use knx_rs_core::message::MessageCode;
 use knx_rs_ip::{ConnectionSpec, KnxConnection, KnxReceiveEvent, connect};
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -464,23 +465,26 @@ impl CaptureService {
                         };
                         match received {
                             KnxReceiveEvent::Frame(frame) => {
-                                let event = CaptureEvent::received(self.endpoint, frame);
-                                let id = match self.store.as_mut() {
-                                    Some(store) => match store.insert(&event) {
-                                        Ok(id) => Some(id),
-                                        Err(error) => {
-                                            connection.close().await;
-                                            self.state_tx.send_replace(
-                                                ConnectionState::StorageFailed {
-                                                    reason: error.to_string(),
-                                                },
-                                            );
-                                            return Err(error.into());
-                                        }
-                                    },
-                                    None => None,
-                                };
-                                let _ = self.frames_tx.send(LiveCapture { id, event });
+                                // L_Data.con confirms a tunnel request; it is not a bus telegram.
+                                if frame.message_code_raw() != MessageCode::LDataCon as u8 {
+                                    let event = CaptureEvent::received(self.endpoint, frame);
+                                    let id = match self.store.as_mut() {
+                                        Some(store) => match store.insert(&event) {
+                                            Ok(id) => Some(id),
+                                            Err(error) => {
+                                                connection.close().await;
+                                                self.state_tx.send_replace(
+                                                    ConnectionState::StorageFailed {
+                                                        reason: error.to_string(),
+                                                    },
+                                                );
+                                                return Err(error.into());
+                                            }
+                                        },
+                                        None => None,
+                                    };
+                                    let _ = self.frames_tx.send(LiveCapture { id, event });
+                                }
                             }
                             KnxReceiveEvent::RoutingLostMessage(report) => {
                                 let event = RoutingLossEvent::received(self.endpoint, report);
@@ -635,6 +639,81 @@ mod tests {
 
     fn capacity(value: usize) -> NonZeroUsize {
         NonZeroUsize::new(value).unwrap()
+    }
+
+    #[tokio::test]
+    async fn tunnel_confirmations_are_not_captured_as_received_telegrams() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("confirmations.sqlite");
+        let store = CaptureStore::open(&path, NonZeroU32::new(10).unwrap()).unwrap();
+        let mut service =
+            CaptureService::new(spec(), Some(store), ReconnectPolicy::default(), capacity(8));
+        let mut states = service.subscribe_state();
+        let mut frames = service.subscribe_frames();
+        let closed = Arc::new(AtomicUsize::new(0));
+        let confirmation = CemiFrame::new_l_data(
+            MessageCode::LDataCon,
+            IndividualAddress::from_raw(0x1101),
+            DestinationAddress::Group(GroupAddress::from_raw(0x0801)),
+            Priority::Low,
+            &[0x00, 0x80, 1],
+        );
+        let telegram = frame(7);
+        let connector = {
+            let closed = Arc::clone(&closed);
+            move || {
+                let closed = Arc::clone(&closed);
+                let events = VecDeque::from([
+                    KnxReceiveEvent::Frame(confirmation.clone()),
+                    KnxReceiveEvent::Frame(telegram.clone()),
+                ]);
+                async move { Ok::<_, &'static str>(FakeEventConnection { events, closed }) }
+            }
+        };
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let observer = async {
+            loop {
+                states.changed().await.unwrap();
+                if matches!(
+                    &*states.borrow_and_update(),
+                    ConnectionState::Connected { .. }
+                ) {
+                    break;
+                }
+            }
+            let live = frames.recv().await.unwrap();
+            assert_eq!(live.id, Some(1));
+            assert_eq!(
+                live.event.frame().message_code_raw(),
+                MessageCode::LDataInd as u8
+            );
+            assert_eq!(live.event.frame().payload(), &[0x00, 0x80, 7]);
+            assert!(matches!(
+                frames.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
+            stop_tx.send(()).unwrap();
+        };
+        let (result, ()) = timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                service.run_with(connector, async {
+                    let _ = stop_rx.await;
+                }),
+                observer
+            )
+        })
+        .await
+        .unwrap();
+        result.unwrap();
+        assert_eq!(closed.load(Ordering::SeqCst), 1);
+
+        let history = CaptureStore::open_existing(&path).unwrap();
+        let captures = history.read_after(0, NonZeroU32::new(10).unwrap()).unwrap();
+        assert_eq!(captures.len(), 1);
+        assert_eq!(
+            captures[0].event.frame().message_code_raw(),
+            MessageCode::LDataInd as u8
+        );
     }
 
     #[tokio::test]

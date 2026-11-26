@@ -712,7 +712,11 @@ impl CaptureStore {
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         let temporary = tempfile::NamedTempFile::new_in(parent)?;
-        self.connection.backup(MAIN_DB, temporary.path(), None)?;
+        self.connection.backup(
+            MAIN_DB,
+            temporary.path(),
+            None::<fn(rusqlite::backup::Progress)>,
+        )?;
         temporary.as_file().sync_all()?;
         temporary
             .persist_noclobber(destination)

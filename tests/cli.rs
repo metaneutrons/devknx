@@ -708,12 +708,16 @@ async fn serve_recovers_committed_history_after_process_termination() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let path = directory.path().join("service.sqlite");
     let database = path.to_str().expect("UTF-8 test path");
-    let server = DeviceServer::start_at("127.0.0.1:0".parse().expect("loopback address"))
-        .await
-        .expect("start KNX tunnel server");
-    let endpoint = format!("tunnel://{}", server.local_addr());
-
+    let mut server_addr = "127.0.0.1:0".parse().expect("loopback address");
     for value in [41_u8, 42_u8] {
+        // A fresh gateway stub avoids platform-specific UDP reset behavior
+        // after the previous tunnel client is terminated; the database stays
+        // shared to exercise recovery across the process restart.
+        let server = DeviceServer::start_at(server_addr)
+            .await
+            .expect("start KNX tunnel server");
+        server_addr = server.local_addr();
+        let endpoint = format!("tunnel://{}", server.local_addr());
         let child = Command::new(env!("CARGO_BIN_EXE_devknx"))
             .args(["serve", &endpoint, "--database", database])
             .stdout(Stdio::null())
@@ -739,7 +743,10 @@ async fn serve_recovers_committed_history_after_process_termination() {
                     Priority::Low,
                     &[0x00, 0x80, value],
                 );
-                server.send_frame(frame).await.expect("send loopback frame");
+                server
+                    .send_frame(frame)
+                    .await
+                    .unwrap_or_else(|error| panic!("send loopback frame {value}: {error}"));
                 if let Ok(history) = CaptureStore::open_existing(&path)
                     && history
                         .read_after(0, NonZeroU32::new(1_000).expect("nonzero"))
@@ -756,8 +763,8 @@ async fn serve_recovers_committed_history_after_process_termination() {
         assert!(found.is_ok(), "capture process timed out on value {value}");
         child.0.kill().expect("terminate capture process");
         child.0.wait().expect("reap capture process");
+        server.shutdown().await;
     }
-    server.stop().await;
 
     let history = CaptureStore::open_existing(&path).expect("reopen after second termination");
     let values: Vec<u8> = history

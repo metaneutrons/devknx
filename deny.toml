@@ -9,8 +9,7 @@ all-features = true
 version = 2
 yanked = "deny"
 ignore = [
-    # Example form, remove when adopting this file:
-    # { id = "RUSTSEC-0000-0000", reason = "no patch available; pulled in through <crate>; remove once <crate> is at <version>" },
+    { id = "RUSTSEC-2026-0543", reason = "RustSec reports no safe Chrono release; devknx uses Chrono for timestamps and rmcp 3.11.0 also requires it. Remove after devknx migrates to a maintained time crate and rmcp drops Chrono." },
 ]
 
 [licenses]
